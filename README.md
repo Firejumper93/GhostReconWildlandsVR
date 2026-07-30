@@ -1,5 +1,13 @@
 # Ghost Recon Wildlands VR (GRW-XR)
 
+> [!WARNING]
+> **THIS IS NOT A COMPLETE VR EXPERIENCE.** This mod is in the EARLY STAGES of
+> development and testing. Stereo depth works, but the game currently appears as a
+> window in front of you, there are no motion controls, and visual and comfort
+> issues remain. It has been tested on a single hardware configuration. Try it as
+> an experiment and a preview, not as a finished way to play the game. Development
+> is active and every release changes things.
+
 A native OpenXR VR mod for Tom Clancy's Ghost Recon Wildlands (AnvilNext 2.0, DirectX 11).
 Head-tracked stereoscopic 3D rendered by the game's own engine, injected through a
 `dxgi.dll` proxy. No game files are modified, ever.

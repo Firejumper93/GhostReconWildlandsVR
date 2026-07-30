@@ -19,9 +19,7 @@ snapshot, not a finished mod. Expect rough edges. Performance numbers here come 
 test system; different hardware, headsets, and settings may perform noticeably worse.
 The mod is being actively optimized and improved, so expect frequent changes.
 
-Note: this README describes the current source. The packaged release on the Releases
-page may lag behind it; build from source to get everything described here. See
-[CHANGELOG.md](CHANGELOG.md) for what changed between versions.
+See [CHANGELOG.md](CHANGELOG.md) for what changed between versions.
 
 ## What works
 
@@ -77,8 +75,7 @@ page may lag behind it; build from source to get everything described here. See
 Download the latest release zip from the
 [Releases page](https://github.com/Firejumper93/GhostReconWildlandsVR/releases),
 unzip it anywhere, run `install.bat`, and read the included `INSTALL.txt`.
-The sections below are for building from source, which is currently ahead of the
-packaged release.
+The sections below are for building from source.
 
 ## Building
 

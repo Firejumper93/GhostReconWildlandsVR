@@ -5,11 +5,11 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
-## Unreleased (source, up to build 12c, 2026-07-30)
+## v0.2.0-alpha (build 12c, 2026-07-30)
 
-The source on `main` is ahead of the latest packaged release (v0.1.1-alpha).
-Build from source to get these changes; a new packaged release will follow once
-the current build finishes headset verification.
+Headline known issue: the fullscreen image is blurry in this version (the
+capture source is the game's 1080p backbuffer). This is known and is the
+focus of the next update.
 
 ### Added
 

@@ -57,6 +57,56 @@ float read_ipd(float fallback);
 void set_ipd_scale(float s);
 float ipd_scale();
 
+// BUILD 11b: fov-gated mono scope. When the published rendered fov drops
+// below this threshold (radians), the camera hook collapses the eye offset
+// to zero for those frames: magnified optics fuse and the baked-in reticle
+// stops carrying eye parallax. Measured (session 11): 3x magnifier renders
+// at 0.172, plain ADS at 0.49+, menus at 0.33+, so 0.30 separates magnified
+// optics from everything else. Written at init (grwxr.cfg mono_scope_fov),
+// read by the camera hook on the engine thread.
+void set_mono_scope_fov(float radians);
+float mono_scope_fov();
+
+// BUILD 11c: first-person DEMO. When enabled, the camera hook pushes the
+// camera position forward along the GAME camera's own forward axis (the
+// base rotation, not the head-composed one, so the offset lands at the
+// character regardless of where the head looks) by fp_forward meters,
+// placing the viewpoint roughly inside the character's head. Known demo
+// jank, documented and accepted: edge culling artifacts (visibility is
+// decided upstream of our write, build 7), hair/eyelash leakage (the head
+// is only invisible from inside via backface culling; the engine has no
+// proximity hide, verified in photo mode session 11), and the usual aim
+// decoupling. Toggled from the render thread (Numpad 8), read by the
+// camera hook on the engine thread.
+void set_fp_enabled(bool on);
+bool fp_enabled();
+void set_fp_forward(float meters);
+float fp_forward();
+
+// BUILD 11f: the third-person camera hangs off the RIGHT shoulder, so a
+// pure forward push lands right of the head (user report). Side (positive =
+// right, so the default is negative) and up offsets complete the placement,
+// all in the base camera's own axes.
+void set_fp_side(float meters);
+float fp_side();
+void set_fp_up(float meters);
+float fp_up();
+
+// BUILD 12a: FULLSCREEN. The proj[2] hook overrides the engine's rendered
+// vertical fov with fs_fov (radians) whenever the incoming fov is in the
+// world band (>= 0.60: on-foot 0.78..0.87, sprint/vehicle ~1.22, menus
+// 1.57; plain ADS 0.49..0.52 and magnified optics stay untouched, so aim
+// zoom and the flat-scope path survive). The existing live-fov blit then
+// spreads the wider image across the eye canvases with no placement
+// changes: 1.92 = 2*atan(1.428) covers the canvas's full downward tangent,
+// filling the view. fs_enabled toggles the override (Numpad 1); fs_fov is
+// grwxr.cfg fullscreen_fov, stepped live (Numpad 2 / Numpad +). Written on
+// the render thread, read by the recorder on the engine thread.
+void set_fs_enabled(bool on);
+bool fs_enabled();
+void set_fs_fov(float radians);
+float fs_fov();
+
 // BUILD 10b.1: frame-to-eye identity FIFO. The engine pipelines frame builds
 // ahead of their Presents by an unknown (and possibly varying) depth, so the
 // present side must NOT derive the eye of the backbuffer image from frame

@@ -336,6 +336,23 @@ bool write_pose_head(uint64_t cam, const float* H) {
             headpose::push_eye_tag(g_eye_toggle);
             g_head_frames.fetch_add(1, std::memory_order_relaxed);
         }
+
+        // Build 11d (combined with 11c per user, "one off"): FLAT SCOPE.
+        // Below the mono_scope_fov threshold the camera write is SKIPPED
+        // ENTIRELY (rotation AND position), superseding 11b's zero-offset
+        // gate. Reason (session 11, 6x screenshot): the game anchors the
+        // scope mask and reticle to ITS aim direction while the scene
+        // follows OUR head-composed camera, so any head-vs-aim angle
+        // displaces overlay from image, magnified by the zoom (doubled mask
+        // circles, "wildly moves", recenter-proof). With no write, the game
+        // renders its own scope view exactly like the flat game: mask
+        // centered, reticle true, ballistics match the crosshair. Head
+        // compose resumes the instant the fov rises. The per-frame block
+        // above still ran, so the eye-tag stream stays intact. read_fov is
+        // at most one frame stale, costing one frame at the transition.
+        if (headpose::read_fov(0.7853982f) < headpose::mono_scope_fov())
+            return true;
+
         float out[9];
         for (int r = 0; r < 3; ++r) {
             for (int c = 0; c < 3; ++c) {
@@ -363,8 +380,25 @@ bool write_pose_head(uint64_t cam, const float* H) {
         // said nothing about this.)
         const float half = 0.5f * headpose::read_ipd(0.063f) * headpose::ipd_scale();
         const float s    = g_eye_toggle ? -half : +half;
+        // Build 11c: first-person DEMO. Push the viewpoint forward along the
+        // BASE (game camera) forward row, so the offset lands at the
+        // character wherever the head looks. Base position and rotation are
+        // captured once per frame, so this stays frame-idempotent like
+        // everything else here. The base forward is unit length (rotation
+        // row) and fp_forward is meters (1 world unit = 1 m).
+        float pos[3] = {g_base_pos[0], g_base_pos[1], g_base_pos[2]};
+        if (headpose::fp_enabled()) {
+            // Build 11f: full placement in the base camera's axes. Row 0 is
+            // right, row 1 forward, row 2 up; the side default is negative
+            // because the third-person camera hangs off the right shoulder.
+            const float df = headpose::fp_forward();
+            const float ds = headpose::fp_side();
+            const float du = headpose::fp_up();
+            for (int c = 0; c < 3; ++c)
+                pos[c] += df * g_base[3 + c] + ds * g_base[0 + c] + du * g_base[6 + c];
+        }
         for (int c = 0; c < 3; ++c) {
-            m[12 + c] = g_base_pos[c] + s * out[c];
+            m[12 + c] = pos[c] + s * out[c];
             g_diag_written[c] = m[12 + c];
         }
         g_diag_have_written = true;
@@ -381,7 +415,7 @@ bool write_pose_head(uint64_t cam, const float* H) {
 // `stack_args` points at the caller's shadow space, so argument 5 of the hooked
 // function is stack_args[4].
 extern "C" void grwxr_probe_record(uint64_t index, const void* saved_raw,
-                                   void* return_address, const uint64_t* stack_args) {
+                                   void* return_address, uint64_t* stack_args) {
     if (index >= (uint64_t)kNumTargets) return;
     const auto* a = (const SavedArgs*)saved_raw;
 
@@ -394,7 +428,29 @@ extern "C" void grwxr_probe_record(uint64_t index, const void* saved_raw,
     if (index == kProjGameplayProbe) {
         float fovy;
         memcpy(&fovy, &stack_args[4], sizeof(fovy));
-        if (fovy > 0.01f && fovy < 3.1f) headpose::publish_fov(fovy);
+        if (fovy > 0.01f && fovy < 3.1f) {
+            // Build 12a: FULLSCREEN. Argument 5 is passed on the caller's
+            // stack, the stub tail-jumps to the real function with that
+            // stack intact, and this recorder runs first, so overwriting
+            // the slot here changes the fov the engine actually renders
+            // with. Only the world band is overridden: plain ADS
+            // (0.49..0.52) keeps its zoom and magnified optics keep the
+            // flat-scope path. The blit needs no change; it already places
+            // content by its published fov, which is the overridden value.
+            // Build 12a.1: the band gets an UPPER limit. proj[2] is also
+            // called at exactly pi/2 (1.5708), the fov of cubemap faces
+            // (sky/reflection captures); 12a widened those too and the
+            // misregistered sky layer slid against the world ("the clouds
+            // followed the headset"). 1.35 keeps everything real (world
+            // 0.78..0.87, sprint/vehicle ~1.22) and releases the captures.
+            const float fs = headpose::fs_fov();
+            if (headpose::fs_enabled() && fs > 0.0f &&
+                fovy >= 0.60f && fovy <= 1.35f) {
+                fovy = fs;
+                memcpy(&stack_args[4], &fovy, sizeof(fovy));
+            }
+            headpose::publish_fov(fovy);
+        }
     }
 
     // Build 5: when armed, capture one full argument vector of on_calc_mvp for
@@ -625,6 +681,15 @@ void dump_matrices() {
 void snap_drain() {
     static int ticks = 0;
     ++ticks;
+
+    // Build 11a diagnostic: the live published fov, once per second. This is
+    // the number the scaling blit places the content with, and the dataset
+    // for choosing the mono-scope threshold: have the user scope each optic
+    // class and read the values off these lines.
+    {
+        const float f = headpose::read_fov(0.0f);
+        if (f > 0.0f) LOG_INFO("fov: %.4f rad (%.1f deg)", f, f * 57.29578f);
+    }
 
     if (g_snap_state.load(std::memory_order_acquire) == 2) {
         print_snapshot();

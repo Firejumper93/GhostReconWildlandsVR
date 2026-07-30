@@ -31,6 +31,22 @@ std::atomic<uint32_t> g_ipd_bits{0};
 // the bits-with-zero-meaning-unset encoding above would eat it.
 std::atomic<float> g_ipd_scale{1.0f};
 
+// Build 11b. See HeadPose.h.
+std::atomic<float> g_mono_scope_fov{0.30f};
+
+// Build 11c. See HeadPose.h.
+std::atomic<bool>  g_fp_enabled{false};
+std::atomic<float> g_fp_forward{2.20f};
+
+// Build 11f. See HeadPose.h.
+std::atomic<float> g_fp_side{-0.40f};
+std::atomic<float> g_fp_up{0.0f};
+
+// Build 12a. See HeadPose.h. Enabled by default: fullscreen is the intended
+// mode; Numpad 1 drops back to the windowed view for A/B.
+std::atomic<bool>  g_fs_enabled{true};
+std::atomic<float> g_fs_fov{1.92f};
+
 // Build 10b.1. Eye-tag ring, power-of-two size. 16 slots is far deeper than
 // any real render-ahead queue; a full ring drops the push, and the resulting
 // -1 pops downgrade frames to mono rather than desyncing the eyes.
@@ -101,6 +117,62 @@ void set_ipd_scale(float s) {
 
 float ipd_scale() {
     return g_ipd_scale.load(std::memory_order_relaxed);
+}
+
+void set_mono_scope_fov(float radians) {
+    g_mono_scope_fov.store(radians, std::memory_order_relaxed);
+}
+
+float mono_scope_fov() {
+    return g_mono_scope_fov.load(std::memory_order_relaxed);
+}
+
+void set_fp_enabled(bool on) {
+    g_fp_enabled.store(on, std::memory_order_relaxed);
+}
+
+bool fp_enabled() {
+    return g_fp_enabled.load(std::memory_order_relaxed);
+}
+
+void set_fp_forward(float meters) {
+    g_fp_forward.store(meters, std::memory_order_relaxed);
+}
+
+float fp_forward() {
+    return g_fp_forward.load(std::memory_order_relaxed);
+}
+
+void set_fp_side(float meters) {
+    g_fp_side.store(meters, std::memory_order_relaxed);
+}
+
+float fp_side() {
+    return g_fp_side.load(std::memory_order_relaxed);
+}
+
+void set_fp_up(float meters) {
+    g_fp_up.store(meters, std::memory_order_relaxed);
+}
+
+float fp_up() {
+    return g_fp_up.load(std::memory_order_relaxed);
+}
+
+void set_fs_enabled(bool on) {
+    g_fs_enabled.store(on, std::memory_order_relaxed);
+}
+
+bool fs_enabled() {
+    return g_fs_enabled.load(std::memory_order_relaxed);
+}
+
+void set_fs_fov(float radians) {
+    g_fs_fov.store(radians, std::memory_order_relaxed);
+}
+
+float fs_fov() {
+    return g_fs_fov.load(std::memory_order_relaxed);
 }
 
 void push_eye_tag(int eye) {

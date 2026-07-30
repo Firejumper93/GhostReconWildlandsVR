@@ -41,6 +41,13 @@ optimized and improved, so expect frequent changes.
 - A GPU with headroom: the test system is an RTX 5060 Ti 16 GB with a Ryzen 7 9700X.
 - To build: Visual Studio 2022 or newer with the C++ workload (MSVC x64, `ml64`).
 
+## Quick install (no build needed)
+
+Download the latest release zip from the
+[Releases page](https://github.com/Firejumper93/GhostReconWildlandsVR/releases),
+unzip it anywhere, run `install.bat`, and read the included `INSTALL.txt`.
+The sections below are for building from source.
+
 ## Building
 
 1. Download the OpenXR SDK loader release from

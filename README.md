@@ -1,0 +1,148 @@
+# Ghost Recon Wildlands VR (GRW-XR)
+
+A native OpenXR VR mod for Tom Clancy's Ghost Recon Wildlands (AnvilNext 2.0, DirectX 11).
+Head-tracked stereoscopic 3D rendered by the game's own engine, injected through a
+`dxgi.dll` proxy. No game files are modified, ever.
+
+**Status: experimental alpha, in ongoing development.** Stereo fusion with real depth
+was achieved on 2026-07-29. This is a development snapshot, not a finished mod. Expect
+rough edges. Performance numbers here come from one test system; different hardware,
+headsets, and settings may perform noticeably worse. The mod is being actively
+optimized and improved, so expect frequent changes.
+
+## What works
+
+- Native OpenXR session on the game's own D3D11 device, paced by the headset (72 Hz)
+- Full head tracking (rotation) driving the actual game camera
+- Stereoscopic depth via alternate-eye rendering: the engine renders one eye per frame,
+  alternating, with per-eye swapchains and correct per-eye frustum placement
+- Recenter on the Home key, live-adjustable eye separation, config file persistence
+- Stable at 72 fps on the test system through extended open-world play
+
+## Known limitations (honest list)
+
+- The game renders its normal ~45 degree field of view, so the image appears as a
+  window in front of you rather than filling the headset. Removing this window
+  (projection override at full per-eye resolution) is the current development focus.
+- Third person camera only so far. No motion controls, no first-person body.
+- Scoped aiming renders at the wrong apparent size for now.
+- Slight visual misalignment on some objects during motion (under investigation).
+- The desktop mirror visibly alternates between eye viewpoints. This is by design;
+  judge the image only in the headset.
+- Tested on exactly one configuration (below). Other headsets and runtimes are untested.
+
+## Requirements
+
+- Ghost Recon Wildlands, Steam edition (tested against the 2023-09-14 Steam build)
+- A PC VR headset with an OpenXR runtime. Tested only on Meta Quest 3 over Link cable
+  with the Meta Quest Link runtime.
+- **Asynchronous Spacewarp must be disabled** (Oculus Debug Tool, set ASW to Disabled).
+  The mod manages the stale eye itself; ASW compounds artifacts on top of it.
+- A GPU with headroom: the test system is an RTX 5060 Ti 16 GB with a Ryzen 7 9700X.
+- To build: Visual Studio 2022 or newer with the C++ workload (MSVC x64, `ml64`).
+
+## Building
+
+1. Download the OpenXR SDK loader release from
+   https://github.com/KhronosGroup/OpenXR-SDK/releases (tested with 1.1.61).
+   Place it so these paths exist:
+   - `tools/xr_probe/extern/include/openxr/openxr.h`
+   - `tools/xr_probe/extern/lib/openxr_loader.lib`
+   Keep the loader's `openxr_loader.dll` from the same release; you will copy it to
+   the game folder in the install step.
+2. If your Visual Studio is not at the default path, edit `VCVARS` at the top of
+   `build.bat`.
+3. Run `build.bat`. Output: `build\dxgi.dll` (the script prints its SHA256).
+
+## Installing
+
+1. Close the game.
+2. If your game is not at `C:\Steam\steamapps\common\Wildlands`, edit `GAME` at the
+   top of `deploy.bat`.
+3. Run `deploy.bat auto`. It verifies the game is closed, builds, copies `dxgi.dll`
+   into the game folder, creates `dxgi_real.dll` there (a local copy of your own
+   `C:\Windows\System32\dxgi.dll`, used for export forwarding), and byte-compares
+   the result.
+4. Copy `openxr_loader.dll` (from the OpenXR SDK release in the build step) into the
+   game folder next to `GRW.exe`.
+5. Recommended in-game settings: anti-aliasing Off, motion blur Off, window mode
+   fullscreen or borderless fullscreen (a bordered window locks the game to your
+   monitor's refresh rate), resolution scaling to taste.
+6. Put the headset on so it is awake and tracking BEFORE launching the game
+   (the VR session initializes once at startup), then launch through Steam.
+
+The mod writes its runtime files to `GRWVR\` inside the game folder: a per-process
+log (`grwxr-<pid>.log`) and an optional `grwxr.cfg`.
+
+## In the headset
+
+| Key | Action |
+|---|---|
+| Home | Recenter (look where you want forward to be, then press) |
+| Numpad + / - | Eye separation scale, fine steps (0.05) |
+| Numpad Del / Enter | Eye separation scale, coarse steps (0.5) |
+| Numpad * | Reset eye separation scale to 1.0 |
+
+To persist a tuned eye separation, create `GRWVR\grwxr.cfg` containing a line like
+`ipd_scale=1.00`. The log prints the exact line to use whenever you change it.
+
+## Disabling and uninstalling
+
+- Disable temporarily: rename `dxgi.dll` in the game folder (to `dxgi.dll.off`, for
+  example). The game then runs completely unmodified.
+- Uninstall: run `deploy.bat remove`, or delete `dxgi.dll`, `dxgi_real.dll`,
+  `openxr_loader.dll`, and the `GRWVR` folder from the game directory.
+
+## Rules of use
+
+- **Solo campaign only. Never use this in co-op, PvP, or any matchmaking.** The game
+  ships Easy Anti-Cheat for multiplayer; this mod must never run in that context.
+- For now, playing in offline mode is recommended (Steam offline mode, or Ubisoft
+  Connect set to offline). It keeps the session unambiguously single-player while
+  the mod is under development.
+- This repository ships source code only. It contains no game files, no Ubisoft
+  binaries, and no anti-cheat components, and it never patches any file of your
+  install; the proxy DLL sits beside the game and is loaded by normal Windows DLL
+  search order.
+- Use at your own risk. The game's anti-tamper occasionally reacts to hooks in
+  unpredictable ways. If something looks broken, rename `dxgi.dll` and re-check
+  before blaming the game or the mod.
+
+## How it works, briefly
+
+The mod is a `dxgi.dll` search-order proxy. It hooks `IDXGISwapChain::Present`,
+creates an OpenXR session on the game's own D3D11 device, and locates the engine's
+camera update function through byte-signature scanning (never hardcoded addresses; a
+failed scan logs loudly and leaves the game untouched). Each frame it composes the
+live headset rotation onto the game camera's root transform and offsets the camera
+position left or right of center, alternating each frame. Each rendered frame is
+copied into that eye's swapchain, placed angle-correct inside a canvas shaped like
+the eye's real display frustum, and submitted with its stored pose; the compositor
+reprojects both eyes to display time. The engine therefore runs at 1x headset rate
+while both eyes stay continuously fed.
+
+## Credits
+
+- **[mutars/anvilengine2vr](https://github.com/mutars/anvilengine2vr)** (MIT): the
+  reference implementation this project is a port of. Its per-game adapter
+  architecture, hook targets, and porting guides are the foundation of this work.
+- **[elliotttate/vrframework](https://github.com/elliotttate/vrframework)**: the
+  field guides that document the technique family for AnvilNext titles.
+- **[dariulone/cyberpunk-vr-port](https://github.com/dariulone/cyberpunk-vr-port)**
+  (MIT): a sibling architecture for REDengine whose documented lessons on eye
+  tagging, pose pairing, and runtime frustum correction directly informed the
+  diagnosis of this mod's hardest bug.
+- **[pancreations/Halo-MCC-VR](https://github.com/pancreations/Halo-MCC-VR)** (MIT):
+  whose notes on Quest runtime double-vision behavior corroborated that diagnosis.
+- **[Khronos OpenXR SDK](https://github.com/KhronosGroup/OpenXR-SDK)** (Apache 2.0):
+  the OpenXR loader and headers.
+- **Claude Code (Anthropic)**: development contributor; the reverse engineering,
+  code, and diagnostics in this repository were built in collaboration with it.
+- Tom Clancy's Ghost Recon Wildlands is the property of Ubisoft. This project is not
+  affiliated with, endorsed by, or supported by Ubisoft, and distributes none of
+  their work.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Portions derived from anvilengine2vr, Copyright (c)
+2024 mutars, MIT.

@@ -1,0 +1,42 @@
+# ============================================================================
+# NEVER COMMIT: game binaries or third-party mod binaries
+# ============================================================================
+# This project ships source only. Never redistribute any file from the game
+# install, any anti-cheat component, or another mod's compiled work.
+GRW.exe
+*EasyAntiCheat*
+*.forge
+*.dat
+
+# Third-party archive/extraction tools sometimes staged locally
+Ubisoft_*_Tool.exe
+lzo2_w64.dll
+oo2core_*.dll
+zstdlib_*.dll
+AnvilToolkit*
+
+# ============================================================================
+# Build output
+# ============================================================================
+build/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+
+# The OpenXR SDK is fetched, not vendored (see README, Building).
+tools/xr_probe/extern/
+tools/xr_probe/*.exe
+
+# ============================================================================
+# Editor and OS noise
+# ============================================================================
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini
+__pycache__/
+*.pyc

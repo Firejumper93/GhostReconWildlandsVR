@@ -1,0 +1,136 @@
+// HeadPose.cpp - see HeadPose.h.
+
+#include "HeadPose.h"
+
+#include <atomic>
+#include <cstring>
+
+namespace grwxr {
+namespace headpose {
+namespace {
+
+// Seqlock. The writer bumps the counter to odd, stores the data, bumps it back
+// to even; a reader accepts a copy only if it saw the same even value on both
+// sides of it. There is exactly one writer (the Present hook), so the writer
+// side needs no CAS. The data elements are relaxed atomics rather than plain
+// floats so the concurrent access is defined behaviour; on x64 they compile to
+// ordinary moves. The odd store is seq_cst so the data stores cannot become
+// visible before the "write in progress" mark does.
+std::atomic<uint32_t> g_seq{0};
+std::atomic<bool>     g_live{false};
+std::atomic<float>    g_R[9] = {};
+
+// Build 9. Stored as float bits so 0 can mean "never published": no rendered
+// fovy is 0.0f, and the reader falls back until the first real publish.
+std::atomic<uint32_t> g_fov_bits{0};
+
+// Build 10b. Same encoding for the measured IPD.
+std::atomic<uint32_t> g_ipd_bits{0};
+
+// Build 10c. Plain atomic float: 0.0 is a legitimate value here (mono), so
+// the bits-with-zero-meaning-unset encoding above would eat it.
+std::atomic<float> g_ipd_scale{1.0f};
+
+// Build 10b.1. Eye-tag ring, power-of-two size. 16 slots is far deeper than
+// any real render-ahead queue; a full ring drops the push, and the resulting
+// -1 pops downgrade frames to mono rather than desyncing the eyes.
+constexpr uint64_t    kTagRing = 16;
+std::atomic<uint64_t> g_tag_w{0}, g_tag_r{0};
+std::atomic<uint8_t>  g_tags[kTagRing] = {};
+
+}  // namespace
+
+void publish(const float R[9]) {
+    const uint32_t s = g_seq.load(std::memory_order_relaxed);
+    g_seq.store(s + 1, std::memory_order_seq_cst);
+    for (int i = 0; i < 9; ++i) g_R[i].store(R[i], std::memory_order_relaxed);
+    g_seq.store(s + 2, std::memory_order_release);
+    g_live.store(true, std::memory_order_release);
+}
+
+void disable() {
+    g_live.store(false, std::memory_order_release);
+}
+
+bool read(float R[9]) {
+    if (!g_live.load(std::memory_order_acquire)) return false;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const uint32_t s1 = g_seq.load(std::memory_order_acquire);
+        if (s1 & 1u) continue;
+        float tmp[9];
+        for (int i = 0; i < 9; ++i) tmp[i] = g_R[i].load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (g_seq.load(std::memory_order_relaxed) != s1) continue;
+        for (int i = 0; i < 9; ++i) R[i] = tmp[i];
+        return true;
+    }
+    return false;
+}
+
+void publish_fov(float fovy_radians) {
+    uint32_t bits;
+    memcpy(&bits, &fovy_radians, sizeof(bits));
+    g_fov_bits.store(bits, std::memory_order_relaxed);
+}
+
+float read_fov(float fallback) {
+    const uint32_t bits = g_fov_bits.load(std::memory_order_relaxed);
+    if (!bits) return fallback;
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+void publish_ipd(float ipd_meters) {
+    uint32_t bits;
+    memcpy(&bits, &ipd_meters, sizeof(bits));
+    g_ipd_bits.store(bits, std::memory_order_relaxed);
+}
+
+float read_ipd(float fallback) {
+    const uint32_t bits = g_ipd_bits.load(std::memory_order_relaxed);
+    if (!bits) return fallback;
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+void set_ipd_scale(float s) {
+    g_ipd_scale.store(s, std::memory_order_relaxed);
+}
+
+float ipd_scale() {
+    return g_ipd_scale.load(std::memory_order_relaxed);
+}
+
+void push_eye_tag(int eye) {
+    const uint64_t w = g_tag_w.load(std::memory_order_relaxed);
+    if (w - g_tag_r.load(std::memory_order_acquire) >= kTagRing) return;
+    g_tags[w & (kTagRing - 1)].store((uint8_t)eye, std::memory_order_relaxed);
+    g_tag_w.store(w + 1, std::memory_order_release);
+}
+
+std::atomic<uint64_t> g_pops_tagged{0}, g_pops_mono{0};
+
+int pop_eye_tag() {
+    const uint64_t r = g_tag_r.load(std::memory_order_relaxed);
+    if (g_tag_w.load(std::memory_order_acquire) == r) {
+        g_pops_mono.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
+    const int e = g_tags[r & (kTagRing - 1)].load(std::memory_order_relaxed);
+    g_tag_r.store(r + 1, std::memory_order_release);
+    g_pops_tagged.fetch_add(1, std::memory_order_relaxed);
+    return e;
+}
+
+unsigned long long pops_tagged() { return g_pops_tagged.load(std::memory_order_relaxed); }
+unsigned long long pops_mono()   { return g_pops_mono.load(std::memory_order_relaxed); }
+
+int eye_tag_depth() {
+    return (int)(g_tag_w.load(std::memory_order_relaxed) -
+                 g_tag_r.load(std::memory_order_relaxed));
+}
+
+}  // namespace headpose
+}  // namespace grwxr

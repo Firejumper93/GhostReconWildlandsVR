@@ -355,13 +355,14 @@ bool write_pose_head(uint64_t cam, const float* H) {
         // frame, absolute value written on every call.
         // Build 10c: ipd_scale tunes perceived separation against the game's
         // actual world scale (grwxr.cfg, Numpad +/- live).
-        // Build 10f: 10e's eye swap discriminator returned NULL (headset
-        // identical with eyes exchanged), so the conventional mapping is
-        // restored per workflow rule 6. The null result is recorded in
-        // CURRENT-STATE: the doubling is insensitive to which viewpoint
-        // reaches which eye.
+        // Build 10m: mapping inverted. Once 10L made the eyes fuse, the
+        // user's depth verdict landed at ipd_scale -0.50 (run of 2026-07-29
+        // 20:44), so the 10f "conventional" sign was backwards for the actual
+        // eye routing. The sign is folded in here: positive scale is now the
+        // correct-depth direction. (10e's eye-swap null predates fusion and
+        // said nothing about this.)
         const float half = 0.5f * headpose::read_ipd(0.063f) * headpose::ipd_scale();
-        const float s    = g_eye_toggle ? +half : -half;
+        const float s    = g_eye_toggle ? -half : +half;
         for (int c = 0; c < 3; ++c) {
             m[12 + c] = g_base_pos[c] + s * out[c];
             g_diag_written[c] = m[12 + c];

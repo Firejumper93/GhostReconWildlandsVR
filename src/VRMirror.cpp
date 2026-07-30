@@ -85,6 +85,11 @@ char g_deferred[2048] = {};
 // texture rather than assuming we can CopyResource straight in.
 ID3D11Texture2D* g_staging = nullptr;
 
+// Build 10m: the ipd_scale the run started with (cfg value, or 1.0 with no
+// cfg). Numpad * resets to this rather than a hardcoded 1.0, so reset means
+// "back to my tuned value", not "back to untuned".
+float g_ipd_default = 1.0f;
+
 void note(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -99,7 +104,7 @@ void load_config() {
     const std::wstring path = log::data_dir() + L"\\grwxr.cfg";
     FILE* f = nullptr;
     if (_wfopen_s(&f, path.c_str(), L"rt") != 0 || !f) {
-        LOG_INFO("VR: no grwxr.cfg, ipd_scale = 1.00 (Numpad +/- adjusts, * resets)");
+        LOG_INFO("VR: no grwxr.cfg, ipd_scale = 1.00 (Numpad 9/- adjusts, * resets)");
         return;
     }
     char line[256];
@@ -107,13 +112,14 @@ void load_config() {
         if (line[0] == '#') continue;
         float v = 0.0f;
         if (sscanf_s(line, " ipd_scale = %f", &v) == 1) {
-            if (v < -20.0f) v = -20.0f;
-            if (v >  20.0f) v =  20.0f;
+            if (v < -2.0f) v = -2.0f;
+            if (v >  2.0f) v =  2.0f;
             headpose::set_ipd_scale(v);
         }
     }
     fclose(f);
-    LOG_INFO("VR: grwxr.cfg read, ipd_scale = %.2f (Numpad +/- adjusts, * resets)",
+    g_ipd_default = headpose::ipd_scale();
+    LOG_INFO("VR: grwxr.cfg read, ipd_scale = %.2f (Numpad 9/- adjusts, * resets to it)",
              headpose::ipd_scale());
 }
 
@@ -571,40 +577,31 @@ void on_present(const d3d11::State& st) {
     }
 
     // Build 10c: live eye-separation tuning, same edge-triggered pattern.
-    // Numpad + / - step ipd_scale by 0.05, Numpad * resets to 1.
-    // Build 10g: range extended to [-3, +3]. At scale 0.00 a residual double
-    // image SURVIVES (measured 2026-07-29 18:03), so the user sweeps negative
-    // until the copies merge; the merge value measures the constant
-    // post-submission separation in IPD units. Negative scale renders each
-    // tagged eye from the opposite side, nothing else changes.
-    // note() is a single slot, so while tapping only the newest value shows;
-    // the last change before the drain is the one that lands in the log.
-    // Build 10h: coarse steps for the merge hunt. Numpad Del (VK_DECIMAL)
-    // steps -0.5, Enter steps +0.5 (VK_RETURN cannot distinguish the numpad
-    // Enter from the main one, so both bump it; diagnostic build, acceptable).
-    // Range widened to [-20, +20]: -3 was not enough to merge the copies.
+    // Numpad 9 steps ipd_scale +0.05, Numpad - steps -0.05, Numpad * resets
+    // to the startup value (cfg default).
+    // Build 10m: the 10h coarse merge-hunt keys are REMOVED. The merge
+    // measurement is done, and VK_RETURN is global, so any Enter press
+    // (menus, chat) silently bumped depth by +0.5 (hazard 15; it fired in
+    // the 20:44 run, kicking a tuned -0.50 back to 0.00 right before quit).
+    // Increase moved from Numpad + to Numpad 9 (user request), and the
+    // sweep range [-20, +20] tightened back to [-2, +2].
     {
         static bool s_add = false, s_sub = false, s_mul = false;
-        static bool s_dec = false, s_ret = false;
-        const bool add = (GetAsyncKeyState(VK_ADD)      & 0x8000) != 0;
+        const bool add = (GetAsyncKeyState(VK_NUMPAD9)  & 0x8000) != 0;
         const bool sub = (GetAsyncKeyState(VK_SUBTRACT) & 0x8000) != 0;
         const bool mul = (GetAsyncKeyState(VK_MULTIPLY) & 0x8000) != 0;
-        const bool dec = (GetAsyncKeyState(VK_DECIMAL)  & 0x8000) != 0;
-        const bool ret = (GetAsyncKeyState(VK_RETURN)   & 0x8000) != 0;
         float s = headpose::ipd_scale();
         bool changed = false;
         if (add && !s_add) { s += 0.05f; changed = true; }
         if (sub && !s_sub) { s -= 0.05f; changed = true; }
-        if (dec && !s_dec) { s -= 0.5f;  changed = true; }
-        if (ret && !s_ret) { s += 0.5f;  changed = true; }
-        if (mul && !s_mul) { s = 1.0f;   changed = true; }
+        if (mul && !s_mul) { s = g_ipd_default; changed = true; }
         if (changed) {
-            if (s < -20.0f) s = -20.0f;
-            if (s >  20.0f) s =  20.0f;
+            if (s < -2.0f) s = -2.0f;
+            if (s >  2.0f) s =  2.0f;
             headpose::set_ipd_scale(s);
             note("VR: ipd scale = %.2f (persist it as ipd_scale=%.2f in grwxr.cfg)", s, s);
         }
-        s_add = add; s_sub = sub; s_mul = mul; s_dec = dec; s_ret = ret;
+        s_add = add; s_sub = sub; s_mul = mul;
     }
     if (g_dead || !g_active.load(std::memory_order_relaxed)) return;
 

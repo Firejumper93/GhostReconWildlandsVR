@@ -5,6 +5,45 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
+## v0.4.0-alpha (build 19, 2026-08-03, source drop; a packaged release follows with the beta)
+
+The three oldest gaps in first person closed in one night: the camera now rides the
+character's actual head bone, the head is hidden from the inside, and an optional 1:1
+head-aim mode makes bullets follow your gaze. Headline known issue: your own chest and
+hands blur at close range in first person (the world stays sharp); removing that blur
+is the focus of the next update.
+
+### Added
+
+- **Head-bone first person** (build 16a). The first-person viewpoint anchors to the
+  player's animated head bone instead of the character origin: eye height tracks
+  standing, crouch and prone automatically, the camera follows animation without
+  jumping, and idle head motion is real. New keys `fp_head_anchor` (default 1) and
+  `fp_head_eye` (offset above the bone, default 0.10 m); Numpad 7/4 tune the offset
+  in 0.02 m steps while anchored.
+- **Head hiding in first person** (build 18). The character's head is hidden through
+  the engine's own head-visibility mechanism whenever first person is on, and restored
+  when it is off. The engine applies visibility on aim and camera transitions, so the
+  hide or un-hide lands at the next such transition (tapping aim once is enough); this
+  is expected.
+- **Continuous 1:1 head aim** (build 19, Numpad Decimal, default off). Head yaw and
+  pitch feed the game's own aim path as the engine consumes them, so view, reticle and
+  bullets follow the gaze exactly while the right stick still turns underneath.
+  Aiming down sights pauses the injection so scopes stay true. New config keys
+  `aim_yaw_sign` / `aim_pitch_sign` calibrate the engine's aim directions (defaults
+  -1 / +1 for the current game build; the axes genuinely differ). If a future game
+  patch reverses an axis, flip that sign.
+
+### Known issues
+
+- Close-range blur on your own chest and hands in first person; the world is sharp.
+  Fix in progress (see the README roadmap).
+- No IK arms or hands yet; the weapon is not held by your controllers.
+- The camera can attach to the wrong body after a respawn or fast travel; toggle first
+  person off and on while facing your character to re-acquire.
+- Aerial vehicle interiors are not yet wired up (ground vehicles are playable).
+- Frame rate dips below 72 in dense towns on the test system.
+
 ## v0.3.0-alpha (build 15L, 2026-08-02)
 
 The blur is gone, motion controls arrived, and first person now attaches to your

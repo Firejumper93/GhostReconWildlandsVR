@@ -3,24 +3,28 @@
 > [!WARNING]
 > **THIS IS NOT A COMPLETE VR EXPERIENCE.** This mod is in the EARLY STAGES of
 > development and testing. Stereo depth, a fullscreen 4K view, motion-controller
-> aiming and an anchored first-person camera all work, but first person does not yet
-> follow the head bone, your character's head is not hidden, there are no IK arms or
-> hands, and comfort issues remain. It has been tested on a single hardware
-> configuration. Try it as an experiment and a preview, not as a finished way to play
-> the game. Development is active and every release changes things.
+> aiming, and a real first-person camera (anchored to your character's head bone,
+> with the head hidden and optional 1:1 head aim) all work, but there are no IK
+> arms or hands yet, your own chest and hands blur at close range in first person,
+> and comfort issues remain. It has been tested on a single hardware configuration.
+> Try it as an experiment and a preview, not as a finished way to play the game.
+> Development is active and every release changes things.
 
 A native OpenXR VR mod for Tom Clancy's Ghost Recon Wildlands (AnvilNext 2.0, DirectX 11).
 Head-tracked stereoscopic 3D rendered by the game's own engine, injected through a
 `dxgi.dll` proxy. No game files are modified, ever.
 
 **Status: experimental alpha, in ongoing development.** Stereo fusion with real depth
-was achieved on 2026-07-29, the fullscreen view on 2026-07-30, and 4K internal
-rendering, motion-controller aiming and anchored first person on 2026-08-01/02. This is
-a development snapshot, not a finished mod. Expect rough edges. Performance numbers here come from one
-test system; different hardware, headsets, and settings may perform noticeably worse.
-The mod is being actively optimized and improved, so expect frequent changes.
+was achieved on 2026-07-29, the fullscreen view on 2026-07-30, 4K internal rendering,
+motion-controller aiming and anchored first person on 2026-08-01/02, and head-bone
+first person, head hiding, and continuous 1:1 head aim on 2026-08-03. This is a
+development snapshot, not a finished mod. Expect rough edges. Performance numbers here
+come from one test system; different hardware, headsets, and settings may perform
+noticeably worse. The mod is being actively optimized and improved, so expect frequent
+changes.
 
-See [CHANGELOG.md](CHANGELOG.md) for what changed between versions.
+See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, and the
+[Roadmap](#roadmap) below for what is coming and how close it is.
 
 ## What works
 
@@ -39,9 +43,17 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed between versions.
 - **Motion-controller aiming and firing.** A partial right-trigger squeeze aims down
   sights, a full squeeze fires (hold for automatic), and pointing the controller away
   from head center turns the game's own aim, so ballistics, HUD and crosshair stay true.
-- **Anchored first person.** A toggle moves the viewpoint onto the player character
-  itself. The player is identified through the engine's own player component, so the
-  camera attaches to your body rather than to a nearby NPC.
+- **True first person, anchored to your head bone.** A toggle moves the viewpoint onto
+  the player character's actual animated head bone: eye height tracks standing, crouch
+  and prone automatically, the camera stays glued to the head while moving, and the
+  player is identified through the engine's own player component so it attaches to your
+  body rather than to a nearby NPC.
+- **Your character's head is hidden in first person**, using the engine's own
+  head-visibility mechanism, so you no longer see hair or helmet geometry from inside.
+- **Continuous 1:1 head aim** (optional, Numpad Decimal). Your head's yaw and pitch feed
+  the game's own aim path, so the view, reticle and bullets all follow your gaze
+  exactly, while the right stick still turns underneath you. Aiming down sights pauses
+  it so scopes stay true.
 - **Scoped aiming**: while scoped, the mod steps aside so the scope renders exactly as
   the flat game and bullets land on the crosshair. Magnified optics are displayed
   across a comfortable window so they actually magnify instead of shrinking to their
@@ -53,23 +65,44 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed between versions.
 
 ## Known limitations (honest list)
 
-- **First person does not track the head bone yet.** The viewpoint is anchored to the
-  character's origin plus a configurable eye height, so it can sit slightly behind or
-  above the real head position, it does not follow idle animations, and it does not
-  compensate for crouch or prone. Head-bone tracking is the current development focus.
-- **Your character's head is not hidden** in first person. You are inside the model and
-  rely on backface culling; expect to see hair or helmet geometry at some angles.
+- **Your own chest and hands blur at close range in first person.** The world stays
+  sharp; the blur is the engine's close-range depth blur on geometry nearly touching
+  the camera. Removing it is the current development focus.
 - **No IK arms or hands.** Aiming is steered through the game's own aim path; the weapon
   is not held by your controllers.
+- Head hiding and un-hiding engage on the next aim transition (for example, tapping
+  aim), not instantly at the toggle. This is how the engine re-asserts visibility and
+  is expected behavior.
 - The camera can occasionally attach to the wrong body after a respawn or fast travel.
   Toggling first person off and on while facing your character re-acquires it.
-- Vehicles in first person are unfinished.
+- Vehicles in first person are unfinished. Ground vehicles are playable and fun in
+  practice; aerial vehicle interiors are not yet wired up.
 - Wide-angle rendering can look warped or "off" toward the edges; the projection
   geometry is under active tuning.
 - Sky and cloud registration at wide field of view is still imperfect.
 - Frame rate dips below 72 in dense towns on the test system.
 - The desktop mirror shows a cropped single eye; judge the image only in the headset.
 - Tested on exactly one configuration (below). Other headsets and runtimes are untested.
+- If a game patch ever makes head aim turn the wrong way, flip `aim_yaw_sign` or
+  `aim_pitch_sign` in the config (the engine's aim directions are calibrated per game
+  build; the signs differ per axis on the current build).
+
+## Roadmap
+
+What is being worked on right now, with an honest estimate of how far along each item
+is. Percentages are progress toward shipping, not promises or dates; they move as
+evidence comes in.
+
+| Feature | Progress | Where it stands |
+|---|---|---|
+| Motion-controlled gun aim (the gun follows your controller, hip fire) | ~70% | The aim machinery is proven end to end with head aim driving it; remaining work is swapping the angle source to the controller ray and adding smoothing and clamps |
+| First-person body blur removal | ~50% | Cause narrowed to the engine's close-range blur; two candidate switches located in the engine's settings, one measurement run needed to pick the route |
+| Full Touch controller support (play without holding a gamepad) | ~40% | The input route is verified (the game accepts a merged XInput stream and loads it from the game folder); the merge layer itself is not yet written |
+| Performance pass for dense towns | ~30% | The engine's shadow-quality lever is located and writable live; a measurement run will decide what ships |
+| Aerial vehicle interior camera | ~20% | Ground-vehicle first person already works in practice; helicopter and plane interiors need their camera behavior characterized first |
+| VR arms and hands (IK) | ~10% | Blocked on locating the GPU skinning data; the engine's own IK system is confirmed present, which is the long-term route |
+
+A public **beta** is planned once the top items land.
 
 ## Requirements
 
@@ -114,8 +147,8 @@ The sections below are for building from source.
    game folder next to `GRW.exe`.
 5. Recommended in-game settings: motion blur Off, window mode fullscreen or borderless
    fullscreen (a bordered window locks the game to your monitor's refresh rate),
-   resolution scaling to taste. Anti-aliasing is your preference; SMAA and TAA both
-   work under the stereo setup.
+   Supersampling 0.90, frame rate limit 72, and **SMAA anti-aliasing** (at 4K the
+   temporal modes blend the alternating eye viewpoints into a shimmer on static edges).
 6. Put the headset on so it is awake and tracking BEFORE launching the game
    (the VR session initializes once at startup), then launch through Steam.
 
@@ -133,8 +166,9 @@ All hotkeys are on the numeric keypad and are read live while the game has focus
 | Numpad * | Reset eye separation scale to its startup value |
 | Numpad 1 | Fullscreen field-of-view override on / off |
 | Numpad + / Numpad 2 | Fullscreen field of view wider / narrower (0.10 rad steps) |
-| Numpad 8 | First person on / off |
-| Numpad 7 / Numpad 4 | First person: eye height up / down (0.05 m) while anchored to the character, otherwise camera forward / back (0.10 m) |
+| Numpad 8 | First person on / off (head hiding follows it automatically) |
+| Numpad . (Decimal) | 1:1 head aim on / off (bullets follow your gaze; default off) |
+| Numpad 7 / Numpad 4 | First person: eye height up / down (0.02 m steps while anchored to the head bone), otherwise camera forward / back |
 | Numpad 6 / Numpad 5 | First person: viewpoint right / left |
 | Numpad 3 / Numpad 0 | First person: viewpoint up / down (unanchored fallback only) |
 | Numpad / | Desktop recording view on / off |
@@ -162,8 +196,11 @@ key in comments. The ones most worth knowing:
 | `ipd_scale` | Eye separation multiplier (default 0.50) |
 | `fullscreen_fov` | Rendered field of view in radians (default 1.92) |
 | `upsize_width` / `upsize_height` | Internal render size (default 3840x2160). Lower it, for example 3200x1800, to trade sharpness for frame rate |
-| `fp_eye` | First-person eye height above the character origin, meters |
+| `fp_head_anchor` | `1` (default) anchors first person to the character's head bone; `0` falls back to the origin anchor |
+| `fp_head_eye` | Eye offset above the head bone, meters (default 0.10) |
+| `fp_eye` | First-person eye height above the character origin, meters (fallback anchor only) |
 | `fp_anchor_side` | First-person lateral centering, meters |
+| `aim_yaw_sign`, `aim_pitch_sign` | Head-aim direction calibration (defaults -1 and +1 for the current game build; flip one only if head aim turns the wrong way on that axis) |
 | `aim_steer`, `aim_ads`, `aim_fire` | Motion-control features, set any to `0` to disable |
 | `desktop_fov` | Crop of the desktop recording view, `0` disables |
 

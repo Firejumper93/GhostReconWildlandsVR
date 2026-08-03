@@ -5,6 +5,71 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
+## v0.3.0-alpha (build 15L, 2026-08-02)
+
+The blur is gone, motion controls arrived, and first person now attaches to your
+actual character. Headline known issue: first person is anchored to the character's
+origin rather than the head bone, so the viewpoint can sit slightly off, does not
+follow idle animation, and does not compensate for crouch or prone. Head-bone
+tracking is the focus of the next update.
+
+### Added
+
+- **4K internal rendering with no desktop changes** (builds 15a, 15b, 15c). The mod
+  hooks the DXGI factory to create the game's swapchain at `upsize_width` x
+  `upsize_height` (default 3840x2160), keeps that size across the engine's own
+  `ResizeBuffers` call, and reports the upsized client area to the game so its entire
+  render pipeline runs at that resolution. The v0.2.0 blur is fixed at the source, and
+  no display or driver setting is required. Lower the two keys (for example
+  3200x1800) to trade sharpness for frame rate.
+- **Motion-controller aiming** (build 14d). Pointing the right Touch controller away
+  from head center turns the game's own aim, injected as relative mouse motion, so
+  ballistics, HUD and crosshair stay true. Tunable via `aim_deadzone_deg`, `aim_gain`,
+  `aim_max_rate`; `aim_steer=0` disables.
+- **Aim down sights and fire on the right trigger** (builds 14f, 14h). A partial
+  squeeze engages the game's own ADS; a full squeeze fires and holds for automatic
+  weapons, releasing back into the ADS band so you can stop shooting while staying
+  aimed. `aim_ads=0` and `aim_fire=0` disable them independently.
+- **Anchored first person** (builds 15e, 15L). The first-person toggle now places the
+  viewpoint on the player character itself rather than pushing it forward from the
+  third-person camera, so it no longer slides when the chase camera pitches or orbits.
+  The player is identified through the engine's own player component, so the camera
+  attaches to your body and not to a nearby NPC. New keys `fp_eye` (eye height above
+  the character origin, default 0.85 m) and `fp_anchor_side` (lateral centering);
+  Numpad 7/4 and 6/5 tune them live while anchored.
+- **Cropped desktop recording view** (build 12c, verified this cycle). Numpad /
+  toggles it; `desktop_fov` sets the crop.
+
+### Fixed
+
+- **Rotation stutter** (build 13a). The layer submitted to the compositor now carries
+  the exact head orientation the frame was rendered with, instead of the pose sampled
+  at present time. Under alternate-eye rendering the engine's pipeline depth varies
+  frame to frame, which made that mismatch oscillate and read as a shimmer during head
+  turns.
+- **Camera jumping to the barrel of the gun while aiming** (build 15e.2). Player
+  identification is frozen whenever the rendered field of view is inside the aim band,
+  where the weapon's own rig sits dead center in front of the camera.
+
+### Changed
+
+- **SMAA is now the recommended anti-aliasing mode.** At 4K the temporal modes blend
+  the two alternating eye viewpoints into a shimmering halo on static edges; the blur
+  of the old 1080p capture was hiding it.
+- Recommended settings are Supersampling 0.90 with a 72 fps limit. At 4K with
+  Supersampling 1.0 the test system cannot hold 72.
+
+### Known issues
+
+- First person does not track the head bone (see above); your character's head is not
+  hidden, so you may see hair or helmet geometry at some angles.
+- No IK arms or hands; the weapon is not held by your controllers.
+- The camera can attach to the wrong body after a respawn or fast travel. Toggle first
+  person off and on while facing your character to re-acquire.
+- Vehicles in first person are unfinished.
+- Sky and cloud registration at wide field of view is still imperfect.
+- Frame rate dips below 72 in dense towns on the test system.
+
 ## v0.2.0-alpha (build 12c, 2026-07-30)
 
 Headline known issue: the fullscreen image is blurry in this version (the

@@ -19,6 +19,9 @@ namespace {
 std::atomic<uint32_t> g_seq{0};
 std::atomic<bool>     g_live{false};
 std::atomic<float>    g_R[9] = {};
+// Build 13a: the same orientation as an absolute XR-space quaternion, inside
+// the same seqlock so R and q can never be read from different publishes.
+std::atomic<float>    g_Q[4] = {};
 
 // Build 9. Stored as float bits so 0 can mean "never published": no rendered
 // fovy is 0.0f, and the reader falls back until the first real publish.
@@ -41,6 +44,17 @@ std::atomic<float> g_fp_forward{2.20f};
 // Build 11f. See HeadPose.h.
 std::atomic<float> g_fp_side{-0.40f};
 std::atomic<float> g_fp_up{0.0f};
+// Build 15e: anchored first person. Eye height above the CHARACTER ORIGIN
+// (obj+0x120, [VERIFIED]), meters, world up. 0.85 is the user's tuned value
+// (2026-08-02; the origin is not at the feet).
+std::atomic<float> g_fp_eye{0.85f};
+// Build 15e.3: anchored lateral offset, meters along the base camera's right
+// axis, for centering the viewpoint on the head (the body blades in
+// weapon-ready stances, so the head is not above the origin).
+std::atomic<float> g_fp_anchor_side{0.0f};
+// The pinned player character object, published by the probe's 1 Hz pin and
+// read per frame by the camera write. 0 = no pin, fall back to the push.
+std::atomic<unsigned long long> g_player_obj{0};
 
 // Build 12a. See HeadPose.h. Enabled by default: fullscreen is the intended
 // mode; Numpad 1 drops back to the windowed view for A/B.
@@ -50,16 +64,23 @@ std::atomic<float> g_fs_fov{1.92f};
 // Build 10b.1. Eye-tag ring, power-of-two size. 16 slots is far deeper than
 // any real render-ahead queue; a full ring drops the push, and the resulting
 // -1 pops downgrade frames to mono rather than desyncing the eyes.
+// Build 13a: each slot also carries the XR-space orientation the frame was
+// composed with. Plain (non-atomic) fields are defined behaviour here: the
+// single producer fills the slot BEFORE the release store of g_tag_w, and the
+// single consumer reads it AFTER the acquire load, so the indices order every
+// slot access.
+struct Tag { uint8_t eye; float q[4]; };
 constexpr uint64_t    kTagRing = 16;
 std::atomic<uint64_t> g_tag_w{0}, g_tag_r{0};
-std::atomic<uint8_t>  g_tags[kTagRing] = {};
+Tag                   g_tags[kTagRing] = {};
 
 }  // namespace
 
-void publish(const float R[9]) {
+void publish(const float R[9], const float q_xr[4]) {
     const uint32_t s = g_seq.load(std::memory_order_relaxed);
     g_seq.store(s + 1, std::memory_order_seq_cst);
     for (int i = 0; i < 9; ++i) g_R[i].store(R[i], std::memory_order_relaxed);
+    for (int i = 0; i < 4; ++i) g_Q[i].store(q_xr[i], std::memory_order_relaxed);
     g_seq.store(s + 2, std::memory_order_release);
     g_live.store(true, std::memory_order_release);
 }
@@ -68,16 +89,18 @@ void disable() {
     g_live.store(false, std::memory_order_release);
 }
 
-bool read(float R[9]) {
+bool read(float R[9], float q_xr[4]) {
     if (!g_live.load(std::memory_order_acquire)) return false;
     for (int attempt = 0; attempt < 4; ++attempt) {
         const uint32_t s1 = g_seq.load(std::memory_order_acquire);
         if (s1 & 1u) continue;
-        float tmp[9];
+        float tmp[9], tq[4];
         for (int i = 0; i < 9; ++i) tmp[i] = g_R[i].load(std::memory_order_relaxed);
+        for (int i = 0; i < 4; ++i) tq[i]  = g_Q[i].load(std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_acquire);
         if (g_seq.load(std::memory_order_relaxed) != s1) continue;
         for (int i = 0; i < 9; ++i) R[i] = tmp[i];
+        for (int i = 0; i < 4; ++i) q_xr[i] = tq[i];
         return true;
     }
     return false;
@@ -159,6 +182,30 @@ float fp_up() {
     return g_fp_up.load(std::memory_order_relaxed);
 }
 
+void set_fp_anchor_side(float meters) {
+    g_fp_anchor_side.store(meters, std::memory_order_relaxed);
+}
+
+float fp_anchor_side() {
+    return g_fp_anchor_side.load(std::memory_order_relaxed);
+}
+
+void set_fp_eye(float meters) {
+    g_fp_eye.store(meters, std::memory_order_relaxed);
+}
+
+float fp_eye() {
+    return g_fp_eye.load(std::memory_order_relaxed);
+}
+
+void set_player_obj(unsigned long long p) {
+    g_player_obj.store(p, std::memory_order_relaxed);
+}
+
+unsigned long long player_obj() {
+    return g_player_obj.load(std::memory_order_relaxed);
+}
+
 void set_fs_enabled(bool on) {
     g_fs_enabled.store(on, std::memory_order_relaxed);
 }
@@ -175,22 +222,28 @@ float fs_fov() {
     return g_fs_fov.load(std::memory_order_relaxed);
 }
 
-void push_eye_tag(int eye) {
+void push_eye_tag(int eye, const float q_xr[4]) {
     const uint64_t w = g_tag_w.load(std::memory_order_relaxed);
     if (w - g_tag_r.load(std::memory_order_acquire) >= kTagRing) return;
-    g_tags[w & (kTagRing - 1)].store((uint8_t)eye, std::memory_order_relaxed);
+    Tag& t = g_tags[w & (kTagRing - 1)];
+    t.eye = (uint8_t)eye;
+    for (int i = 0; i < 4; ++i) t.q[i] = q_xr[i];
     g_tag_w.store(w + 1, std::memory_order_release);
 }
 
 std::atomic<uint64_t> g_pops_tagged{0}, g_pops_mono{0};
 
-int pop_eye_tag() {
+int pop_eye_tag(float q_xr[4], bool* q_ok) {
     const uint64_t r = g_tag_r.load(std::memory_order_relaxed);
     if (g_tag_w.load(std::memory_order_acquire) == r) {
         g_pops_mono.fetch_add(1, std::memory_order_relaxed);
+        if (q_ok) *q_ok = false;
         return -1;
     }
-    const int e = g_tags[r & (kTagRing - 1)].load(std::memory_order_relaxed);
+    const Tag& t = g_tags[r & (kTagRing - 1)];
+    const int e = t.eye;
+    for (int i = 0; i < 4; ++i) q_xr[i] = t.q[i];
+    if (q_ok) *q_ok = true;
     g_tag_r.store(r + 1, std::memory_order_release);
     g_pops_tagged.fetch_add(1, std::memory_order_relaxed);
     return e;

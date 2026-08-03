@@ -103,11 +103,11 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain* sc, UINT sync, UINT fla
     return g_orig_present(sc, sync, flags);
 }
 
-// ResizeBuffers is deliberately NOT hooked. See docs/RE-notes.md do-not-hook
-// list: hooking it by vtable patch caused unbounded recursion and a stack
-// overflow before the game reached a single frame. We do not need it. Instead,
-// Present re-reads the swapchain description whenever the cached size looks
-// stale, which costs one GetDesc on a resize rather than a hook on a hot path.
+// ResizeBuffers is not hooked HERE. This module still relies on Present
+// re-reading the swapchain description when the cached size looks stale.
+// Build 15b hooks ResizeBuffers in FactoryHook.cpp for the swapchain upsize,
+// with the re-entrancy guard whose absence caused the 2026-07-28 recursion
+// crash (docs/RE-notes.md, do-not-hook entry retired with evidence).
 
 // Does this process own a visible top-level window? Used to tell the real game
 // apart from the two transient launcher processes GRW.exe spawns.
@@ -190,7 +190,7 @@ bool install() {
     LOG_INFO("  slot %d Present       = 0x%p", kPresentSlot, g_vtable[kPresentSlot]);
     LOG_INFO("  slot %d ResizeBuffers = 0x%p", kResizeBuffersSlot, g_vtable[kResizeBuffersSlot]);
 
-    // Only Present is hooked. ResizeBuffers is on the do-not-hook list.
+    // Only Present is hooked here. FactoryHook owns the ResizeBuffers hook (15b).
     if (!patch_slot(g_vtable, kPresentSlot, (void*)&hooked_present, (void**)&g_orig_present)) {
         LOG_ERROR("failed to patch Present slot");
         goto cleanup;
@@ -206,7 +206,7 @@ bool install() {
     }
 
     LOG_INFO("hook installed. original Present = 0x%p", (void*)g_orig_present);
-    LOG_INFO("ResizeBuffers deliberately NOT hooked (do-not-hook list: caused recursion)");
+    LOG_INFO("ResizeBuffers not hooked by this module (FactoryHook hooks it guarded, build 15b)");
     g_installed.store(true);
 
 cleanup:

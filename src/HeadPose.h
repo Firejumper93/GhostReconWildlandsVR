@@ -23,17 +23,21 @@ namespace grwxr {
 namespace headpose {
 
 // Render thread, once per presented frame. R is a 3x3 rotation, row-major,
-// game basis, row-vector convention.
-void publish(const float R[9]);
+// game basis, row-vector convention. q_xr is the SAME head orientation as an
+// absolute XR-space quaternion (x,y,z,w in the layer space), carried along so
+// the camera hook can echo back exactly which orientation each built frame
+// was composed with (BUILD 13a, render-pose submit).
+void publish(const float R[9], const float q_xr[4]);
 
 // Stop the camera write (session STOPPING/EXITING, shutdown). read() returns
 // false until the next publish, so the game's own camera takes back over.
 void disable();
 
-// Engine thread. Copies the latest published rotation into R and returns
-// true. Returns false if nothing has been published, the channel is disabled,
-// or the read tore; the caller must then leave the camera untouched.
-bool read(float R[9]);
+// Engine thread. Copies the latest published rotation into R (and the
+// matching XR-space quaternion into q_xr) and returns true. Returns false if
+// nothing has been published, the channel is disabled, or the read tore; the
+// caller must then leave the camera untouched.
+bool read(float R[9], float q_xr[4]);
 
 // Engine thread, from the proj[2] hook: the vertical field of view the frame
 // is being rendered with, in radians.
@@ -92,6 +96,28 @@ float fp_side();
 void set_fp_up(float meters);
 float fp_up();
 
+// Build 15e: ANCHORED FIRST PERSON. The 11c demo pushed the camera forward
+// from the third-person camera, which drifts as that camera pitches and
+// orbits ("gets out of whack when you control the character"). Instead the
+// viewpoint is placed at the CHARACTER's own world origin (skeleton +0x120,
+// [VERIFIED] 2026-08-01) plus fp_eye meters of world up, so it stays put
+// while the player moves. fp_side/fp_up remain as fine trim in camera axes.
+void set_fp_eye(float meters);
+float fp_eye();
+
+// Build 15e.3: anchored lateral centering, meters along the base camera's
+// right axis (positive = right). Cfg key fp_anchor_side, Numpad 6/5 live
+// while a pin exists.
+void set_fp_anchor_side(float meters);
+float fp_anchor_side();
+
+// The pinned player character object. Published by the read-only probe's
+// 1 Hz pin (which picks the character the chase camera is LOOKING AT, the
+// discriminator that survives teammates standing close), consumed by the
+// camera write, which re-reads the origin every frame. 0 = no pin.
+void set_player_obj(unsigned long long p);
+unsigned long long player_obj();
+
 // BUILD 12a: FULLSCREEN. The proj[2] hook overrides the engine's rendered
 // vertical fov with fs_fov (radians) whenever the incoming fov is in the
 // world band (>= 0.60: on-foot 0.78..0.87, sprint/vehicle ~1.22, menus
@@ -115,10 +141,21 @@ float fs_fov();
 // present. Frames present in build order, so the oldest tag always names the
 // image being presented, whatever the pipeline depth. Single producer
 // (engine thread), single consumer (render thread), lock-free ring.
-void push_eye_tag(int eye);   // engine thread, once per built frame
-int  pop_eye_tag();           // render thread, once per present; -1 if none
-                              // (no camera write happened for this frame:
-                              // menus, loading; treat the image as mono)
+// BUILD 13a: each tag also carries the absolute XR-space head orientation the
+// frame's content was composed with (the q_xr the camera hook consumed), so
+// the present side can submit the TRUE render pose instead of a freshly
+// located one. Submitting a present-time pose the content was not rendered
+// with makes the compositor's timewarp land each submission at a slightly
+// different angle; with the build-to-present pipeline depth flapping 0..1
+// (10b logs) the error oscillates per refresh: monocular 36 Hz stutter during
+// head rotation, invisible when still (session 13 headset report, the exact
+// discriminator pattern). Prior art: cyberpunk-vr-port "render-pose submit".
+void push_eye_tag(int eye, const float q_xr[4]);  // engine thread, once per
+                                                  // built frame
+int  pop_eye_tag(float q_xr[4], bool* q_ok);      // render thread, once per
+                              // present; -1 if none (no camera write happened
+                              // for this frame: menus, loading; treat the
+                              // image as mono). q_ok false on -1.
 int  eye_tag_depth();         // diagnostic: current ring occupancy
 
 // BUILD 10b.2 diagnostics: how many pops found a tag vs came up empty (mono).

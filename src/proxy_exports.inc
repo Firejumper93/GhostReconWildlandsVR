@@ -4,13 +4,16 @@
 //
 // Every export of the real DLL is forwarded so the host process resolves
 // its imports normally and never notices the proxy.
+//
+// Exceptions: exports aliased to grwxr_* below are implemented by the
+// proxy itself (src/FactoryHook.cpp) and call dxgi_real from code.
 
 #pragma comment(linker, "/export:ApplyCompatResolutionQuirking=dxgi_real.ApplyCompatResolutionQuirking,@1")
 #pragma comment(linker, "/export:CompatString=dxgi_real.CompatString,@2")
 #pragma comment(linker, "/export:CompatValue=dxgi_real.CompatValue,@3")
-#pragma comment(linker, "/export:CreateDXGIFactory=dxgi_real.CreateDXGIFactory,@10")
-#pragma comment(linker, "/export:CreateDXGIFactory1=dxgi_real.CreateDXGIFactory1,@11")
-#pragma comment(linker, "/export:CreateDXGIFactory2=dxgi_real.CreateDXGIFactory2,@12")
+#pragma comment(linker, "/export:CreateDXGIFactory=grwxr_CreateDXGIFactory,@10")
+#pragma comment(linker, "/export:CreateDXGIFactory1=grwxr_CreateDXGIFactory1,@11")
+#pragma comment(linker, "/export:CreateDXGIFactory2=grwxr_CreateDXGIFactory2,@12")
 #pragma comment(linker, "/export:DXGID3D10CreateDevice=dxgi_real.DXGID3D10CreateDevice,@13")
 #pragma comment(linker, "/export:DXGID3D10CreateLayeredDevice=dxgi_real.DXGID3D10CreateLayeredDevice,@14")
 #pragma comment(linker, "/export:DXGID3D10GetLayeredDeviceSize=dxgi_real.DXGID3D10GetLayeredDeviceSize,@15")

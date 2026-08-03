@@ -16,6 +16,13 @@ REM   GRWVR\          our data directory, created at runtime
 REM
 REM Written with goto-style flow rather than parenthesised if-blocks: cmd.exe
 REM parses parenthesised blocks containing special characters unreliably.
+REM
+REM The process checks use findstr, never `find`: when this script is launched
+REM from a shell whose PATH puts Git's Unix tools first (the normal case here),
+REM `find /i` resolves to POSIX find, errors out, and the errorlevel test then
+REM reports "game is closed" no matter what. That defect silently allowed
+REM deploys against a running game (2026-07-31, 2026-08-01). findstr has no
+REM Unix namesake and cannot be shadowed the same way.
 
 setlocal
 
@@ -35,9 +42,9 @@ REM ------------------------------------------------------------------ auto --
 :auto
 echo.
 echo === 1/5 verifying the game is closed ===
-tasklist /FI "IMAGENAME eq GRW.exe" 2>nul | find /i "GRW.exe" >nul
+tasklist /FI "IMAGENAME eq GRW.exe" 2>nul | findstr /i /c:"GRW.exe" >nul
 if not errorlevel 1 goto err_running
-tasklist /FI "IMAGENAME eq rungame.exe" 2>nul | find /i "rungame.exe" >nul
+tasklist /FI "IMAGENAME eq rungame.exe" 2>nul | findstr /i /c:"rungame.exe" >nul
 if not errorlevel 1 goto err_running_eac
 echo     game is closed.
 
@@ -140,7 +147,7 @@ exit /b 1
 
 REM ---------------------------------------------------------------- remove --
 :remove
-tasklist /FI "IMAGENAME eq GRW.exe" 2>nul | find /i "GRW.exe" >nul
+tasklist /FI "IMAGENAME eq GRW.exe" 2>nul | findstr /i /c:"GRW.exe" >nul
 if not errorlevel 1 goto err_running
 if not exist "%DST%" goto nothing_to_remove
 move /y "%DST%" "%GAME%\dxgi.dll.disabled" >nul

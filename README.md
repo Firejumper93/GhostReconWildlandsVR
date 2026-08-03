@@ -2,20 +2,21 @@
 
 > [!WARNING]
 > **THIS IS NOT A COMPLETE VR EXPERIENCE.** This mod is in the EARLY STAGES of
-> development and testing. Stereo depth and a fullscreen view work, but there are
-> no motion controls, aiming still follows the flat game's own aim, and visual and
-> comfort issues remain. It has been tested on a single hardware configuration.
-> Try it as an experiment and a preview, not as a finished way to play the game.
-> Development is active and every release changes things.
+> development and testing. Stereo depth, a fullscreen 4K view, motion-controller
+> aiming and an anchored first-person camera all work, but first person does not yet
+> follow the head bone, your character's head is not hidden, there are no IK arms or
+> hands, and comfort issues remain. It has been tested on a single hardware
+> configuration. Try it as an experiment and a preview, not as a finished way to play
+> the game. Development is active and every release changes things.
 
 A native OpenXR VR mod for Tom Clancy's Ghost Recon Wildlands (AnvilNext 2.0, DirectX 11).
 Head-tracked stereoscopic 3D rendered by the game's own engine, injected through a
 `dxgi.dll` proxy. No game files are modified, ever.
 
 **Status: experimental alpha, in ongoing development.** Stereo fusion with real depth
-was achieved on 2026-07-29, and the fullscreen view (the engine rendering the headset's
-field of view instead of a flat-game window) landed on 2026-07-30. This is a development
-snapshot, not a finished mod. Expect rough edges. Performance numbers here come from one
+was achieved on 2026-07-29, the fullscreen view on 2026-07-30, and 4K internal
+rendering, motion-controller aiming and anchored first person on 2026-08-01/02. This is
+a development snapshot, not a finished mod. Expect rough edges. Performance numbers here come from one
 test system; different hardware, headsets, and settings may perform noticeably worse.
 The mod is being actively optimized and improved, so expect frequent changes.
 
@@ -24,40 +25,50 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed between versions.
 ## What works
 
 - Native OpenXR session on the game's own D3D11 device, paced by the headset (72 Hz)
-- Full head tracking (rotation) driving the actual game camera
+- Full head tracking driving the actual game camera, with the render-time pose submitted
+  to the compositor so rotation stays smooth under alternate-eye rendering
 - Stereoscopic depth via alternate-eye rendering: the engine renders one eye per frame,
   alternating, with per-eye swapchains and correct per-eye frustum placement
 - **Fullscreen view**: the mod overrides the game's rendered field of view (default
   1.92 rad, about 110 degrees) so the image fills the headset instead of appearing as
   a window. On by default, toggleable and tunable live.
+- **4K internal rendering, no desktop changes required.** The mod sizes the game's
+  swapchain and reports a 4K client area to the engine, so the whole pipeline renders
+  at 3840x2160 and the capture is sharp from an ordinary 1080p desktop. The render size
+  is a config key, so it doubles as the quality-versus-frame-rate knob.
+- **Motion-controller aiming and firing.** A partial right-trigger squeeze aims down
+  sights, a full squeeze fires (hold for automatic), and pointing the controller away
+  from head center turns the game's own aim, so ballistics, HUD and crosshair stay true.
+- **Anchored first person.** A toggle moves the viewpoint onto the player character
+  itself. The player is identified through the engine's own player component, so the
+  camera attaches to your body rather than to a nearby NPC.
 - **Scoped aiming**: while scoped, the mod steps aside so the scope renders exactly as
   the flat game and bullets land on the crosshair. Magnified optics are displayed
   across a comfortable window so they actually magnify instead of shrinking to their
   true angular size.
-- **First-person demo mode**: a toggleable camera push that places the view at the
-  character instead of behind them. Demo quality (see limitations), but playable.
-- Recenter on the Home key, live-adjustable eye separation, field of view, and
+- Recenter on the Home key, live-adjustable eye separation, field of view and
   first-person placement, config file persistence
+- A cropped, non-alternating desktop mirror suitable for recording
 - Stable at 72 fps on the test system through extended open-world play
 
 ## Known limitations (honest list)
 
-- **The fullscreen image is soft.** The mod captures the game's backbuffer, which is
-  1080p stretched across a wide field of view. Raising the capture resolution is the
-  current development focus.
+- **First person does not track the head bone yet.** The viewpoint is anchored to the
+  character's origin plus a configurable eye height, so it can sit slightly behind or
+  above the real head position, it does not follow idle animations, and it does not
+  compensate for crouch or prone. Head-bone tracking is the current development focus.
+- **Your character's head is not hidden** in first person. You are inside the model and
+  rely on backface culling; expect to see hair or helmet geometry at some angles.
+- **No IK arms or hands.** Aiming is steered through the game's own aim path; the weapon
+  is not held by your controllers.
+- The camera can occasionally attach to the wrong body after a respawn or fast travel.
+  Toggling first person off and on while facing your character re-acquires it.
+- Vehicles in first person are unfinished.
 - Wide-angle rendering can look warped or "off" toward the edges; the projection
   geometry is under active tuning.
-- No motion controls. Aiming from the hip and in ADS follows the game's own aim, not
-  your view; you will see the true ballistic aim point drift from your crosshair
-  until the game's aim catches up. Proper aim integration is planned for the IK
-  phase. While scoped, ballistics are exact (the mod disengages).
-- First person is a demo: expect culling pop at the screen edges, visible hair and
-  eyelashes, and vehicle cabins that the camera cannot reach yet.
-- Third-person and first-person camera only, no first-person body rig yet.
-- The new desktop recording view (Numpad /) is freshly built and not yet verified in
-  a full play session.
-- Sky and cloud registration at wide field of view has a deployed fix pending final
-  verification.
+- Sky and cloud registration at wide field of view is still imperfect.
+- Frame rate dips below 72 in dense towns on the test system.
+- The desktop mirror shows a cropped single eye; judge the image only in the headset.
 - Tested on exactly one configuration (below). Other headsets and runtimes are untested.
 
 ## Requirements
@@ -113,6 +124,8 @@ log (`grwxr-<pid>.log`) and an optional `grwxr.cfg`.
 
 ## In the headset
 
+All hotkeys are on the numeric keypad and are read live while the game has focus.
+
 | Key | Action |
 |---|---|
 | Home | Recenter (look where you want forward to be, then press) |
@@ -120,25 +133,39 @@ log (`grwxr-<pid>.log`) and an optional `grwxr.cfg`.
 | Numpad * | Reset eye separation scale to its startup value |
 | Numpad 1 | Fullscreen field-of-view override on / off |
 | Numpad + / Numpad 2 | Fullscreen field of view wider / narrower (0.10 rad steps) |
-| Numpad 8 | First-person demo mode on / off |
-| Numpad 7 / Numpad 4 | First-person camera forward / back (0.10 m steps) |
-| Numpad 6 / Numpad 5 | First-person camera right / left (0.10 m steps) |
-| Numpad 3 / Numpad 0 | First-person camera up / down (0.10 m steps) |
-| Numpad / | Desktop recording view on / off (experimental) |
+| Numpad 8 | First person on / off |
+| Numpad 7 / Numpad 4 | First person: eye height up / down (0.05 m) while anchored to the character, otherwise camera forward / back (0.10 m) |
+| Numpad 6 / Numpad 5 | First person: viewpoint right / left |
+| Numpad 3 / Numpad 0 | First person: viewpoint up / down (unanchored fallback only) |
+| Numpad / | Desktop recording view on / off |
 
-Every tuning key prints the exact `grwxr.cfg` line to persist its current value in
-the log. Settings the config file understands (all optional, defaults in parentheses):
+Every change is logged with the exact `grwxr.cfg` line needed to persist it. Hotkey
+changes last only for the session; the config file is the permanent home.
+
+### Right Touch controller
+
+| Input | Action |
+|---|---|
+| Trigger, partial squeeze | Aim down sights |
+| Trigger, full squeeze | Fire (hold for automatic fire) |
+| Point away from head center | Turn the game's aim |
+
+Keep your thumb off the gamepad's right stick while steering with the controller.
+
+## Configuration
+
+`GRWVR\grwxr.cfg` in the game folder holds the persistent settings and documents every
+key in comments. The ones most worth knowing:
 
 | Key | Meaning |
 |---|---|
-| `ipd_scale` (1.0) | Eye separation multiplier. 0.50 is the tuned value on the test system. |
-| `fullscreen_fov` (1.92) | The overridden vertical field of view in radians. |
-| `mono_scope_fov` (0.30) | Below this rendered fov the mod steps aside (flat scope). 0 disables. |
-| `scope_display_fov` (0.5236) | Display size of magnified scope content. 0 = angle-correct. |
-| `fp_forward` (2.20) | First-person mode forward camera push in meters. |
-| `fp_side` (-0.40) | First-person sideways offset in meters (cancels the over-shoulder camera). |
-| `fp_up` (0) | First-person vertical offset in meters. |
-| `desktop_fov` (0.90) | Field of view of the desktop recording view in radians. |
+| `ipd_scale` | Eye separation multiplier (default 0.50) |
+| `fullscreen_fov` | Rendered field of view in radians (default 1.92) |
+| `upsize_width` / `upsize_height` | Internal render size (default 3840x2160). Lower it, for example 3200x1800, to trade sharpness for frame rate |
+| `fp_eye` | First-person eye height above the character origin, meters |
+| `fp_anchor_side` | First-person lateral centering, meters |
+| `aim_steer`, `aim_ads`, `aim_fire` | Motion-control features, set any to `0` to disable |
+| `desktop_fov` | Crop of the desktop recording view, `0` disables |
 
 ## Disabling and uninstalling
 

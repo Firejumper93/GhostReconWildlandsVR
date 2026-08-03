@@ -31,6 +31,7 @@
 #include "VRMirror.h"
 #include "AnselProbe.h"
 #include "CameraProbe.h"
+#include "FactoryHook.h"
 
 // Forward every export of the real dxgi.dll to dxgi_real.dll.
 // deploy.bat places a copy of C:\Windows\System32\dxgi.dll as dxgi_real.dll
@@ -87,6 +88,15 @@ DWORD WINAPI init_thread(LPVOID) {
     } else {
         LOG_WARN("dxgi_real.dll not loaded yet (normal: forwards resolve lazily)");
     }
+
+    // Build 15a: the factory stubs may already have fired (the game creates
+    // its device the moment dxgi is loaded); report their state and the
+    // upsize target now, then drain their events with the other modules.
+    grwxr::factory::report_startup();
+
+    // Build 15c: the engine sizes its renderer from the window client size,
+    // so the client size the game sees must lie before the renderer reads it.
+    grwxr::factory::install_render_size_spoof();
 
     const bool gfx = wait_for_graphics(30000);
     LOG_INFO("d3d11.dll present: %s", gfx ? "yes" : "NO (timed out after 30s)");
@@ -148,8 +158,10 @@ DWORD WINAPI init_thread(LPVOID) {
         Sleep(1000);
         grwxr::d3d11::drain_capture_log();
         grwxr::vr::drain_log();
+        grwxr::vr::drain_input();
         grwxr::ansel::drain();
         grwxr::camera::drain();
+        grwxr::factory::drain();
 
         // Bring OpenXR up once the device exists, on OUR thread, not the render
         // thread. Session creation is slow and allocates; it must not happen

@@ -15,6 +15,11 @@ Session 1 (GRW-XR). Read-only with respect to system files.
 Usage:
     python tools/gen_proxy_exports.py C:\\Windows\\System32\\dxgi.dll dxgi_real \\
         --out src/proxy_exports.inc
+
+Exports named with --intercept are aliased to a grwxr_-prefixed function
+implemented in the proxy itself (same public name, same ordinal) instead of
+being forwarded. Build 15a intercepts the three CreateDXGIFactory* exports
+this way; see src/FactoryHook.cpp.
 """
 import argparse
 import os
@@ -27,7 +32,11 @@ def main():
     ap.add_argument("source_dll", help="the real DLL to mirror, e.g. C:\\Windows\\System32\\dxgi.dll")
     ap.add_argument("forward_name", help="module name to forward to, without .dll, e.g. dxgi_real")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--intercept", default="",
+                    help="comma-separated export names to alias to grwxr_NAME "
+                         "implementations in the proxy instead of forwarding")
     a = ap.parse_args()
+    intercept = {n for n in a.intercept.split(",") if n}
 
     pe = pefile.PE(a.source_dll, fast_load=False)
     if not hasattr(pe, "DIRECTORY_ENTRY_EXPORT"):
@@ -40,18 +49,33 @@ def main():
         f"//",
         f"// Every export of the real DLL is forwarded so the host process resolves",
         f"// its imports normally and never notices the proxy.",
-        "",
     ]
+    if intercept:
+        lines += [
+            "//",
+            "// Exceptions: exports aliased to grwxr_* below are implemented by the",
+            "// proxy itself (src/FactoryHook.cpp) and call dxgi_real from code.",
+        ]
+    lines.append("")
 
     named = 0
     ordinal_only = 0
+    intercepted = 0
     for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
         ordv = exp.ordinal
         if exp.name:
             nm = exp.name.decode("latin-1")
-            lines.append(
-                f'#pragma comment(linker, "/export:{nm}={a.forward_name}.{nm},@{ordv}")'
-            )
+            if nm in intercept:
+                # Same public name and ordinal, implemented by the proxy.
+                lines.append(
+                    f'#pragma comment(linker, "/export:{nm}=grwxr_{nm},@{ordv}")'
+                )
+                intercept.discard(nm)
+                intercepted += 1
+            else:
+                lines.append(
+                    f'#pragma comment(linker, "/export:{nm}={a.forward_name}.{nm},@{ordv}")'
+                )
             named += 1
         else:
             # Ordinal-only export: forward by ordinal using the #N syntax.
@@ -61,13 +85,16 @@ def main():
             ordinal_only += 1
 
     pe.close()
+    if intercept:
+        raise SystemExit(f"--intercept names not found in export table: {sorted(intercept)}")
     text = "\n".join(lines) + "\n"
 
     if a.out:
         os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
         with open(a.out, "w", encoding="ascii") as fh:
             fh.write(text)
-        print(f"wrote {a.out}: {named} named exports, {ordinal_only} ordinal-only")
+        print(f"wrote {a.out}: {named} named exports "
+              f"({intercepted} intercepted), {ordinal_only} ordinal-only")
     else:
         print(text)
 

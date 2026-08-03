@@ -32,7 +32,7 @@ if errorlevel 1 ( echo *** ASSEMBLY FAILED *** & popd & exit /b 1 )
 cl /nologo /std:c++20 /EHsc /O2 /W4 /MT /DNDEBUG /LD /I tools\xr_probe\extern\include ^
    /Fo:build\ /Fd:build\ ^
    src\dllmain.cpp src\Log.cpp src\D3D11Hook.cpp src\Crash.cpp src\VRMirror.cpp src\AnselProbe.cpp ^
-   src\Sig.cpp src\ThunkHook.cpp src\CameraProbe.cpp src\HeadPose.cpp ^
+   src\Sig.cpp src\ThunkHook.cpp src\CameraProbe.cpp src\HeadPose.cpp src\FactoryHook.cpp ^
    build\ProbeStub.obj ^
    /link /DLL /LIBPATH:tools\xr_probe\extern\lib openxr_loader.lib /OUT:build\dxgi.dll
 

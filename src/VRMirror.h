@@ -40,5 +40,9 @@ bool active();
 // the render thread records, our own thread writes the log.
 void drain_log();
 
+// BUILD 13b: 1 Hz controller pose/trigger log line, heartbeat thread only.
+// Silent until g_input_ok and at least one hand tracks.
+void drain_input();
+
 }  // namespace vr
 }  // namespace grwxr

@@ -1,4 +1,5 @@
 #include "VRMirror.h"
+#include "CameraProbe.h"
 #include "HeadPose.h"
 #include "Log.h"
 
@@ -61,6 +62,17 @@ float                  g_steer_mpd      = 10.0f;  // mouse counts per degree
 std::atomic<uint64_t>  g_steer_ticks{0};          // presents that injected
 std::atomic<long long> g_steer_dx{0}, g_steer_dy{0};   // total counts injected
 std::atomic<float>     g_steer_yaw_last{0.0f}, g_steer_pitch_last{0.0f};
+
+// Build 19: VR head aim state (see the aim_pump comment block below for the
+// design). Render thread only; the signs are cfg keys read at init.
+bool  g_vraim_on       = false;         // Numpad Decimal toggles
+float g_aim_sign_yaw   = 1.0f;          // cfg aim_yaw_sign  (+1 or -1)
+float g_aim_sign_pitch = 1.0f;          // cfg aim_pitch_sign
+float g_aim_cum[2]     = {0.0f, 0.0f};  // absorbed by the engine, geometric rad
+float g_aim_zero[2]    = {0.0f, 0.0f};  // head-angle baseline (re-zeroed while
+                                        // off or fov-gated: no snap on resume)
+float g_aim_out[2]     = {0.0f, 0.0f};  // armed, not yet observed consumed
+bool  g_aim_outf[2]    = {false, false};
 
 // BUILD 14f: TRIGGER = AIM DOWN SIGHTS. The right trigger drives the game's
 // own ADS binding (right-mouse hold), so the game's existing hip-to-ADS
@@ -301,6 +313,15 @@ void load_config() {
             if (v >  2.0f) v =  2.0f;
             headpose::set_ipd_scale(v);
         }
+        // Build 19: engine-vs-geometric direction of the aim angle pair, +1
+        // or -1. Not derivable offline; a wrong sign makes the view turn
+        // the WRONG WAY on that axis while VR head aim is on. Session 20
+        // headset calibration: the engine's yaw runs OPPOSITE our geometric
+        // convention, so the shipped grwxr.cfg carries -1.
+        if (sscanf_s(line, " aim_yaw_sign = %f", &v) == 1)
+            g_aim_sign_yaw = v < 0.0f ? -1.0f : 1.0f;
+        if (sscanf_s(line, " aim_pitch_sign = %f", &v) == 1)
+            g_aim_sign_pitch = v < 0.0f ? -1.0f : 1.0f;
         // Build 11b: the mono-scope threshold, radians. 0 disables the gate.
         if (sscanf_s(line, " mono_scope_fov = %f", &v) == 1) {
             if (v < 0.0f) v = 0.0f;
@@ -332,6 +353,16 @@ void load_config() {
             if (v > 2.5f) v = 2.5f;
             headpose::set_fp_eye(v);
         }
+        // Build 16a: the head-bone anchor, and the head-joint-to-eye trim it
+        // uses instead of fp_eye. fp_head_anchor=0 forces the old origin
+        // anchor, which is the one-line revert if the head bone misbehaves.
+        if (sscanf_s(line, " fp_head_eye = %f", &v) == 1) {
+            if (v < -0.5f) v = -0.5f;
+            if (v >  1.0f) v =  1.0f;
+            headpose::set_fp_head_eye(v);
+        }
+        if (sscanf_s(line, " fp_head_anchor = %f", &v) == 1)
+            headpose::set_fp_head_anchor(v != 0.0f);
         // Build 15e.3: anchored lateral centering, meters along the base
         // camera's right axis.
         if (sscanf_s(line, " fp_anchor_side = %f", &v) == 1) {
@@ -456,6 +487,65 @@ void quat_to_rows(const Quat& q, float R[9]) {
 
 bool g_have_ref = false;
 Quat g_ref_inv{0.0f, 0.0f, 0.0f, 1.0f};   // conjugate of the yaw-only reference
+
+// --- Build 19: VR HEAD AIM ------------------------------------------------
+//
+// Feeds the head's yaw/pitch into the engine's ABSOLUTE aim pair through the
+// consume-once deltas of camera::aim_arm (the mechanism build 17 proved:
+// absolute, persistent, steers view AND bullets). The camera hook subtracts
+// what the engine has absorbed (headpose::set_aim_cum) before composing the
+// full head rotation, so the view is always the true head pose and never
+// depends on how fast, or whether, the engine consumes: menus, cutscenes and
+// a clamped pitch all degrade to exactly the pre-injection behaviour.
+//
+// The one unknown the offline work could not settle is whether the engine's
+// yaw/pitch units run the same direction as our geometric convention, so
+// both signs are cfg keys (state lives with the other config globals at the
+// top of the file). A wrong sign shows up as the view turning the WRONG WAY
+// on that axis (headset-confirmed, session 20): the compose overcorrects by
+// twice the injection, net reversed. Flip the key, relaunch, done.
+
+float wrap_pi(float a) {
+    while (a >  3.14159265f) a -= 6.28318531f;
+    while (a < -3.14159265f) a += 6.28318531f;
+    return a;
+}
+
+// Once per present, right after the head rotation is computed. axis 0 = yaw,
+// 1 = pitch, both geometric radians in the game basis.
+void aim_pump(float head_yaw, float head_pitch) {
+    const float head[2] = {head_yaw, head_pitch};
+    // Injection pauses below the world fov band (ADS and optics, hazard 25
+    // territory) and while toggled off. While paused the baseline re-zeroes
+    // every frame, so resuming never snaps: aim continues from wherever the
+    // engine has it, tracking head MOVEMENT from that moment on.
+    const bool live = g_vraim_on &&
+                      headpose::read_fov(0.7853982f) >= 0.65f;
+    for (int a = 0; a < 2; ++a) {
+        if (camera::aim_pending(a)) continue;   // still queued for the engine
+        if (g_aim_outf[a]) {
+            // The delta armed earlier was consumed: account it. The engine
+            // absorbed sign*d in its units, which is d in geometric radians
+            // when the cfg sign is right.
+            g_aim_outf[a] = false;
+            g_aim_cum[a]  = wrap_pi(g_aim_cum[a] + g_aim_out[a]);
+            headpose::set_aim_cum(g_aim_cum[0], g_aim_cum[1]);
+        }
+        if (!live) {
+            g_aim_zero[a] = wrap_pi(head[a] - g_aim_cum[a]);
+            continue;
+        }
+        float d = wrap_pi(head[a] - g_aim_zero[a] - g_aim_cum[a]);
+        if (fabsf(d) < 0.0005f) continue;       // ~0.03 deg: not worth a write
+        if (d >  0.30f) d =  0.30f;             // per-injection clamp: a lost
+        if (d < -0.30f) d = -0.30f;             // frame cannot become a whip
+        const float sign = a == 0 ? g_aim_sign_yaw : g_aim_sign_pitch;
+        if (camera::aim_arm(a, d * sign) == 1) {
+            g_aim_out[a]  = d;
+            g_aim_outf[a] = true;
+        }
+    }
+}
 
 // BUILD 14d: see the state block at the top of the file. Called once per
 // present on the render thread. Injects proportional relative mouse motion
@@ -601,6 +691,16 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j)
             Hg[i * 3 + j] = S[i] * S[j] * Rr[P[i] * 3 + P[j]];
+
+    // Build 19: head yaw/pitch in the SAME geometric convention the camera
+    // hook extracts from the engine base (forward row: yaw = atan2(fx, fy),
+    // pitch = asin(fz)), feeding the aim injection pump.
+    {
+        float sp = Hg[5];
+        if (sp >  0.9999f) sp =  0.9999f;
+        if (sp < -0.9999f) sp = -0.9999f;
+        aim_pump(atan2f(Hg[3], Hg[4]), asinf(sp));
+    }
 
     // Build 13a: the absolute XR-space orientation travels with the rotation
     // so the camera hook can echo back exactly which head orientation each
@@ -1469,11 +1569,33 @@ void on_present(const d3d11::State& st) {
             note("VR: first-person demo %s (fp_forward %.2f m, Numpad 7/4 steps)",
                  on ? "ON" : "OFF", headpose::fp_forward());
         }
+        // Build 18: the head-hide override simply follows the FP state.
+        // Re-published every poll (not only on the edge) so the detour is
+        // correct even if FP was toggled before the hook finished installing.
+        camera::set_head_hide(headpose::fp_enabled());
         // Build 15e: Numpad 7/4 now step whichever distance is actually in
         // play, so no new keys are needed (hazard 24). Anchored: eye height
         // above the character origin. Not anchored: the 11c forward push.
+        // Build 16a: when the HEAD BONE anchor is the one in play, those same
+        // keys tune fp_head_eye (the joint-to-eye trim, 0.02 m steps because
+        // the whole range is a few centimeters) instead of fp_eye. Still no
+        // new keys: the pair always steps whatever the viewpoint is actually
+        // riding on.
         bool moved = false;
-        if (headpose::player_obj()) {
+        const bool head_live = headpose::fp_head_anchor() &&
+                               headpose::head_node() != 0xFFFFu;
+        if (headpose::player_obj() && head_live) {
+            float e = headpose::fp_head_eye();
+            if (up && !s_up) { e += 0.02f; moved = true; }
+            if (dn && !s_dn) { e -= 0.02f; moved = true; }
+            if (moved) {
+                if (e < -0.5f) e = -0.5f;
+                if (e >  1.0f) e =  1.0f;
+                headpose::set_fp_head_eye(e);
+                note("VR: fp_head_eye = %.2f m above the HEAD BONE "
+                     "(persist as fp_head_eye=%.2f in grwxr.cfg)", e, e);
+            }
+        } else if (headpose::player_obj()) {
             float e = headpose::fp_eye();
             if (up && !s_up) { e += 0.05f; moved = true; }
             if (dn && !s_dn) { e -= 0.05f; moved = true; }
@@ -1587,6 +1709,24 @@ void on_present(const d3d11::State& st) {
                  g_desk_fov);
         }
         s_tog = tog;
+    }
+    // Build 19: Numpad Decimal toggles VR HEAD AIM (repurposed from the
+    // build-17 one-shot experiment, which it supersedes). Default off.
+    {
+        static bool s_yb = false;
+        const bool yb = (GetAsyncKeyState(VK_DECIMAL) & 0x8000) != 0;
+        if (yb && !s_yb) {
+            if (!camera::aim_available()) {
+                note("aim: VR head aim unavailable (setter hooks not installed)");
+            } else {
+                g_vraim_on = !g_vraim_on;
+                note("aim: VR HEAD AIM %s (signs yaw%+.0f pitch%+.0f, "
+                     "aim_yaw_sign/aim_pitch_sign in grwxr.cfg)",
+                     g_vraim_on ? "ON: bullets follow your gaze" : "OFF",
+                     g_aim_sign_yaw, g_aim_sign_pitch);
+            }
+        }
+        s_yb = yb;
     }
     if (g_dead || !g_active.load(std::memory_order_relaxed)) {
         // BUILD 14f: a parked or dead session must not hold ADS (doff safety).

@@ -40,6 +40,32 @@
 EXTERN grwxr_probe_record : PROC
 EXTERN grwxr_probe_originals : QWORD
 
+; Build 17, the aim-architecture experiment (see CameraProbe.cpp).
+EXTERN grwxr_setyaw_pending : DWORD    ; 1 = a one-shot bump is queued
+EXTERN grwxr_setyaw_bump    : DWORD    ; float bits of the bump, radians
+EXTERN grwxr_setyaw_disp    : DWORD    ; vtable byte offset from the slot bytes
+EXTERN grwxr_setyaw_count   : QWORD
+EXTERN grwxr_setyaw_lastobj : QWORD
+EXTERN grwxr_setyaw_lastval : DWORD    ; float bits of the last incoming yaw
+EXTERN grwxr_setyaw_shipped : DWORD    ; float bits of the bumped value we sent
+EXTERN grwxr_setyaw_fired   : DWORD    ; 1 = a bump was consumed (drain clears)
+
+; Build 19, the pitch half of aim injection (see CameraProbe.cpp).
+EXTERN grwxr_setpitch_pending : DWORD
+EXTERN grwxr_setpitch_bump    : DWORD
+EXTERN grwxr_setpitch_disp    : DWORD
+EXTERN grwxr_setpitch_count   : QWORD
+EXTERN grwxr_setpitch_lastobj : QWORD
+EXTERN grwxr_setpitch_lastval : DWORD
+
+; Build 18, head hide (see CameraProbe.cpp).
+EXTERN grwxr_headhide_table : QWORD    ; verified head-class method table VA
+EXTERN grwxr_headhide_impl  : QWORD    ; the real SetHidden implementation
+EXTERN grwxr_headhide_on    : DWORD    ; 1 = force hide on the matching class
+EXTERN grwxr_headhide_calls : QWORD
+EXTERN grwxr_headhide_forced: QWORD
+EXTERN grwxr_headhide_obj   : QWORD    ; last matching object seen
+
 .code
 
 ; ---------------------------------------------------------------------------
@@ -106,5 +132,109 @@ ENDM
     PROBE_ENTRY 8
     PROBE_ENTRY 9
     PROBE_ENTRY 10
+
+; ---------------------------------------------------------------------------
+; Build 17: replacement for the SetYaw virtual-dispatch stub at RVA 0x006777C0,
+; whose verified body is `mov rax,[rcx]; jmp qword ptr [rax+570h]` with
+; rcx = the absolute-aim angle object and the yaw (radians) in xmm1
+; (docs/RE-notes.md "THE ABSOLUTE AIM ANGLE EXISTS"; the movaps xmm1,xmm0
+; immediately before the call at 0x124D34CE is the register proof).
+;
+; Normally a pure pass-through that only updates counters. When the user has
+; queued a one-shot bump (Numpad Decimal), the NEXT call ships yaw+bump once.
+; The engine's own integrate loop is get-modify-write on the same object, so
+; a one-time bump persists without us touching anything again.
+;
+; project rule 8: no logging, no allocation, no locks, no calls. Plain and
+; interlocked stores only. No stack use at all, so no alignment concerns.
+; rax, r11 and the flags are volatile at function entry; xmm0 maps to argument
+; slot 1, which is rcx (the object), so xmm0 carries nothing and is free.
+; The tail emulates the original dispatch exactly, with the vtable offset
+; taken from the verified slot bytes rather than hardcoded.
+; ---------------------------------------------------------------------------
+grwxr_setyaw_entry PROC
+    lock inc qword ptr [grwxr_setyaw_count]
+    mov     [grwxr_setyaw_lastobj], rcx
+    movd    eax, xmm1
+    mov     [grwxr_setyaw_lastval], eax
+
+    ; consume a queued one-shot bump: pending -> 0, atomically
+    xor     eax, eax
+    xchg    eax, dword ptr [grwxr_setyaw_pending]
+    test    eax, eax
+    jz      sy_pass
+    movd    xmm0, dword ptr [grwxr_setyaw_bump]
+    addss   xmm1, xmm0
+    movd    eax, xmm1
+    mov     [grwxr_setyaw_shipped], eax
+    mov     dword ptr [grwxr_setyaw_fired], 1
+sy_pass:
+    ; the original stub, re-implemented: mov rax,[rcx]; jmp [rax+disp]
+    mov     rax, [rcx]
+    mov     r11d, dword ptr [grwxr_setyaw_disp]
+    mov     r11, [rax + r11]
+    jmp     r11
+grwxr_setyaw_entry ENDP
+
+; ---------------------------------------------------------------------------
+; Build 19: replacement for the SetPitch virtual-dispatch stub at RVA
+; 0x005FA190 (`mov rax,[rcx]; jmp qword ptr [rax+5D0h]`, verified at install).
+; Identical mechanism to grwxr_setyaw_entry: pass-through with counters, plus
+; a consume-once delta armed by the render thread's aim pump. Same rule-8
+; constraints, same register reasoning.
+; ---------------------------------------------------------------------------
+grwxr_setpitch_entry PROC
+    lock inc qword ptr [grwxr_setpitch_count]
+    mov     [grwxr_setpitch_lastobj], rcx
+    movd    eax, xmm1
+    mov     [grwxr_setpitch_lastval], eax
+
+    xor     eax, eax
+    xchg    eax, dword ptr [grwxr_setpitch_pending]
+    test    eax, eax
+    jz      sp_pass
+    movd    xmm0, dword ptr [grwxr_setpitch_bump]
+    addss   xmm1, xmm0
+sp_pass:
+    mov     rax, [rcx]
+    mov     r11d, dword ptr [grwxr_setpitch_disp]
+    mov     r11, [rax + r11]
+    jmp     r11
+grwxr_setpitch_entry ENDP
+
+; ---------------------------------------------------------------------------
+; Build 18: replacement for the SetHidden thunk (0x029DC7D0 -> 0x12582AC0),
+; `__fastcall void(void* self rcx, bool hide dl)`, dl=1 hides
+; (docs/RE-notes.md "The visibility setter" and "THE PROXIMITY HIDE").
+;
+; The engine re-asserts visibility EVERY camera update (hazard 29), so hiding
+; the head is not one call, it is winning the argument on every call: when the
+; object is THE head-visibility component (class identity: [rcx+8] equals the
+; method table verified at install) and the mod wants the head hidden, the
+; engine's `hide` argument is overridden to 1 on the way through. Everything
+; else passes through untouched, and a zeroed table pointer disables the
+; whole test.
+;
+; project rule 8: stores and interlocked increments only, no calls, no
+; stack. rax and r11 are volatile at entry. [rcx+8] is the same field the
+; real function's callers dereference, so reading it here adds no new risk.
+; ---------------------------------------------------------------------------
+grwxr_headhide_entry PROC
+    lock inc qword ptr [grwxr_headhide_calls]
+    mov     rax, [grwxr_headhide_table]
+    test    rax, rax
+    jz      hh_pass
+    cmp     rax, [rcx+8]
+    jne     hh_pass
+    mov     [grwxr_headhide_obj], rcx      ; latched: the verified route to
+                                           ; the pointer (RE-notes)
+    cmp     dword ptr [grwxr_headhide_on], 0
+    je      hh_pass
+    mov     dl, 1                          ; force HIDE
+    lock inc qword ptr [grwxr_headhide_forced]
+hh_pass:
+    mov     rax, [grwxr_headhide_impl]
+    jmp     rax
+grwxr_headhide_entry ENDP
 
 END

@@ -86,6 +86,40 @@ void  grwxr_probe_entry_7();
 void  grwxr_probe_entry_8();
 void  grwxr_probe_entry_9();
 void  grwxr_probe_entry_10();
+
+// Build 17, the aim-architecture experiment. Written and read by the asm entry
+// grwxr_setyaw_entry (ProbeStub.asm); the drain thread reads the counters and
+// the key thread sets `pending` through camera::arm_yaw_bump(). Aligned plain
+// loads and stores are atomic on x64; `pending` is consumed with xchg in the
+// stub so a queued bump fires exactly once.
+uint32_t grwxr_setyaw_pending = 0;
+uint32_t grwxr_setyaw_bump    = 0;   // float bits, set before install
+uint32_t grwxr_setyaw_disp    = 0;   // vtable byte offset, from the slot bytes
+volatile uint64_t grwxr_setyaw_count   = 0;
+volatile uint64_t grwxr_setyaw_lastobj = 0;
+volatile uint32_t grwxr_setyaw_lastval = 0;
+volatile uint32_t grwxr_setyaw_shipped = 0;
+volatile uint32_t grwxr_setyaw_fired   = 0;
+void  grwxr_setyaw_entry();
+
+// Build 19: the pitch half, same consume-once mechanism.
+uint32_t grwxr_setpitch_pending = 0;
+uint32_t grwxr_setpitch_bump    = 0;
+uint32_t grwxr_setpitch_disp    = 0;
+volatile uint64_t grwxr_setpitch_count   = 0;
+volatile uint64_t grwxr_setpitch_lastobj = 0;
+volatile uint32_t grwxr_setpitch_lastval = 0;
+void  grwxr_setpitch_entry();
+
+// Build 18, head hide. Written here and in VRMirror's key poll, read by the
+// asm entry grwxr_headhide_entry every engine SetHidden call.
+uint64_t grwxr_headhide_table = 0;   // 0 until verified at install
+uint64_t grwxr_headhide_impl  = 0;
+uint32_t grwxr_headhide_on    = 0;
+volatile uint64_t grwxr_headhide_calls  = 0;
+volatile uint64_t grwxr_headhide_forced = 0;
+volatile uint64_t grwxr_headhide_obj    = 0;
+void  grwxr_headhide_entry();
 }
 
 namespace grwxr {
@@ -470,6 +504,180 @@ bool rig_has_hash(uint64_t rig, uint32_t hash) {
     return false;
 }
 
+// Build 16a: the same binary search, but returning the NODE INDEX rather than
+// a yes/no. The map records are 8 bytes, {u32 CRC32 name hash, u16 node
+// index}, sorted by hash. Returns -1 on miss or on any unreadable field. We
+// walk the map ourselves rather than calling the engine's own lookup
+// (0x00CF90F0) so no engine code runs on our thread and no address beyond the
+// already-verified rig layout is trusted.
+int rig_find_node(uint64_t rig, uint32_t hash) {
+    uint16_t cnt = 0, bones = 0;
+    uint64_t map = 0;
+    if (!read_block(rig + 0x5A, &cnt, sizeof(cnt))) return -1;
+    if (cnt == 0 || cnt >= 2048) return -1;
+    if (!read_block(rig + 0x50, &map, sizeof(map))) return -1;
+    if (map < 0x10000 || (map & 3)) return -1;
+    read_block(rig + 0x8A, &bones, sizeof(bones));
+    int a = 0, b = (int)cnt - 1;
+    while (a <= b) {
+        const int mid = (a + b) / 2;
+        uint32_t h = 0;
+        if (!read_block(map + (uint64_t)mid * 8, &h, sizeof(h))) return -1;
+        if (h == hash) {
+            uint16_t idx = 0xFFFF;
+            if (!read_block(map + (uint64_t)mid * 8 + 4, &idx, sizeof(idx)))
+                return -1;
+            // The index must address a real node. bones is the rig's node
+            // count; a hit outside it means the record layout is not what we
+            // think and the caller must not use it.
+            if (bones && idx >= bones) return -1;
+            return (int)idx;
+        }
+        if (h < hash) a = mid + 1; else b = mid - 1;
+    }
+    return -1;
+}
+
+// Build 16a: THE HEAD BONE READ. Engine thread, inside the camera hook's SEH
+// (the caller guards; this function itself only touches memory it has range
+// checked). Layout is [VERIFIED] from the engine's own leaf accessors:
+//
+//   pose   = [skel + 0x238]        the per-character FINAL pose
+//   buf    = [pose + 0x178]        bone transform buffer, stride 0x20
+//   rec    = buf + idx * 0x20      { float4 translation, float4 quaternion }
+//   flags  = [pose + 0x8C]         bit 26 set = buffer already in world space
+//   rootT  = [pose + 0x00]         float4, the pose root translation
+//   rootQ  = [pose + 0x10]         float4 xyzw, the pose root rotation
+//
+// The pose at +0x238 is created with bit 26 CLEARED, so its buffer is MODEL
+// space and world = rootQ * boneT + rootT. Bit 26 is honoured anyway, because
+// a future engine path could hand us a world-space buffer and silently
+// double-transforming would be a subtle, hard-to-see error.
+bool read_bone_world(uint64_t skel, unsigned int idx, float out[3]) {
+    if (!skel || idx == 0xFFFFu) return false;
+    uint64_t pose = 0, buf = 0;
+    if (!read_block(skel + 0x238, &pose, sizeof(pose))) return false;
+    if (pose < 0x10000 || (pose & 7)) return false;
+    if (!read_block(pose + 0x178, &buf, sizeof(buf))) return false;
+    if (buf < 0x10000 || (buf & 7)) return false;
+
+    float t[4];
+    if (!read_block(buf + (uint64_t)idx * 0x20, t, sizeof(t))) return false;
+    if (!isfinite(t[0]) || !isfinite(t[1]) || !isfinite(t[2])) return false;
+
+    uint32_t flags = 0;
+    read_block(pose + 0x8C, &flags, sizeof(flags));
+    if (flags & 0x04000000u) {           // already world space
+        out[0] = t[0]; out[1] = t[1]; out[2] = t[2];
+        return true;
+    }
+
+    float rt[4], rq[4];
+    if (!read_block(pose + 0x00, rt, sizeof(rt))) return false;
+    if (!read_block(pose + 0x10, rq, sizeof(rq))) return false;
+    for (int i = 0; i < 4; ++i)
+        if (!isfinite(rt[i]) || !isfinite(rq[i])) return false;
+
+    // The root quaternion's w carries a uniform scale as well as the rotation
+    // (offline note), so normalise before rotating: an unnormalised quaternion
+    // would scale the bone offset as a side effect of the rotation.
+    const float n = sqrtf(rq[0] * rq[0] + rq[1] * rq[1] +
+                          rq[2] * rq[2] + rq[3] * rq[3]);
+    if (!(n > 1e-6f)) return false;
+    const float qx = rq[0] / n, qy = rq[1] / n, qz = rq[2] / n, qw = rq[3] / n;
+
+    // v' = v + 2*qw*(q x v) + 2*(q x (q x v))
+    const float cx = qy * t[2] - qz * t[1];
+    const float cy = qz * t[0] - qx * t[2];
+    const float cz = qx * t[1] - qy * t[0];
+    const float dx = qy * cz - qz * cy;
+    const float dy = qz * cx - qx * cz;
+    const float dz = qx * cy - qy * cx;
+    out[0] = t[0] + 2.0f * (qw * cx + dx) + rt[0];
+    out[1] = t[1] + 2.0f * (qw * cy + dy) + rt[1];
+    out[2] = t[2] + 2.0f * (qw * cz + dz) + rt[2];
+    return isfinite(out[0]) && isfinite(out[1]) && isfinite(out[2]);
+}
+
+// Build 17: THE AIM ARCHITECTURE EXPERIMENT.
+//
+// (The 16b effector-array sweep that lived here was removed per rule 6: two
+// headset runs found nothing on the skeleton or the owner entity, and the
+// negative plus its caveats are recorded in CURRENT-STATE.md. The next
+// effector probe, when wanted, is the root-global route described there.)
+//
+// docs/RE-notes.md "THE ABSOLUTE AIM ANGLE EXISTS": an absolute yaw/pitch pair
+// with virtual accessors is integrated from the look-input deltas every frame,
+// and RECOIL writes the same pair. Whether it is the authoritative aim
+// (bullets) or a camera-only value is the open architectural question, and it
+// decides whether 1:1 VR aiming is possible. This experiment answers it in one
+// test: queue a ONE-SHOT +20 degree bump onto the next SetYaw call (Numpad
+// Decimal). The engine's integrate loop is get-modify-write on the same
+// object, so the bump persists on its own.
+//   - view and reticle snap ~20 deg and BULLETS FOLLOW: the pair is the
+//     authoritative aim; absolute pose-driven aiming is on.
+//   - view snaps but bullets keep the old line: camera-only; aim needs the
+//     look-input delta route instead.
+//   - view snaps then eases back: the "wanted" fields (+0xA0/+0xA4) drive a
+//     controller that fights external writes; next probe writes those too.
+//
+// SetYaw is not an E9 thunk: RVA 0x006777C0 is a virtual-dispatch stub,
+// `mov rax,[rcx]; jmp qword ptr [rax+0x570]`, alone in an int3-padded 16-byte
+// .edata slot. install_raw verifies every byte below before patching, and the
+// asm replacement re-implements the dispatch with the offset taken from these
+// verified bytes. Register proof of the prototype (this=rcx, yaw radians in
+// xmm1): the integrate site does `movaps xmm1,xmm0` right before its call
+// (bytes read from the pinned exe at 0x124D34CB, session 20).
+constexpr uintptr_t kSetYawSlotRva   = 0x006777C0;
+constexpr uint8_t   kSetYawExpect[10] = {0x48, 0x8B, 0x01,              // mov rax,[rcx]
+                                         0x48, 0xFF, 0xA0,              // jmp qword ptr [rax+
+                                         0x70, 0x05, 0x00, 0x00};       //   0x570]
+
+// Build 19: the pitch setter, same slot shape, dispatch offset 0x5D0
+// (RE-notes "THE ABSOLUTE AIM ANGLE EXISTS", printer-proved accessor set).
+constexpr uintptr_t kSetPitchSlotRva   = 0x005FA190;
+constexpr uint8_t   kSetPitchExpect[10] = {0x48, 0x8B, 0x01,
+                                           0x48, 0xFF, 0xA0,
+                                           0xD0, 0x05, 0x00, 0x00};
+
+hook::ThunkHook g_setyaw_hook;
+hook::ThunkHook g_setpitch_hook;
+
+// Build 18: HEAD HIDE (docs/RE-notes.md "The visibility setter, ported from
+// the community mod" and "THE PROXIMITY HIDE, fully traced").
+//
+// Session 20 confirmed in the headset that the engine's own proximity cull
+// short-circuits at first-person camera distance and never hides the head, so
+// the mod must win the argument itself. The engine re-asserts visibility every
+// camera update (hazard 29), which is why this is a detour that overrides the
+// `hide` argument on EVERY call for the one matching object, not a one-shot
+// call of our own (and why no engine code ever runs on our threads for this).
+//
+// The identity test is the community mod's, ported: the head-visibility
+// component's [obj+0x08] is a name-hashed method table unique to its class.
+// Rule 7 forbids trusting the table RVA bare, so install verifies the chain:
+// the table's slot +0x1F0 must resolve (through its 5-byte jmp thunk if
+// present) to the function found by THIS unique signature, which is the
+// class's own slot-0x0F member (RVA 0x124E15A0 in the pinned binary).
+constexpr uintptr_t kHeadTableRva     = 0x04A66410;
+constexpr uintptr_t kHeadSetterThunk  = 0x029DC7D0;
+constexpr uintptr_t kHeadSetterImpl   = 0x12582AC0;
+constexpr const char* kHeadSlotFnSig  =
+    "48 89 5C 24 08 57 48 83 EC 20 48 83 7A 20 00 48 89 D3 48 89 CF 74 ? "
+    "49 89 D0 31 D2 E8";
+// The setter's own body, unique, no rel32/rip operands (RE-notes).
+constexpr const char* kHeadSetterSig  =
+    "48 83 EC 08 44 0F B6 DA 49 89 C9 38 51 68 74 ? 44 0F B7 51 4A";
+
+hook::ThunkHook g_headhide_hook;
+
+// Build 16a diagnostics, written by the camera hook, read by the 1 Hz drain.
+// Plain floats: a torn diagnostic read is harmless.
+float g_head_pos[3]    = {};
+float g_head_dz        = 0.0f;   // head height above the character origin
+bool  g_head_valid     = false;
+std::atomic<uint64_t> g_head_reads{0}, g_head_rejects{0};
+
 bool skel_is_humanoid(uint64_t p) {
     constexpr uint32_t kHeadHash = 0x07C159A2;   // CRC32("Head")
     // 15h.4: the cache expires every ~64 calls. Rig heap addresses are
@@ -658,12 +866,41 @@ bool write_pose_head(uint64_t cam, const float* H, const float* Q) {
         if (headpose::read_fov(0.7853982f) < headpose::mono_scope_fov())
             return true;
 
+        // Build 19: once aim injection has been absorbed by the engine, the
+        // raw base rotation INCLUDES the head yaw/pitch we injected, and
+        // composing the full head rotation on top would double-apply it.
+        // Rebuild the base from its own geometric yaw/pitch with the absorbed
+        // amounts removed. Extraction and rebuild share one convention
+        // (game basis: x right, y forward, z up; yaw = atan2(fx, fy),
+        // pitch = asin(fz)), so with zero absorbed this path is exact for a
+        // roll-less base; engine camera roll (shakes) is dropped while it is
+        // active, which is accepted v1 jank. While aim_cum is (0,0), the raw
+        // base is used untouched: byte-identical to build 18 behaviour.
+        const float* B = g_base;
+        float rebuilt[9];
+        float cy = 0, cp = 0;
+        if (headpose::aim_cum(&cy, &cp)) {
+            float sp = g_base[5];
+            if (sp >  0.9999f) sp =  0.9999f;
+            if (sp < -0.9999f) sp = -0.9999f;
+            const float Y = atan2f(g_base[3], g_base[4]) - cy;
+            float       P = asinf(sp) - cp;
+            if (P >  1.55f) P =  1.55f;
+            if (P < -1.55f) P = -1.55f;
+            const float cyaw = cosf(Y), syaw = sinf(Y);
+            const float cpit = cosf(P), spit = sinf(P);
+            rebuilt[0] =  cyaw;        rebuilt[1] = -syaw;        rebuilt[2] = 0.0f;
+            rebuilt[3] =  syaw * cpit; rebuilt[4] =  cyaw * cpit; rebuilt[5] = spit;
+            rebuilt[6] = -syaw * spit; rebuilt[7] = -cyaw * spit; rebuilt[8] = cpit;
+            B = rebuilt;
+        }
+
         float out[9];
         for (int r = 0; r < 3; ++r) {
             for (int c = 0; c < 3; ++c) {
-                out[r * 3 + c] = H[r * 3 + 0] * g_base[0 + c]
-                               + H[r * 3 + 1] * g_base[3 + c]
-                               + H[r * 3 + 2] * g_base[6 + c];
+                out[r * 3 + c] = H[r * 3 + 0] * B[0 + c]
+                               + H[r * 3 + 1] * B[3 + c]
+                               + H[r * 3 + 2] * B[6 + c];
             }
         }
         for (int r = 0; r < 3; ++r)
@@ -711,6 +948,44 @@ bool write_pose_head(uint64_t cam, const float* H, const float* Q) {
                 // freed or recycled object reads as garbage and is dropped.
                 if (isfinite(o[0]) && isfinite(o[1]) && isfinite(o[2]) &&
                     dist3(o, g_base_pos) < 12.0f) {
+                    // Build 16a: THE HEAD BONE takes over from the origin
+                    // when it reads back sane. The origin anchor stays as the
+                    // fallback on every failure path, so a bad rig, a
+                    // stale pose pointer or an unresolved node index costs
+                    // us today's behaviour rather than the viewpoint.
+                    // Plausibility is judged against the character's own
+                    // origin, not the camera: a head is within a meter
+                    // horizontally of the body centre and between the knees
+                    // (prone) and full standing height above it.
+                    bool head_ok = false;
+                    if (headpose::fp_head_anchor()) {
+                        float h[3];
+                        if (read_bone_world(obj, headpose::head_node(), h)) {
+                            const float hdx = h[0] - o[0];
+                            const float hdy = h[1] - o[1];
+                            const float hdz = h[2] - o[2];
+                            if (hdx * hdx + hdy * hdy < 1.0f &&
+                                hdz > -0.5f && hdz < 2.2f) {
+                                o[0] = h[0];
+                                o[1] = h[1];
+                                o[2] = h[2];
+                                g_head_pos[0] = h[0];
+                                g_head_pos[1] = h[1];
+                                g_head_pos[2] = h[2];
+                                g_head_dz  = hdz;
+                                head_ok    = true;
+                                g_head_reads.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            } else {
+                                g_head_rejects.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            }
+                        } else {
+                            g_head_rejects.fetch_add(
+                                1, std::memory_order_relaxed);
+                        }
+                        g_head_valid = head_ok;
+                    }
                     // 15e.3: fp_anchor_side slides the anchored viewpoint
                     // along the BASE camera's right axis (row 0). The origin
                     // sits at body center but the head is not above it in
@@ -718,11 +993,18 @@ bool write_pose_head(uint64_t cam, const float* H, const float* Q) {
                     // needs a centering knob until the head bone lands.
                     // Base right, not composed: turning the head must not
                     // swing the anchor.
-                    const float as = headpose::fp_anchor_side();
+                    // 16a: the vertical rise depends on WHICH anchor won.
+                    // From the character origin it is fp_eye (0.85, a whole
+                    // body height); from the head JOINT it is fp_head_eye
+                    // (0.10, joint to eyes). Using one knob for both would
+                    // put the viewpoint a metre above the character's head
+                    // the moment the head bone started resolving.
+                    const float as   = headpose::fp_anchor_side();
+                    const float rise = head_ok ? headpose::fp_head_eye()
+                                               : headpose::fp_eye();
                     pos[0] = o[0] + as * g_base[0];
                     pos[1] = o[1] + as * g_base[1];
-                    pos[2] = o[2] + as * g_base[2]
-                           + headpose::fp_eye();   // world up is +Z
+                    pos[2] = o[2] + as * g_base[2] + rise;  // world up is +Z
                     anchored = true;
                 }
             }
@@ -958,6 +1240,88 @@ bool install() {
         LOG_ERROR("camera: nothing installed. The game runs unmodified.");
         return false;
     }
+
+    // Build 17: the SetYaw virtual-dispatch stub. Not part of the E9 table
+    // above; install_raw verifies the exact slot bytes instead of a jump
+    // target, and a mismatch leaves the aim experiment off with everything
+    // else still running. The dispatch offset the asm stub must emulate and
+    // the bump value are published to the asm globals BEFORE the patch makes
+    // the entry reachable.
+    {
+        memcpy(&grwxr_setyaw_disp, kSetYawExpect + 6, sizeof(grwxr_setyaw_disp));
+        g_setyaw_hook.install_raw(img->base + kSetYawSlotRva, kSetYawExpect,
+                                  sizeof(kSetYawExpect),
+                                  (void*)&grwxr_setyaw_entry,
+                                  "SetYaw vdispatch 0x006777C0");
+        memcpy(&grwxr_setpitch_disp, kSetPitchExpect + 6,
+               sizeof(grwxr_setpitch_disp));
+        g_setpitch_hook.install_raw(img->base + kSetPitchSlotRva,
+                                    kSetPitchExpect, sizeof(kSetPitchExpect),
+                                    (void*)&grwxr_setpitch_entry,
+                                    "SetPitch vdispatch 0x005FA190");
+        if (g_setyaw_hook.installed() && g_setpitch_hook.installed())
+            LOG_INFO("aim: both setters hooked. Numpad Decimal toggles VR "
+                     "head aim (default off).");
+    }
+
+    // Build 18: head hide. Three independent checks before anything is
+    // patched, each failing loudly and independently (rule 7):
+    //   1. the setter signature must match uniquely AT the documented impl,
+    //   2. the class method table must be verified through its slot +0x1F0
+    //      resolving to the function found by the slot-fn signature,
+    //   3. ThunkHook::install verifies the E9 thunk really targets the impl.
+    {
+        bool hh_ok = true;
+        size_t m = 0;
+        auto setter = sig::find_unique(*img, kHeadSetterSig, &m);
+        if (!setter || *setter != img->base + kHeadSetterImpl) {
+            LOG_ERROR("hide: SetHidden signature %s (matches=%zu, expected "
+                      "RVA 0x%08zX). Head hide OFF, everything else runs.",
+                      setter ? "matched at the WRONG address" : "missed",
+                      m, (size_t)kHeadSetterImpl);
+            hh_ok = false;
+        }
+        auto slotfn = sig::find_unique(*img, kHeadSlotFnSig, &m);
+        if (hh_ok && !slotfn) {
+            LOG_ERROR("hide: class slot-fn signature missed (matches=%zu). "
+                      "Cannot verify the method table. Head hide OFF.", m);
+            hh_ok = false;
+        }
+        if (hh_ok) {
+            // Slot +0x1F0 of the candidate table must resolve to *slotfn,
+            // directly or through one 5-byte jmp thunk.
+            uint64_t slotval = 0;
+            memcpy(&slotval, img->base + kHeadTableRva + 0x1F0,
+                   sizeof(slotval));
+            const uint8_t* p = (const uint8_t*)slotval;
+            const uint8_t* resolved = p;
+            if (p >= img->base && p < img->base + img->size && p[0] == 0xE9) {
+                int32_t rel = 0;
+                memcpy(&rel, p + 1, sizeof(rel));
+                resolved = p + 5 + rel;
+            }
+            if (resolved != *slotfn) {
+                LOG_ERROR("hide: method table slot +0x1F0 resolves to 0x%p, "
+                          "signature found 0x%p. NOT the class we analysed. "
+                          "Head hide OFF.",
+                          (const void*)resolved, (void*)*slotfn);
+                hh_ok = false;
+            }
+        }
+        if (hh_ok) {
+            grwxr_headhide_impl = (uint64_t)(img->base + kHeadSetterImpl);
+            if (g_headhide_hook.install(img->base + kHeadSetterThunk,
+                                        img->base + kHeadSetterImpl,
+                                        (void*)&grwxr_headhide_entry,
+                                        "SetHidden 0x12582AC0")) {
+                // Published LAST: the asm entry ignores everything until the
+                // table pointer is nonzero.
+                grwxr_headhide_table = (uint64_t)(img->base + kHeadTableRva);
+                LOG_INFO("hide: armed. The head object hides whenever first "
+                         "person is on (class table verified via slot fn).");
+            }
+        }
+    }
     LOG_INFO("camera: survey armed. BUILD 8: the live OpenXR head rotation is");
     LOG_INFO("camera: composed frame-idempotently onto the root transform at");
     LOG_INFO("camera: Camera+0x000 before on_calc_mvp. With no headset the");
@@ -1144,6 +1508,33 @@ void snap_drain() {
             }
             if (bestp) {
                 headpose::set_player_obj(bestp);
+                // Build 16a: resolve the Head node index for THIS skeleton's
+                // rig. Cheap (a binary search over a sorted map) and re-done
+                // every tick, so a respawn, an outfit change or any other
+                // event that swaps the rig cannot leave a stale index behind.
+                // The camera write consumes only the published index.
+                {
+                    uint64_t rig = 0;
+                    int node = -1;
+                    if (read_block(bestp + 0x220, &rig, sizeof(rig)) &&
+                        rig > 0x10000 && !(rig & 7))
+                        node = rig_find_node(rig, 0x07C159A2u);  // CRC32 Head
+                    const unsigned int pub =
+                        node >= 0 ? (unsigned int)node : 0xFFFFu;
+                    static unsigned int s_last_node = 0xFFFEu;
+                    headpose::set_head_node(pub);
+                    if (pub != s_last_node) {
+                        s_last_node = pub;
+                        if (pub == 0xFFFFu)
+                            LOG_INFO("fp: HEAD BONE not found in rig "
+                                     "0x%012llX (anchor falls back to the "
+                                     "character origin)",
+                                     (unsigned long long)rig);
+                        else
+                            LOG_INFO("fp: HEAD BONE node %u in rig 0x%012llX",
+                                     pub, (unsigned long long)rig);
+                    }
+                }
                 if ((ticks % 10) == 3)
                     LOG_INFO("fp: pin(entity) 0x%012llX dist=%.2fm "
                              "cluster=%d (camera %s)",
@@ -1151,6 +1542,28 @@ void snap_drain() {
                              g_fp_anchored.load(std::memory_order_relaxed)
                                  ? "ANCHORED to the character"
                                  : "on the 11c push (not anchored)");
+                // The stance test the user runs: stand, crouch, go prone.
+                // A real animated head bone moves ~1.6 / ~1.1 / ~0.3 m above
+                // the character origin. A static offset does not move at all,
+                // which is exactly how a wrong node index would present.
+                if ((ticks % 2) == 0 && g_head_valid)
+                    LOG_INFO("fp: HEAD world=(%.2f %.2f %.2f) dz=%+.2fm "
+                             "reads=%llu rejects=%llu",
+                             g_head_pos[0], g_head_pos[1], g_head_pos[2],
+                             g_head_dz,
+                             (unsigned long long)g_head_reads.load(
+                                 std::memory_order_relaxed),
+                             (unsigned long long)g_head_rejects.load(
+                                 std::memory_order_relaxed));
+                else if ((ticks % 10) == 3 && headpose::fp_head_anchor() &&
+                         headpose::fp_enabled())
+                    LOG_INFO("fp: HEAD not readable yet (node=%u reads=%llu "
+                             "rejects=%llu); anchor is on the origin",
+                             headpose::head_node(),
+                             (unsigned long long)g_head_reads.load(
+                                 std::memory_order_relaxed),
+                             (unsigned long long)g_head_rejects.load(
+                                 std::memory_order_relaxed));
             } else if ((ticks % 10) == 3) {
                 LOG_INFO("fp: pin(entity) no ring member for entity "
                          "0x%012llX (holding 0x%012llX)",
@@ -2029,6 +2442,47 @@ void drain() {
 
     snap_drain();
 
+    // Build 19 telemetry, drain thread only. The counters are written by the
+    // asm stubs with plain aligned stores, so a torn read is impossible and a
+    // slightly stale one is harmless.
+    if (g_setyaw_hook.installed() || g_setpitch_hook.installed()) {
+        static int aim_ticks = 0;
+        if ((++aim_ticks % 5) == 2) {
+            float ly = 0, lp = 0, cy = 0, cp = 0;
+            uint32_t bits = grwxr_setyaw_lastval;
+            memcpy(&ly, &bits, sizeof(ly));
+            bits = grwxr_setpitch_lastval;
+            memcpy(&lp, &bits, sizeof(lp));
+            headpose::aim_cum(&cy, &cp);
+            LOG_INFO("aim: yaw calls=%llu %.1f deg | pitch calls=%llu "
+                     "%.1f deg | absorbed=(%.1f, %.1f) deg pending=(%u,%u)",
+                     (unsigned long long)grwxr_setyaw_count, ly * 57.29578f,
+                     (unsigned long long)grwxr_setpitch_count, lp * 57.29578f,
+                     cy * 57.29578f, cp * 57.29578f,
+                     grwxr_setyaw_pending, grwxr_setpitch_pending);
+        }
+    }
+
+    // Build 18 telemetry. The latched object is the verified route to the
+    // head-visibility component (RE-notes), so log it once when it appears.
+    if (g_headhide_hook.installed()) {
+        static uint64_t s_seen_obj = 0;
+        static int hide_ticks = 0;
+        const uint64_t obj = grwxr_headhide_obj;
+        if (obj && obj != s_seen_obj) {
+            s_seen_obj = obj;
+            LOG_INFO("hide: head object LATCHED 0x%012llX (class identity "
+                     "passed)", (unsigned long long)obj);
+        }
+        if ((++hide_ticks % 10) == 4) {
+            LOG_INFO("hide: %s, setter calls=%llu forced=%llu obj=0x%012llX",
+                     grwxr_headhide_on ? "FORCING (fp on)" : "idle (fp off)",
+                     (unsigned long long)grwxr_headhide_calls,
+                     (unsigned long long)grwxr_headhide_forced,
+                     (unsigned long long)grwxr_headhide_obj);
+        }
+    }
+
     static uint32_t last_rows = 0;
     static int      ticks     = 0;
 
@@ -2085,8 +2539,47 @@ void drain() {
 }
 
 void uninstall() {
+    grwxr_headhide_table = 0;   // asm entry goes inert before the patch lifts
+    g_headhide_hook.restore();
+    g_setyaw_hook.restore();
+    g_setpitch_hook.restore();
     for (auto& h : g_hooks) h.restore();
     g_any = false;
+}
+
+// Build 18: drive the head-hide override from the first-person state. Called
+// from VRMirror's per-frame key poll; a plain aligned store, read by the asm
+// entry on every engine SetHidden call. When this drops to 0 the engine's own
+// re-assert (hazard 29, every camera update) restores visibility by itself
+// within a frame, so no explicit un-hide call is needed or wanted.
+void set_head_hide(bool on) {
+    grwxr_headhide_on = on ? 1u : 0u;
+}
+
+// Build 19: the aim injection surface (supersedes build 17's one-shot bump,
+// which this generalises). Render thread arms one delta per axis; the asm
+// stub consumes it exactly once via xchg on the engine thread. The write
+// order (bump first, then pending with a full barrier) means the stub can
+// never read a stale bump: it only looks at bump after xchg returned 1.
+bool aim_available() {
+    return g_setyaw_hook.installed() && g_setpitch_hook.installed();
+}
+
+bool aim_pending(int axis) {
+    return (axis == 0 ? grwxr_setyaw_pending : grwxr_setpitch_pending) != 0;
+}
+
+int aim_arm(int axis, float delta_engine_units) {
+    hook::ThunkHook& h  = axis == 0 ? g_setyaw_hook : g_setpitch_hook;
+    uint32_t& bump      = axis == 0 ? grwxr_setyaw_bump
+                                    : grwxr_setpitch_bump;
+    uint32_t& pending   = axis == 0 ? grwxr_setyaw_pending
+                                    : grwxr_setpitch_pending;
+    if (!h.installed()) return -1;
+    if (pending) return 0;
+    memcpy(&bump, &delta_engine_units, sizeof(bump));
+    InterlockedExchange((volatile LONG*)&pending, 1);
+    return 1;
 }
 
 }  // namespace camera

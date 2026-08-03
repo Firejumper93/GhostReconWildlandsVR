@@ -67,6 +67,16 @@ public:
     bool install(uint8_t* thunk, void* expected_target, void* replacement,
                  const char* name);
 
+    // Build 17 variant for slots that are NOT E9 thunks but still sit alone in
+    // int3-padded 16-byte slots: the virtual-dispatch stubs
+    // (`mov rax,[rcx]; jmp qword ptr [rax+disp]`, 10 bytes + CC padding).
+    // There is no jump target to verify, so the caller supplies the EXACT
+    // expected byte sequence instead; one mismatched byte installs nothing
+    // (project rule 7). The replacement must re-implement the dispatch
+    // itself, because there is no single "original function" to return to.
+    bool install_raw(uint8_t* slot, const uint8_t* expected, size_t expected_len,
+                     void* replacement, const char* name);
+
     void restore();
 
     bool installed() const { return installed_; }

@@ -26,7 +26,7 @@
 param(
     [string]$GhidraRoot = 'C:\ghidra_12.0.4_PUBLIC_20260303\ghidra_12.0.4_PUBLIC',
     [string]$Exe        = 'C:\Steam\steamapps\common\Wildlands\GRW.exe',
-    [string]$ProjectDir = 'C:\Claude\GRW-VR\ghidra',
+    [string]$ProjectDir = '.\ghidra',
     [string]$ProjectName = 'GRWVR',
     [switch]$NoAnalysis
 )

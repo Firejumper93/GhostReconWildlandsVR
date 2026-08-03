@@ -45,5 +45,24 @@ void drain();
 // Restores the thunk.
 void uninstall();
 
+// Build 19: the aim injection surface (supersedes build 17's one-shot bump).
+// axis 0 = yaw, 1 = pitch, deltas in the ENGINE's radian units. aim_arm
+// queues one delta for consume-once application to the next engine setter
+// call: returns 1 armed, 0 busy (the previous delta has not been consumed
+// yet), -1 hook not installed. aim_pending says whether a delta is still
+// queued, which is how the render-thread pump knows a previously armed delta
+// was absorbed and can be added to the accounting it publishes through
+// headpose::set_aim_cum.
+bool aim_available();
+bool aim_pending(int axis);
+int  aim_arm(int axis, float delta_engine_units);
+
+// Build 18: while on, the SetHidden detour forces the head-visibility
+// component hidden on every engine call (the engine re-asserts visibility
+// every update, so this must be a standing override, not a one-shot). Driven
+// from the first-person state each frame; off restores engine behaviour
+// within a frame. Safe from any thread; a no-op if the hook did not install.
+void set_head_hide(bool on);
+
 }  // namespace camera
 }  // namespace grwxr

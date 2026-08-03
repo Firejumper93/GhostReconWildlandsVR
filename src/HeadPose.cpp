@@ -56,6 +56,12 @@ std::atomic<float> g_fp_anchor_side{0.0f};
 // read per frame by the camera write. 0 = no pin, fall back to the push.
 std::atomic<unsigned long long> g_player_obj{0};
 
+// Build 16a. See HeadPose.h. 0.10 m is the head joint to eye trim, not
+// fp_eye's 0.85 m origin-to-eye rise.
+std::atomic<bool>         g_fp_head_anchor{true};
+std::atomic<float>        g_fp_head_eye{0.10f};
+std::atomic<unsigned int> g_head_node{0xFFFFu};
+
 // Build 12a. See HeadPose.h. Enabled by default: fullscreen is the intended
 // mode; Numpad 1 drops back to the windowed view for A/B.
 std::atomic<bool>  g_fs_enabled{true};
@@ -198,6 +204,30 @@ float fp_eye() {
     return g_fp_eye.load(std::memory_order_relaxed);
 }
 
+void set_fp_head_anchor(bool on) {
+    g_fp_head_anchor.store(on, std::memory_order_relaxed);
+}
+
+bool fp_head_anchor() {
+    return g_fp_head_anchor.load(std::memory_order_relaxed);
+}
+
+void set_fp_head_eye(float meters) {
+    g_fp_head_eye.store(meters, std::memory_order_relaxed);
+}
+
+float fp_head_eye() {
+    return g_fp_head_eye.load(std::memory_order_relaxed);
+}
+
+void set_head_node(unsigned int idx) {
+    g_head_node.store(idx, std::memory_order_relaxed);
+}
+
+unsigned int head_node() {
+    return g_head_node.load(std::memory_order_relaxed);
+}
+
 void set_player_obj(unsigned long long p) {
     g_player_obj.store(p, std::memory_order_relaxed);
 }
@@ -251,6 +281,23 @@ int pop_eye_tag(float q_xr[4], bool* q_ok) {
 
 unsigned long long pops_tagged() { return g_pops_tagged.load(std::memory_order_relaxed); }
 unsigned long long pops_mono()   { return g_pops_mono.load(std::memory_order_relaxed); }
+
+// Build 19: absorbed aim-injection totals, geometric radians (HeadPose.h).
+static std::atomic<float> g_aim_cum_yaw{0.0f};
+static std::atomic<float> g_aim_cum_pitch{0.0f};
+
+void set_aim_cum(float yaw_geo, float pitch_geo) {
+    g_aim_cum_yaw.store(yaw_geo, std::memory_order_relaxed);
+    g_aim_cum_pitch.store(pitch_geo, std::memory_order_relaxed);
+}
+
+bool aim_cum(float* yaw_geo, float* pitch_geo) {
+    const float y = g_aim_cum_yaw.load(std::memory_order_relaxed);
+    const float p = g_aim_cum_pitch.load(std::memory_order_relaxed);
+    *yaw_geo = y;
+    *pitch_geo = p;
+    return y != 0.0f || p != 0.0f;
+}
 
 int eye_tag_depth() {
     return (int)(g_tag_w.load(std::memory_order_relaxed) -

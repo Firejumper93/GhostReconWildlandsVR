@@ -111,6 +111,34 @@ float fp_eye();
 void set_fp_anchor_side(float meters);
 float fp_anchor_side();
 
+// Build 16a: THE HEAD BONE. The character origin was always a placeholder
+// anchor: it sits at the feet/body centre, ignores idle animation, and is at
+// the wrong height in every non-standing stance (all three user-reported).
+// The animated Head bone is the real viewpoint. Read path, [VERIFIED] by
+// offline disassembly of the engine's own accessors (docs/RE-notes.md
+// 2026-08-02 "THE POSE OBJECT"): [skeleton+0x238] is the per-character final
+// Pose, [pose+0x178] its bone-transform buffer, and node i occupies 0x20
+// bytes there: float4 translation at +0x00, float4 quaternion at +0x10. The
+// node index comes from the rig's sorted name map, keyed on CRC32("Head").
+//
+// fp_head_anchor selects it over the origin anchor (cfg key, default on).
+// fp_head_eye is the trim from the head JOINT to the eyes, in meters of world
+// up; the head joint sits at the base of the skull, so a small positive value
+// is expected rather than fp_eye's 0.85. It shares the Numpad 7/4 keys with
+// fp_eye: whichever anchor is live is the one those keys tune, so no new key
+// is added (hazard 24).
+void set_fp_head_anchor(bool on);
+bool fp_head_anchor();
+void set_fp_head_eye(float meters);
+float fp_head_eye();
+
+// The player's Head node index inside the rig's pose buffer, resolved on the
+// drain thread (1 Hz binary search over the rig name map) and consumed by the
+// camera write on the engine thread. 0xFFFF means "not resolved": the camera
+// write then falls back to the origin anchor.
+void set_head_node(unsigned int idx);
+unsigned int head_node();
+
 // The pinned player character object. Published by the read-only probe's
 // 1 Hz pin (which picks the character the chase camera is LOOKING AT, the
 // discriminator that survives teammates standing close), consumed by the
@@ -163,6 +191,19 @@ int  eye_tag_depth();         // diagnostic: current ring occupancy
 // stereo routing cannot be trusted.
 unsigned long long pops_tagged();
 unsigned long long pops_mono();
+
+// Build 19: VR AIM INJECTION accounting. The render thread injects head
+// yaw/pitch deltas into the engine's absolute aim pair (CameraProbe) and
+// tracks here, in GEOMETRIC radians, how much the engine has absorbed so
+// far. The camera hook subtracts these from the engine camera's own
+// yaw/pitch before composing the full head rotation, so the view never
+// double-applies what the engine already turned. Written on the render
+// thread when a consumed injection is observed; read by the camera hook
+// every call. A torn yaw/pitch pair costs one frame of sub-degree error.
+// aim_cum returns false while both are zero (no injection ever absorbed),
+// which is the camera hook's signal to use the raw base untouched.
+void set_aim_cum(float yaw_geo, float pitch_geo);
+bool aim_cum(float* yaw_geo, float* pitch_geo);
 
 }  // namespace headpose
 }  // namespace grwxr

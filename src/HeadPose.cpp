@@ -291,6 +291,39 @@ void set_aim_cum(float yaw_geo, float pitch_geo) {
     g_aim_cum_pitch.store(pitch_geo, std::memory_order_relaxed);
 }
 
+// Build 22: the Touch-as-gamepad snapshot (see the header).
+static std::atomic<uint32_t> g_pad_btn{0};
+static std::atomic<bool>     g_pad_live{false};
+static std::atomic<float>    g_pad_ax0{0.0f}, g_pad_ax1{0.0f}, g_pad_ax2{0.0f},
+                             g_pad_ax3{0.0f}, g_pad_ax4{0.0f}, g_pad_ax5{0.0f};
+
+void set_touch_pad(uint32_t buttons, const float axes[6], bool live) {
+    g_pad_btn.store(buttons, std::memory_order_relaxed);
+    if (axes) {
+        g_pad_ax0.store(axes[0], std::memory_order_relaxed);
+        g_pad_ax1.store(axes[1], std::memory_order_relaxed);
+        g_pad_ax2.store(axes[2], std::memory_order_relaxed);
+        g_pad_ax3.store(axes[3], std::memory_order_relaxed);
+        g_pad_ax4.store(axes[4], std::memory_order_relaxed);
+        g_pad_ax5.store(axes[5], std::memory_order_relaxed);
+    }
+    g_pad_live.store(live, std::memory_order_relaxed);
+}
+
+bool touch_pad(uint32_t* buttons, float axes[6]) {
+    if (!g_pad_live.load(std::memory_order_relaxed)) return false;
+    if (buttons) *buttons = g_pad_btn.load(std::memory_order_relaxed);
+    if (axes) {
+        axes[0] = g_pad_ax0.load(std::memory_order_relaxed);
+        axes[1] = g_pad_ax1.load(std::memory_order_relaxed);
+        axes[2] = g_pad_ax2.load(std::memory_order_relaxed);
+        axes[3] = g_pad_ax3.load(std::memory_order_relaxed);
+        axes[4] = g_pad_ax4.load(std::memory_order_relaxed);
+        axes[5] = g_pad_ax5.load(std::memory_order_relaxed);
+    }
+    return true;
+}
+
 bool aim_cum(float* yaw_geo, float* pitch_geo) {
     const float y = g_aim_cum_yaw.load(std::memory_order_relaxed);
     const float p = g_aim_cum_pitch.load(std::memory_order_relaxed);

@@ -119,6 +119,8 @@ uint32_t grwxr_headhide_on    = 0;
 volatile uint64_t grwxr_headhide_calls  = 0;
 volatile uint64_t grwxr_headhide_forced = 0;
 volatile uint64_t grwxr_headhide_obj    = 0;
+// Build 34: direct setter calls made on the FP toggle edge (instant hide).
+volatile uint64_t grwxr_headhide_direct = 0;
 void  grwxr_headhide_entry();
 }
 
@@ -670,6 +672,23 @@ constexpr const char* kHeadSetterSig  =
     "48 83 EC 08 44 0F B6 DA 49 89 C9 38 51 68 74 ? 44 0F B7 51 4A";
 
 hook::ThunkHook g_headhide_hook;
+
+// Build 35: NO CAMERA BLUR (RE-notes "NO CAMERA BLUR, decoded from the
+// community FP mod's cheat table", session 23). The community FP mod ships
+// without the FP body blur; its cheat table's whole mechanism is one byte,
+// the immediate of `mov sil, 1` forced to 0 inside the function that also
+// compares the uncracked name hash 0x826846F3. Re-derived in our build:
+// expected match RVA 0x124DE4CC, patch byte at match+5 (RVA 0x124DE4D1).
+// WRITE-CLASS NOTE, stated honestly: this is our first write inside a real
+// function body rather than an int3-padded thunk slot (same class as the
+// parked accuracy patch). The AOB must be unique AND at the documented RVA
+// AND the byte must read 01 before anything is written; any failure leaves
+// the game untouched (rule 7). uninstall() restores the byte.
+constexpr uintptr_t   kNoBlurMatchRva = 0x124DE4CC;
+constexpr size_t      kNoBlurImmOff   = 5;
+constexpr const char* kNoBlurSig      =
+    "45 89 E6 40 B6 01 E8 ? ? ? ? 3D F3 46 68 82";
+uint8_t* g_noblur_byte = nullptr;
 
 // Build 16a diagnostics, written by the camera hook, read by the 1 Hz drain.
 // Plain floats: a torn diagnostic read is harmless.
@@ -1322,6 +1341,42 @@ bool install() {
             }
         }
     }
+
+    // Build 35: the no-camera-blur byte. See the constants block for the
+    // provenance and the write-class note.
+    {
+        size_t m = 0;
+        auto hit = sig::find_unique(*img, kNoBlurSig, &m);
+        if (!hit) {
+            LOG_ERROR("blur: no-camera-blur signature %s (matches=%zu). "
+                      "Blur patch OFF, everything else runs.",
+                      m ? "AMBIGUOUS" : "missed", m);
+        } else if (*hit != img->base + kNoBlurMatchRva) {
+            LOG_ERROR("blur: signature matched at RVA 0x%08zX, expected "
+                      "0x%08zX (game updated?). Blur patch OFF.",
+                      (size_t)(*hit - img->base), (size_t)kNoBlurMatchRva);
+        } else if ((*hit)[kNoBlurImmOff] != 0x01) {
+            LOG_ERROR("blur: byte at match+%zu reads 0x%02X, expected 01. "
+                      "Blur patch OFF.",
+                      kNoBlurImmOff, (*hit)[kNoBlurImmOff]);
+        } else {
+            uint8_t* b = *hit + kNoBlurImmOff;
+            DWORD prot = 0;
+            if (VirtualProtect(b, 1, PAGE_EXECUTE_READWRITE, &prot)) {
+                *b = 0x00;
+                DWORD dummy = 0;
+                VirtualProtect(b, 1, prot, &dummy);
+                FlushInstructionCache(GetCurrentProcess(), b, 1);
+                g_noblur_byte = b;
+                LOG_INFO("blur: camera blur DISABLED (mov sil,1 -> mov sil,0 "
+                         "at RVA 0x%08zX, the FP mod's No Camera Blur).",
+                         (size_t)(b - img->base));
+            } else {
+                LOG_ERROR("blur: VirtualProtect failed (err %lu). "
+                          "Blur patch OFF.", GetLastError());
+            }
+        }
+    }
     LOG_INFO("camera: survey armed. BUILD 8: the live OpenXR head rotation is");
     LOG_INFO("camera: composed frame-idempotently onto the root transform at");
     LOG_INFO("camera: Camera+0x000 before on_calc_mvp. With no headset the");
@@ -1535,6 +1590,92 @@ void snap_drain() {
                                      pub, (unsigned long long)rig);
                     }
                 }
+
+                // Build 27: HAND BONE SANITY CHECK, read-only, no behaviour.
+                //
+                // This is the gate on all remaining IK work. Build 16b hunted
+                // the HumanIK effector array by testing whether effector 3
+                // landed near the LEFT HAND bone and effector 4 near the
+                // RIGHT, and it found nothing. But the node indices it used
+                // were 21 and 223, wildly asymmetric in a 312-bone rig, and
+                // were NEVER CHECKED. If either resolved to a prop or
+                // attachment helper instead of a real wrist, that dual-match
+                // test could never pass even where the array does exist, and
+                // the whole negative is an artifact of a bad reference point.
+                //
+                // So: resolve both hands and the head from the rig's own
+                // name-hash map and log where they actually are. A real pair
+                // of hands on a standing character is under about a metre
+                // apart and each within about a metre of the head. Anything
+                // wildly outside that means the indices are wrong, and THAT
+                // is the bug, not the effector array.
+                //
+                // Read-only: rig_find_node is a binary search over a sorted
+                // map and read_bone_world only touches range-checked memory.
+                // Logged every 5th tick and only when the verdict changes, so
+                // it cannot spam a play session.
+                if ((ticks % 5) == 2) {
+                    uint64_t rg = 0;
+                    if (read_block(bestp + 0x220, &rg, sizeof(rg)) &&
+                        rg > 0x10000 && !(rg & 7)) {
+                        const int nL = rig_find_node(rg, 0xB675F36Cu);  // LeftHand
+                        const int nR = rig_find_node(rg, 0x75F94D30u);  // RightHand
+                        const int nH = rig_find_node(rg, 0x07C159A2u);  // Head
+                        float L[3] = {}, R[3] = {}, H[3] = {};
+                        const bool okL = nL >= 0 &&
+                            read_bone_world(bestp, (unsigned int)nL, L);
+                        const bool okR = nR >= 0 &&
+                            read_bone_world(bestp, (unsigned int)nR, R);
+                        const bool okH = nH >= 0 &&
+                            read_bone_world(bestp, (unsigned int)nH, H);
+
+                        auto dist = [](const float* a, const float* b) {
+                            const float dx = a[0] - b[0], dy = a[1] - b[1],
+                                        dz = a[2] - b[2];
+                            return sqrtf(dx * dx + dy * dy + dz * dz);
+                        };
+                        const float lr = (okL && okR) ? dist(L, R) : -1.0f;
+                        const float lh = (okL && okH) ? dist(L, H) : -1.0f;
+                        const float rh = (okR && okH) ? dist(R, H) : -1.0f;
+
+                        // One word so the headset report is unambiguous.
+                        const char* verdict = "UNKNOWN";
+                        if (!okL || !okR || !okH)      verdict = "UNREADABLE";
+                        else if (lr < 0.05f)           verdict = "BAD(coincident)";
+                        else if (lr > 2.5f)            verdict = "BAD(too far apart)";
+                        else if (lh > 1.5f || rh > 1.5f) verdict = "BAD(not near head)";
+                        else                           verdict = "PLAUSIBLE";
+
+                        static int s_lastL = -2, s_lastR = -2;
+                        static char s_lastv[24] = {};
+                        if (nL != s_lastL || nR != s_lastR ||
+                            strcmp(s_lastv, verdict) != 0) {
+                            s_lastL = nL; s_lastR = nR;
+                            strncpy_s(s_lastv, verdict, _TRUNCATE);
+                            LOG_INFO("hands: %s  Lnode=%d Rnode=%d Hnode=%d  "
+                                     "L-R=%.2fm L-H=%.2fm R-H=%.2fm",
+                                     verdict, nL, nR, nH, lr, lh, rh);
+                            LOG_INFO("hands: L=(%.2f %.2f %.2f) "
+                                     "R=(%.2f %.2f %.2f) H=(%.2f %.2f %.2f)",
+                                     L[0], L[1], L[2], R[0], R[1], R[2],
+                                     H[0], H[1], H[2]);
+                        }
+                    }
+                }
+
+                // (The builds 28-32 effector walk that lived here was removed
+                // per rule 6: its route is EXHAUSTED. It verified the root
+                // global 0x04B132B0, verified the +0x50 list and the
+                // entry -> +0x10 -> +0xD8 chain, identified the reached
+                // objects as skeleton instances, and then refuted every
+                // single-indirection placement of the HumanIK effector array
+                // on them: not embedded (builds 30/31), not behind any
+                // pointer field of the skeleton or of X (build 32). See
+                // CURRENT-STATE.md builds 28-32 and the RE-notes session-23
+                // sections. The IK workstream continues on the HumanIK-native
+                // route: the rig instance pool and the debug flag registry.)
+
+
                 if ((ticks % 10) == 3)
                     LOG_INFO("fp: pin(entity) 0x%012llX dist=%.2fm "
                              "cluster=%d (camera %s)",
@@ -2437,6 +2578,14 @@ void snap_drain() {
 
 }  // namespace
 
+// Build 39: see CameraProbe.h. Unsynchronized by design; the comment there
+// states the tolerance argument.
+void base_pos(float out[3]) {
+    out[0] = g_base_pos[0];
+    out[1] = g_base_pos[1];
+    out[2] = g_base_pos[2];
+}
+
 void drain() {
     if (!g_any) return;
 
@@ -2463,6 +2612,32 @@ void drain() {
         }
     }
 
+    // Build 20 probe, read-only: the APPLIED GameSettings global (RE-notes
+    // 2026-08-03, static 0x04CCDE70, no pointer chase). GRW.ini already holds
+    // the three blur keys at 0, so whether the live applied copy agrees is
+    // the discriminator for the FP body blur route: nonzero here means the
+    // settings write path is worth taking, zero means the blur lives in the
+    // proximity fade instead. Logged at first read and on change only.
+    if (g_module) {
+        static uint8_t s_blur_prev[3] = {0, 0, 0};
+        static int     s_blur_have    = -1;
+        uint8_t cur[3];
+        const uint64_t gs = g_module + 0x04CCDE70;
+        const bool ok = read_block(gs + 0xAE, &cur[0], 1) &&
+                        read_block(gs + 0xB0, &cur[1], 1) &&
+                        read_block(gs + 0xB9, &cur[2], 1);
+        if (ok && (s_blur_have != 1 || memcmp(cur, s_blur_prev, 3) != 0)) {
+            memcpy(s_blur_prev, cur, sizeof(s_blur_prev));
+            s_blur_have = 1;
+            LOG_INFO("settings: applied CloseRangeBlur=%u HighQualityDOF=%u "
+                     "MotionBlur=%u", cur[0], cur[1], cur[2]);
+        } else if (!ok && s_blur_have == -1) {
+            s_blur_have = 0;
+            LOG_INFO("settings: applied GameSettings unreadable at 0x%012llX",
+                     (unsigned long long)gs);
+        }
+    }
+
     // Build 18 telemetry. The latched object is the verified route to the
     // head-visibility component (RE-notes), so log it once when it appears.
     if (g_headhide_hook.installed()) {
@@ -2475,10 +2650,12 @@ void drain() {
                      "passed)", (unsigned long long)obj);
         }
         if ((++hide_ticks % 10) == 4) {
-            LOG_INFO("hide: %s, setter calls=%llu forced=%llu obj=0x%012llX",
+            LOG_INFO("hide: %s, setter calls=%llu forced=%llu direct=%llu "
+                     "obj=0x%012llX",
                      grwxr_headhide_on ? "FORCING (fp on)" : "idle (fp off)",
                      (unsigned long long)grwxr_headhide_calls,
                      (unsigned long long)grwxr_headhide_forced,
+                     (unsigned long long)grwxr_headhide_direct,
                      (unsigned long long)grwxr_headhide_obj);
         }
     }
@@ -2541,6 +2718,16 @@ void drain() {
 void uninstall() {
     grwxr_headhide_table = 0;   // asm entry goes inert before the patch lifts
     g_headhide_hook.restore();
+    if (g_noblur_byte) {
+        DWORD prot = 0;
+        if (VirtualProtect(g_noblur_byte, 1, PAGE_EXECUTE_READWRITE, &prot)) {
+            *g_noblur_byte = 0x01;
+            DWORD dummy = 0;
+            VirtualProtect(g_noblur_byte, 1, prot, &dummy);
+            FlushInstructionCache(GetCurrentProcess(), g_noblur_byte, 1);
+        }
+        g_noblur_byte = nullptr;
+    }
     g_setyaw_hook.restore();
     g_setpitch_hook.restore();
     for (auto& h : g_hooks) h.restore();
@@ -2549,11 +2736,31 @@ void uninstall() {
 
 // Build 18: drive the head-hide override from the first-person state. Called
 // from VRMirror's per-frame key poll; a plain aligned store, read by the asm
-// entry on every engine SetHidden call. When this drops to 0 the engine's own
-// re-assert (hazard 29, every camera update) restores visibility by itself
-// within a frame, so no explicit un-hide call is needed or wanted.
+// entry on every engine SetHidden call.
+// Build 34: the engine's re-assert is TRANSITION-driven, not continuous
+// (build 18 headset run: zero setter calls for 12 s of FP-on play, then a
+// burst at the first aim), so the passive override alone leaves the head
+// visible until the first aim after FP on, and hidden until the first
+// transition after FP off. Once the object is latched, apply the state
+// directly on each toggle edge by calling the verified impl: an idempotent
+// boolean flip with no lock, callee, allocation or global read (RE-notes,
+// "The visibility setter"), so it is safe from the render thread. A
+// concurrent engine burst can only re-write the same idempotent state.
+// Before the first latch of the session (the engine has not called the
+// setter yet, and no other route to the object is verified) the build 18
+// behaviour stands: the head hides at the first aim or camera transition.
 void set_head_hide(bool on) {
-    grwxr_headhide_on = on ? 1u : 0u;
+    const uint32_t v = on ? 1u : 0u;
+    const uint32_t prev = grwxr_headhide_on;
+    grwxr_headhide_on = v;
+    if (v != prev) {
+        const uint64_t obj  = grwxr_headhide_obj;
+        const uint64_t impl = grwxr_headhide_impl;
+        if (obj && impl) {
+            ((void (*)(void*, uint8_t))impl)((void*)obj, (uint8_t)v);
+            grwxr_headhide_direct = grwxr_headhide_direct + 1;
+        }
+    }
 }
 
 // Build 19: the aim injection surface (supersedes build 17's one-shot bump,

@@ -5,6 +5,53 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
+## v0.5.0-alpha (builds 20-38, 2026-08-04, PACKAGED RELEASE)
+
+The first packaged release since v0.1.1-alpha. If your installed version still shows
+the game as a flat screen floating in the headset, you were on that old build:
+everything below (and the v0.2 through v0.4 source-drop features: real stereo depth,
+fullscreen view, 4K internal rendering, true first person) is new to you. Delete the
+old `dxgi.dll` and install this one, and read the new "Baseline graphics settings"
+section in the README before judging performance: in particular, **never use
+temporal anti-aliasing (TAA)** with this mod.
+
+### Added
+
+- **Full Touch controller play, no gamepad needed** (builds 22-22.2). The mod merges
+  the Touch controllers into the game as a gamepad: sticks, triggers, grips,
+  A/B/X/Y, menu. New key `xinput_touch` (default 1).
+- **Controller-driven hip-fire aim with a visible dot reticle** (builds 23-24). Hip
+  fire follows the right controller's ray, drawn per eye like a native VR game. New
+  keys `aim_source` (default 1 = controller), `aim_ctrl_smooth` (default 0.35),
+  `aim_reticle` (default 1).
+- **Aim-down-sights look-to-aim split** (build 25). Holding the left trigger switches
+  aim to the head and hides the dot, so the game's sight picture matches where
+  bullets land. Transitional until the weapon itself rides the controller.
+- **Config GUI and hot reload** (build 21). `grwxr.cfg` is re-read about one second
+  after any save; `tools\cfg_gui\cfg_gui.exe` is a standalone slider editor. All
+  numpad tuning keys were REMOVED: only Home (recenter), Numpad 8 (first person) and
+  Numpad Decimal (head aim) remain.
+- **Resilient VR startup** (build 38). Launching with the headset asleep no longer
+  kills VR for the run; the mod arms itself the moment the headset wakes.
+
+### Fixed
+
+- **The first-person close-range body blur is GONE** (build 35). Chest, arms and
+  weapon no longer smear in first person. This was the headline known issue of the
+  last release.
+- **Head hiding is instant on the toggle** (build 34). No more waiting for the next
+  aim transition (the first toggle of a session still engages after your first aim).
+- **A vertical-aim runaway** under controller aim when the controller pointed nearly
+  straight down (builds 20, 23.1): pitch accounting is now bounded and near-vertical
+  rays no longer drag yaw.
+
+### Performance
+
+- Verified on the test system: 72 fps sustained in open-world play at the baseline
+  settings, including with Supersampling 0.90 and SMAA.
+- A save carrying TAA settings measured a sustained drop into the low 60s. TAA also
+  ghosts under alternate-eye rendering. Use SMAA or no AA, never TAA.
+
 ## v0.4.0-alpha (build 19, 2026-08-03, source drop; a packaged release follows with the beta)
 
 The three oldest gaps in first person closed in one night: the camera now rides the

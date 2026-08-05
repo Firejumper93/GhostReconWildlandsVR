@@ -57,6 +57,13 @@ bool aim_available();
 bool aim_pending(int axis);
 int  aim_arm(int axis, float delta_engine_units);
 
+// Build 39: the camera's world position as captured once per built frame at
+// the camera hook (Camera+0x000 row 3). For correlation probes only: the read
+// is deliberately unsynchronized, so a caller on another thread can see a
+// position torn between two frames. That error is centimetres; the weapon
+// probe's filter radius is metres. Returns zeros before the first capture.
+void base_pos(float out[3]);
+
 // Build 18: while on, the SetHidden detour forces the head-visibility
 // component hidden on every engine call (the engine re-asserts visibility
 // every update, so this must be a standing override, not a one-shot). Driven

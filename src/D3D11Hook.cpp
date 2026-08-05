@@ -135,6 +135,7 @@ HWND find_our_window() {
 
 const State& state() { return g_state; }
 void set_present_callback(PresentCallback cb) { g_callback.store(cb, std::memory_order_relaxed); }
+bool has_present_callback() { return g_callback.load(std::memory_order_relaxed) != nullptr; }
 
 bool install() {
     if (g_installed.load()) return true;

@@ -1,14 +1,20 @@
 # Ghost Recon Wildlands VR (GRW-XR)
 
 > [!WARNING]
+> **SINGLEPLAYER ONLY. Solo campaign, never co-op, never PvP, never matchmaking.**
+> The game ships Easy Anti-Cheat for multiplayer and this mod must never run in
+> that context. Playing offline (Steam offline mode or Ubisoft Connect offline) is
+> recommended while testing.
+>
 > **THIS IS NOT A COMPLETE VR EXPERIENCE.** This mod is in the EARLY STAGES of
-> development and testing. Stereo depth, a fullscreen 4K view, motion-controller
-> aiming, and a real first-person camera (anchored to your character's head bone,
-> with the head hidden and optional 1:1 head aim) all work, but there are no IK
-> arms or hands yet, your own chest and hands blur at close range in first person,
-> and comfort issues remain. It has been tested on a single hardware configuration.
-> Try it as an experiment and a preview, not as a finished way to play the game.
-> Development is active and every release changes things.
+> development and testing. Stereo depth, a fullscreen 4K view, full Touch
+> controller play (no gamepad needed), controller-driven aiming with a visible
+> reticle, and a real first-person camera (anchored to your character's head
+> bone, head hidden, close-range body blur removed) all work, but there are no
+> IK arms or hands yet and comfort issues remain. It has been tested on a single
+> hardware configuration. Try it as an experiment and a preview, not as a
+> finished way to play the game. Development is active and every release changes
+> things.
 
 A native OpenXR VR mod for Tom Clancy's Ghost Recon Wildlands (AnvilNext 2.0, DirectX 11).
 Head-tracked stereoscopic 3D rendered by the game's own engine, injected through a
@@ -16,12 +22,20 @@ Head-tracked stereoscopic 3D rendered by the game's own engine, injected through
 
 **Status: experimental alpha, in ongoing development.** Stereo fusion with real depth
 was achieved on 2026-07-29, the fullscreen view on 2026-07-30, 4K internal rendering,
-motion-controller aiming and anchored first person on 2026-08-01/02, and head-bone
-first person, head hiding, and continuous 1:1 head aim on 2026-08-03. This is a
-development snapshot, not a finished mod. Expect rough edges. Performance numbers here
-come from one test system; different hardware, headsets, and settings may perform
-noticeably worse. The mod is being actively optimized and improved, so expect frequent
-changes.
+motion-controller aiming and anchored first person on 2026-08-01/02, head-bone
+first person, head hiding, and continuous 1:1 head aim on 2026-08-03, and full Touch
+controller play, controller-driven hip-fire aim with a reticle, and removal of the
+first-person close-range body blur on 2026-08-03/04. This is a development snapshot,
+not a finished mod. Expect rough edges. Performance numbers here come from one test
+system; different hardware, headsets, and settings may perform noticeably worse. The
+mod is being actively optimized and improved, so expect frequent changes.
+
+**If you tested an earlier release** (v0.1.x through v0.3.x): the "flat screen
+floating in space" is long gone. Current builds render a fullscreen, head-tracked,
+stereoscopic view with real depth, play entirely on the Touch controllers, aim with
+the right controller with a visible dot reticle, and support a true first-person
+mode. If your install still shows a floating window, you are on the old release:
+delete the old `dxgi.dll` and install this one.
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, and the
 [Roadmap](#roadmap) below for what is coming and how close it is.
@@ -40,9 +54,14 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, and the
   swapchain and reports a 4K client area to the engine, so the whole pipeline renders
   at 3840x2160 and the capture is sharp from an ordinary 1080p desktop. The render size
   is a config key, so it doubles as the quality-versus-frame-rate knob.
-- **Motion-controller aiming and firing.** A partial right-trigger squeeze aims down
-  sights, a full squeeze fires (hold for automatic), and pointing the controller away
-  from head center turns the game's own aim, so ballistics, HUD and crosshair stay true.
+- **Full Touch controller play, no gamepad needed.** The mod fabricates a gamepad from
+  the Touch controllers: sticks move and turn, triggers aim and fire, grips and
+  A/B/X/Y and menu all work. Pick up the Touch controllers and play.
+- **Controller-driven hip-fire aim with a visible reticle.** Hip fire follows the
+  right controller's ray, shown as a small dot reticle per eye like a native VR game,
+  so ballistics, HUD and crosshair stay true. Holding the left trigger (aim down
+  sights) switches to look-to-aim so the game's sight picture matches where bullets
+  land; this split is transitional until the weapon itself rides the controller.
 - **True first person, anchored to your head bone.** A toggle moves the viewpoint onto
   the player character's actual animated head bone: eye height tracks standing, crouch
   and prone automatically, the camera stays glued to the head while moving, and the
@@ -50,6 +69,13 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, and the
   body rather than to a nearby NPC.
 - **Your character's head is hidden in first person**, using the engine's own
   head-visibility mechanism, so you no longer see hair or helmet geometry from inside.
+  Hiding is instant on the toggle (the first toggle of a session engages after your
+  first aim).
+- **The first-person close-range body blur is REMOVED.** Your chest, arms and weapon
+  no longer smear when the camera sits at the character's head. This was the top
+  complaint from earlier builds.
+- **Resilient VR startup.** If the headset is asleep when the game launches, the mod
+  now waits and arms itself the moment the headset wakes; no relaunch needed.
 - **Continuous 1:1 head aim** (optional, Numpad Decimal). Your head's yaw and pitch feed
   the game's own aim path, so the view, reticle and bullets all follow your gaze
   exactly, while the right stick still turns underneath you. Aiming down sights pauses
@@ -58,21 +84,19 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, and the
   the flat game and bullets land on the crosshair. Magnified optics are displayed
   across a comfortable window so they actually magnify instead of shrinking to their
   true angular size.
-- Recenter on the Home key, live-adjustable eye separation, field of view and
-  first-person placement, config file persistence
+- **Config GUI and hot reload.** All tuning lives in `GRWVR\grwxr.cfg`, re-read about
+  one second after any save, and `tools\cfg_gui\cfg_gui.exe` is a standalone slider
+  editor. Only three hotkeys remain in play (recenter, first person, head aim).
 - A cropped, non-alternating desktop mirror suitable for recording
 - Stable at 72 fps on the test system through extended open-world play
 
 ## Known limitations (honest list)
 
-- **Your own chest and hands blur at close range in first person.** The world stays
-  sharp; the blur is the engine's close-range depth blur on geometry nearly touching
-  the camera. Removing it is the current development focus.
-- **No IK arms or hands.** Aiming is steered through the game's own aim path; the weapon
-  is not held by your controllers.
-- Head hiding and un-hiding engage on the next aim transition (for example, tapping
-  aim), not instantly at the toggle. This is how the engine re-asserts visibility and
-  is expected behavior.
+- **No IK arms or hands, and the weapon model does not yet visibly ride your
+  controller.** Bullets already follow the controller; making the gun model agree is
+  the current development focus.
+- Hip-fire accuracy uses the game's normal hip-fire spread; ADS-grade accuracy under
+  VR aim (without forcing the game's ADS state) is designed and queued.
 - The camera can occasionally attach to the wrong body after a respawn or fast travel.
   Toggling first person off and on while facing your character re-acquires it.
 - Vehicles in first person are unfinished. Ground vehicles are playable and fun in
@@ -95,12 +119,15 @@ evidence comes in.
 
 | Feature | Progress | Where it stands |
 |---|---|---|
-| Motion-controlled gun aim (the gun follows your controller, hip fire) | ~70% | The aim machinery is proven end to end with head aim driving it; remaining work is swapping the angle source to the controller ray and adding smoothing and clamps |
-| First-person body blur removal | ~50% | Cause narrowed to the engine's close-range blur; two candidate switches located in the engine's settings, one measurement run needed to pick the route |
-| Full Touch controller support (play without holding a gamepad) | ~40% | The input route is verified (the game accepts a merged XInput stream and loads it from the game folder); the merge layer itself is not yet written |
+| The gun visibly rides your controller (physical sighting) | ~40% | Bullets already follow the controller; the engine's object-placement path is fully mapped and a probe locating the weapon's placement handle is in testing |
+| Hip-fire accuracy at ADS grade under VR aim | ~70% | The exact engine flag is located and verified unique in this build; one write route decision remains before it ships |
 | Performance pass for dense towns | ~30% | The engine's shadow-quality lever is located and writable live; a measurement run will decide what ships |
 | Aerial vehicle interior camera | ~20% | Ground-vehicle first person already works in practice; helicopter and plane interiors need their camera behavior characterized first |
-| VR arms and hands (IK) | ~10% | Blocked on locating the GPU skinning data; the engine's own IK system is confirmed present, which is the long-term route |
+| VR arms and hands (IK) | ~15% | The GPU skinning data format was recovered from the game's own shipped shaders; which render path draws the player is the remaining unknown. The engine's own IK system is confirmed present, which is the long-term route |
+
+Shipped since the last release: full Touch controller support, controller hip-fire
+aim with a reticle, first-person body blur removal, instant head hide, config GUI
+with hot reload, resilient VR startup.
 
 A public **beta** is planned once the top items land.
 
@@ -145,46 +172,63 @@ The sections below are for building from source.
    the result.
 4. Copy `openxr_loader.dll` (from the OpenXR SDK release in the build step) into the
    game folder next to `GRW.exe`.
-5. Recommended in-game settings: motion blur Off, window mode fullscreen or borderless
-   fullscreen (a bordered window locks the game to your monitor's refresh rate),
-   Supersampling 0.90, frame rate limit 72, and **SMAA anti-aliasing** (at 4K the
-   temporal modes blend the alternating eye viewpoints into a shimmer on static edges).
-6. Put the headset on so it is awake and tracking BEFORE launching the game
-   (the VR session initializes once at startup), then launch through Steam.
+5. Set the baseline graphics settings below.
+6. Launch through Steam. The headset no longer needs to be awake before launch: the
+   mod waits and arms itself the moment the headset wakes.
+
+## Baseline graphics settings (start here before judging anything)
+
+This is the tested baseline. Test against it before reporting a graphics or
+performance problem, because two of these settings (window mode and anti-aliasing)
+can silently cost half the frame rate.
+
+In-game video settings (these write to `GRW.ini` in
+`Documents\My Games\Ghost Recon Wildlands`):
+
+| Setting | Value | Why |
+|---|---|---|
+| Resolution / window | 1920x1080, Fullscreen (`WindowMode=1`) | The mod renders internally at 4K regardless of the desktop size. A BORDERED window locks the game to your monitor's refresh rate and caps VR at 60 |
+| Frame rate limit | 72 (`FpsLimit=72`) | Matches the Quest 3 refresh the mod paces to |
+| Supersampling | 0.90 (`Supersampling=0.90`) | 1.00 exceeds the tested GPU's budget at 4K; 0.90 holds 72 fps |
+| Anti-aliasing | **SMAA or Off. NEVER any temporal (TAA) mode** (`AntiAliasingMode=3` is SMAA, `0` is off) | Temporal AA blends the alternating eye viewpoints into ghosting, and it is expensive: a TAA-enabled save measured a sustained drop from 72 to the low 60s |
+| Motion blur | Off | Smears under head tracking |
+
+Two traps worth knowing, both observed on the test system:
+
+- **The game rewrites `GRW.ini` when you apply anything in its menus**, and it has
+  silently wiped `FpsLimit` doing so. After any in-game menu apply, re-check the ini.
+- **Old saves can carry old settings with them.** A save from before this baseline
+  loaded with TAA enabled and read as "the mod got laggy". If performance suddenly
+  looks wrong, check the anti-aliasing setting first, then the ini.
 
 The mod writes its runtime files to `GRWVR\` inside the game folder: a per-process
 log (`grwxr-<pid>.log`) and an optional `grwxr.cfg`.
 
 ## In the headset
 
-All hotkeys are on the numeric keypad and are read live while the game has focus.
+Only THREE hotkeys remain; every tuning key from older releases was removed. All
+tuning lives in `GRWVR\grwxr.cfg`, which hot-reloads about one second after any
+save, or use the included slider GUI (`tools\cfg_gui\cfg_gui.exe`).
 
 | Key | Action |
 |---|---|
 | Home | Recenter (look where you want forward to be, then press) |
-| Numpad 9 / Numpad - | Eye separation scale + / - (0.05 steps) |
-| Numpad * | Reset eye separation scale to its startup value |
-| Numpad 1 | Fullscreen field-of-view override on / off |
-| Numpad + / Numpad 2 | Fullscreen field of view wider / narrower (0.10 rad steps) |
 | Numpad 8 | First person on / off (head hiding follows it automatically) |
 | Numpad . (Decimal) | 1:1 head aim on / off (bullets follow your gaze; default off) |
-| Numpad 7 / Numpad 4 | First person: eye height up / down (0.02 m steps while anchored to the head bone), otherwise camera forward / back |
-| Numpad 6 / Numpad 5 | First person: viewpoint right / left |
-| Numpad 3 / Numpad 0 | First person: viewpoint up / down (unanchored fallback only) |
-| Numpad / | Desktop recording view on / off |
 
-Every change is logged with the exact `grwxr.cfg` line needed to persist it. Hotkey
-changes last only for the session; the config file is the permanent home.
+### Touch controllers (no gamepad needed)
 
-### Right Touch controller
+The mod merges the Touch controllers into the game as a gamepad, so the full normal
+control scheme works: sticks move and turn, face buttons and grips act as their
+gamepad equivalents. On top of that:
 
 | Input | Action |
 |---|---|
-| Trigger, partial squeeze | Aim down sights |
-| Trigger, full squeeze | Fire (hold for automatic fire) |
-| Point away from head center | Turn the game's aim |
+| Right controller, point | Hip-fire aim: the dot reticle and bullets follow the controller ray |
+| Right trigger, full squeeze | Fire (hold for automatic fire) |
+| Left trigger (hold) | Aim down sights: aim follows your head so the sight picture is true; the dot hides |
 
-Keep your thumb off the gamepad's right stick while steering with the controller.
+A physical gamepad still works if you prefer it (the Touch snapshot merges with it).
 
 ## Configuration
 
@@ -201,6 +245,10 @@ key in comments. The ones most worth knowing:
 | `fp_eye` | First-person eye height above the character origin, meters (fallback anchor only) |
 | `fp_anchor_side` | First-person lateral centering, meters |
 | `aim_yaw_sign`, `aim_pitch_sign` | Head-aim direction calibration (defaults -1 and +1 for the current game build; flip one only if head aim turns the wrong way on that axis) |
+| `aim_source` | `1` (default) hip-fire aim follows the right controller; `0` follows the head |
+| `aim_ctrl_smooth` | Controller-aim smoothing, 0 to 1 (default 0.35) |
+| `aim_reticle` | `1` (default) draws the hip-fire dot reticle; `0` hides it |
+| `xinput_touch` | `1` (default) merges Touch controllers into the gamepad; `0` passes through untouched |
 | `aim_steer`, `aim_ads`, `aim_fire` | Motion-control features, set any to `0` to disable |
 | `desktop_fov` | Crop of the desktop recording view, `0` disables |
 

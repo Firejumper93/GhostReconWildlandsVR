@@ -2,6 +2,7 @@
 #include "CameraProbe.h"
 #include "HeadPose.h"
 #include "Log.h"
+#include "XInputMerge.h"
 
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_D3D11
@@ -32,6 +33,14 @@ XrActionSet g_actionset = XR_NULL_HANDLE;
 XrAction    g_act_aim   = XR_NULL_HANDLE;
 XrAction    g_act_trig  = XR_NULL_HANDLE;
 XrAction    g_act_grip  = XR_NULL_HANDLE;   // build 14e.2, the aim-steer gate
+// Build 22: the rest of the Touch surface, for the XInput merge.
+XrAction    g_act_stick    = XR_NULL_HANDLE;   // vector2f, both hands
+XrAction    g_act_stickclk = XR_NULL_HANDLE;   // boolean, both hands
+XrAction    g_act_btn_a    = XR_NULL_HANDLE;   // right hand
+XrAction    g_act_btn_b    = XR_NULL_HANDLE;   // right hand
+XrAction    g_act_btn_x    = XR_NULL_HANDLE;   // left hand
+XrAction    g_act_btn_y    = XR_NULL_HANDLE;   // left hand
+XrAction    g_act_menu     = XR_NULL_HANDLE;   // left hand
 XrPath      g_hand[2]      = {XR_NULL_PATH, XR_NULL_PATH};
 XrSpace     g_aim_space[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
 bool        g_input_ok = false;
@@ -42,6 +51,7 @@ std::atomic<float>    g_in_pos[2][3] = {};
 std::atomic<float>    g_in_ori[2][4] = {};
 std::atomic<float>    g_in_trig[2]   = {};
 std::atomic<float>    g_in_grip[2]   = {};   // build 14e.2
+std::atomic<int>      g_in_stick_rc[2] = {}; // build 22.1: (XrResult<<1)|isActive
 
 // BUILD 14d: CONTROLLER AIM STEER. While the RIGHT trigger is held (the game
 // never sees Touch input, so squeezing it fires nothing), the angle between
@@ -73,6 +83,22 @@ float g_aim_zero[2]    = {0.0f, 0.0f};  // head-angle baseline (re-zeroed while
                                         // off or fov-gated: no snap on resume)
 float g_aim_out[2]     = {0.0f, 0.0f};  // armed, not yet observed consumed
 bool  g_aim_outf[2]    = {false, false};
+
+// Build 23: the aim SOURCE. The pump is source-agnostic (it drives the
+// engine's absolute pair toward whatever target angles it is handed, and the
+// camera hook always composes the view from the true head pose), so the gun
+// following the controller is just a different target: the right Touch
+// controller's aim ray, extracted in the SAME recentered reference frame and
+// game basis as the head. Skeleton rule 5: the ray gets an EMA filter before
+// it reaches the game; the pump's own 0.30 rad per-injection clamp and the
+// build-20 cumulative-pitch bound already cap it.
+std::atomic<int> g_aim_source{1};       // cfg aim_source: 0 head, 1 right controller
+float g_ctl_smooth = 0.35f;             // cfg aim_ctrl_smooth, EMA alpha per frame
+float g_ctl_yaw    = 0.0f;              // filtered controller angles, render thread
+float g_ctl_pitch  = 0.0f;
+bool  g_ctl_have   = false;             // never tracked yet: fall back to head
+std::atomic<float> g_ctl_diag[4] = {};  // 23.1: ctl yaw/pitch, head yaw/pitch
+std::atomic<bool>  g_ctl_diag_ok{false};
 
 // BUILD 14f: TRIGGER = AIM DOWN SIGHTS. The right trigger drives the game's
 // own ADS binding (right-mouse hold), so the game's existing hip-to-ADS
@@ -229,6 +255,15 @@ std::vector<ID3D11RenderTargetView*> g_rtv[2];
 // g_blit_ok stays false and the 10L fixed copy path runs unchanged.
 ID3D11VertexShader*       g_blit_vs   = nullptr;
 ID3D11PixelShader*        g_blit_ps   = nullptr;
+// Build 24: the controller-aim reticle. A small dot drawn into each eye's
+// canvas at the controller ray's angular offset from the view center, so
+// hip-fire aim is VISIBLE the whole time (the game's own crosshair is
+// screen-centered and cannot show it). Render thread only.
+ID3D11PixelShader*        g_dot_ps    = nullptr;
+bool  g_dot_enable = true;    // cfg aim_reticle, 0 hides it
+bool  g_dot_on = false;       // this frame: draw it
+float g_dot_tx = 0.0f;        // tangent offsets from view center
+float g_dot_ty = 0.0f;
 ID3D11SamplerState*       g_blit_samp = nullptr;
 ID3D11RasterizerState*    g_blit_rs   = nullptr;
 ID3D11DepthStencilState*  g_blit_dss  = nullptr;
@@ -269,6 +304,10 @@ float g_scope_disp_fov = 0.5236f;
 XrSessionState g_state_xr = XR_SESSION_STATE_UNKNOWN;
 std::atomic<bool> g_active{false};
 std::atomic<bool> g_failed{false};
+// Build 38: session created but not yet READY (headset asleep or idle). The
+// init thread keeps polling and begins the session when the headset wakes,
+// instead of the old behaviour of latching g_failed and needing a relaunch.
+std::atomic<bool> g_pending{false};
 // Render-thread only. Set when the session is unrecoverable (EXITING,
 // LOSS_PENDING, or a failed re-begin); on_present becomes a no-op then.
 bool g_dead = false;
@@ -423,13 +462,28 @@ void load_config() {
         if (sscanf_s(line, " aim_fire = %f", &v) == 1) {
             g_fire_on.store(v > 0.0f, std::memory_order_relaxed);
         }
+        // Build 22: Touch-as-gamepad merge. 0 makes the XInputGetState
+        // detour a pure pass-through (hot-reloadable, so it doubles as the
+        // instant kill switch).
+        if (sscanf_s(line, " xinput_touch = %f", &v) == 1)
+            xin::set_enabled(v > 0.0f);
+        // Build 23: what the VR aim toggle drives. 0 = head (build 19),
+        // 1 = right controller ray (hip-fire, the default).
+        if (sscanf_s(line, " aim_source = %f", &v) == 1)
+            g_aim_source.store(v >= 0.5f ? 1 : 0, std::memory_order_relaxed);
+        if (sscanf_s(line, " aim_ctrl_smooth = %f", &v) == 1) {
+            if (v < 0.05f) v = 0.05f;
+            if (v > 1.0f)  v = 1.0f;
+            g_ctl_smooth = v;
+        }
+        // Build 24: the controller-aim reticle dot. 0 hides it.
+        if (sscanf_s(line, " aim_reticle = %f", &v) == 1)
+            g_dot_enable = v > 0.0f;
     }
     fclose(f);
     g_ipd_default = headpose::ipd_scale();
-    LOG_INFO("VR: grwxr.cfg read, ipd_scale = %.2f (Numpad 9/- adjusts, * resets to it),",
-             headpose::ipd_scale());
-    LOG_INFO("VR: mono_scope_fov = %.2f rad (eye offset collapses below this rendered fov)",
-             headpose::mono_scope_fov());
+    LOG_INFO("VR: grwxr.cfg read, ipd_scale = %.2f, mono_scope_fov = %.2f rad",
+             headpose::ipd_scale(), headpose::mono_scope_fov());
 }
 
 const char* state_name(XrSessionState s) {
@@ -539,6 +593,18 @@ void aim_pump(float head_yaw, float head_pitch) {
         if (fabsf(d) < 0.0005f) continue;       // ~0.03 deg: not worth a write
         if (d >  0.30f) d =  0.30f;             // per-injection clamp: a lost
         if (d < -0.30f) d = -0.30f;             // frame cannot become a whip
+        if (a == 1) {
+            // Build 20, hazard 31: the engine CLAMPS pitch against external
+            // writes, so chasing the head past that clamp credits g_aim_cum
+            // with absorption that never happened and the rebuilt base pins
+            // near vertical (the session-20 run-2 cascade). Bound the
+            // accounted total instead; past the bound the compose still
+            // carries the residual, so the view stays the true head pose.
+            const float kCumPitchMax = 1.4f;
+            if (g_aim_cum[1] + d >  kCumPitchMax) d =  kCumPitchMax - g_aim_cum[1];
+            if (g_aim_cum[1] + d < -kCumPitchMax) d = -kCumPitchMax - g_aim_cum[1];
+            if (fabsf(d) < 0.0005f) continue;
+        }
         const float sign = a == 0 ? g_aim_sign_yaw : g_aim_sign_pitch;
         if (camera::aim_arm(a, d * sign) == 1) {
             g_aim_out[a]  = d;
@@ -699,7 +765,92 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
         float sp = Hg[5];
         if (sp >  0.9999f) sp =  0.9999f;
         if (sp < -0.9999f) sp = -0.9999f;
-        aim_pump(atan2f(Hg[3], Hg[4]), asinf(sp));
+        const float head_ay = atan2f(Hg[3], Hg[4]);
+        const float head_ap = asinf(sp);
+        float ay = head_ay;
+        float ap = head_ap;
+        // Build 25: while the LEFT TRIGGER holds ADS, aim reverts to the
+        // HEAD. The game draws its sight picture at view center (head), so
+        // controller-driven aim during ADS splits picture from impacts
+        // (user: "the picture moves with the head but not the gun"). Split
+        // model: hip = controller ray with the dot, ADS = look-to-aim, both
+        // internally coherent. Gun-anchored optics belong to the arms phase.
+        const bool lt_ads =
+            g_in_trig[0].load(std::memory_order_relaxed) >= 0.5f;
+        // Build 23: controller-driven hip-fire. Same reference (g_ref_inv),
+        // same basis change, same yaw/pitch convention as the head above, so
+        // the two sources are interchangeable mid-run (cfg aim_source, hot-
+        // reloadable). An untracked controller HOLDS its last filtered ray
+        // (no snap); one that never tracked leaves the head in charge.
+        if (g_aim_source.load(std::memory_order_relaxed) == 1 && !lt_ads) {
+            const Quat c{g_in_ori[1][0].load(std::memory_order_relaxed),
+                         g_in_ori[1][1].load(std::memory_order_relaxed),
+                         g_in_ori[1][2].load(std::memory_order_relaxed),
+                         g_in_ori[1][3].load(std::memory_order_relaxed)};
+            if ((g_in_seen.load(std::memory_order_relaxed) & 2u) &&
+                (c.x != 0.0f || c.y != 0.0f || c.z != 0.0f || c.w != 0.0f)) {
+                const Quat rc = qmul(g_ref_inv, c);
+                float Rc[9];
+                quat_to_rows(rc, Rc);
+                float Cg[9];
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j)
+                        Cg[i * 3 + j] = S[i] * S[j] * Rc[P[i] * 3 + P[j]];
+                float cs = Cg[5];
+                if (cs >  0.9999f) cs =  0.9999f;
+                if (cs < -0.9999f) cs = -0.9999f;
+                const float cp = asinf(cs);
+                // Build 23.1: a near-vertical ray has no usable yaw (the
+                // horizontal projection vanishes and atan2 returns noise:
+                // the same gimbal guard the head reference capture has).
+                // A dangling or holstered controller points steeply down,
+                // so without this gate the filter chased garbage yaw and
+                // dragged the aim hard off. Yaw only updates while the ray
+                // is at least ~18 deg off vertical; pitch is always sound.
+                const float h2 = Cg[3] * Cg[3] + Cg[4] * Cg[4];
+                const bool  yaw_ok = h2 > 0.10f;
+                const float cy = yaw_ok ? atan2f(Cg[3], Cg[4]) : g_ctl_yaw;
+                if (!g_ctl_have) {
+                    if (yaw_ok) {
+                        g_ctl_yaw   = cy;
+                        g_ctl_pitch = cp;
+                        g_ctl_have  = true;
+                    }
+                } else {
+                    const float a = g_ctl_smooth;
+                    if (yaw_ok)
+                        g_ctl_yaw = wrap_pi(g_ctl_yaw + a * wrap_pi(cy - g_ctl_yaw));
+                    g_ctl_pitch = g_ctl_pitch + a * (cp - g_ctl_pitch);
+                }
+                // Diagnostic rider (drain thread logs it): filtered
+                // controller aim vs head, and the yaw-usability verdict.
+                g_ctl_diag[0].store(g_ctl_yaw,  std::memory_order_relaxed);
+                g_ctl_diag[1].store(g_ctl_pitch, std::memory_order_relaxed);
+                g_ctl_diag[2].store(ay, std::memory_order_relaxed);
+                g_ctl_diag[3].store(ap, std::memory_order_relaxed);
+                g_ctl_diag_ok.store(yaw_ok, std::memory_order_relaxed);
+            }
+            if (g_ctl_have) { ay = g_ctl_yaw; ap = g_ctl_pitch; }
+        }
+        aim_pump(ay, ap);
+
+        // Build 24: place the aim reticle at the controller ray's offset
+        // from the view center (both angles live in the same recentered
+        // frame). Hidden when aim is off, the source is the head (the dot
+        // would sit dead center), the ray is behind the view cone, or the
+        // fov gate says optics own the screen.
+        g_dot_on = false;
+        if (g_dot_enable && g_vraim_on && g_ctl_have && !lt_ads &&
+            g_aim_source.load(std::memory_order_relaxed) == 1 &&
+            headpose::read_fov(0.7853982f) >= 0.65f) {
+            const float dy = wrap_pi(g_ctl_yaw - head_ay);
+            const float dp = g_ctl_pitch - head_ap;
+            if (fabsf(dy) < 1.2f && fabsf(dp) < 1.2f) {
+                g_dot_tx = tanf(dy);
+                g_dot_ty = tanf(dp);
+                g_dot_on = true;
+            }
+        }
     }
 
     // Build 13a: the absolute XR-space orientation travels with the rotation
@@ -888,6 +1039,16 @@ bool create_blit_resources(const d3d11::State& st) {
         "float4 ps_main(float4 pos : SV_Position,\n"
         "               float2 uv : TEXCOORD0) : SV_Target {\n"
         "    return tex0.Sample(smp0, uv);\n"
+        "}\n"
+        // Build 24: the aim dot. The viewport is the dot's bounding square;
+        // discard outside the circle, darker rim for contrast on sky.
+        "float4 ps_dot(float4 pos : SV_Position,\n"
+        "              float2 uv : TEXCOORD0) : SV_Target {\n"
+        "    float r = length(uv - 0.5) * 2.0;\n"
+        "    if (r > 1.0) discard;\n"
+        "    float3 col = float3(1.0, 0.30, 0.15);\n"
+        "    if (r > 0.72) col *= 0.25;\n"
+        "    return float4(col, 1.0);\n"
         "}\n";
 
     ID3DBlob* vsb = nullptr;
@@ -949,6 +1110,24 @@ bool create_blit_resources(const d3d11::State& st) {
         if (g_blit_ps)   { g_blit_ps->Release();   g_blit_ps   = nullptr; }
         if (g_blit_vs)   { g_blit_vs->Release();   g_blit_vs   = nullptr; }
     }
+    // Build 24: the dot shader is OPTIONAL: a failure only costs the
+    // reticle, never the blit.
+    if (ok) {
+        ID3DBlob* db = nullptr;
+        err = nullptr;
+        if (SUCCEEDED(compile(kSrc, sizeof(kSrc) - 1, "grwxr_blit", nullptr,
+                              nullptr, "ps_dot", "ps_4_0", 0, 0, &db, &err))) {
+            if (FAILED(st.device->CreatePixelShader(db->GetBufferPointer(),
+                                                    db->GetBufferSize(),
+                                                    nullptr, &g_dot_ps)))
+                LOG_WARN("VR: 24 dot shader creation failed, no aim reticle");
+            db->Release();
+        } else {
+            LOG_WARN("VR: 24 dot shader compile failed, no aim reticle: %s",
+                     err ? (const char*)err->GetBufferPointer() : "?");
+        }
+        if (err) err->Release();
+    }
     return ok;
 }
 
@@ -991,6 +1170,26 @@ bool blit_into(int eye, ID3D11DeviceContext* ctx, float fovy) {
         ctx->OMSetRenderTargets(1, &g_rtv[eye][idx], nullptr);
         ctx->Draw(3, 0);
         drawn = true;
+
+        // Build 24: the aim reticle rides the same acquire. Zero-disparity
+        // placement (same angular offset in both eyes = optical infinity),
+        // ~0.5 deg across, drawn with the CURRENT controller offset even on
+        // the stale eye's redraw, which keeps the dot at display latency
+        // rather than content latency.
+        if (g_dot_on && g_dot_ps) {
+            const float r = 0.0045f * g_sx[eye];
+            D3D11_VIEWPORT dv;
+            dv.TopLeftX = g_cx[eye] + g_dot_tx * g_sx[eye] - r;
+            dv.TopLeftY = g_cy[eye] - g_dot_ty * g_sy[eye] - r;
+            dv.Width    = 2.0f * r;
+            dv.Height   = 2.0f * r;
+            dv.MinDepth = 0.0f;
+            dv.MaxDepth = 1.0f;
+            ctx->RSSetViewports(1, &dv);
+            ctx->PSSetShader(g_dot_ps, nullptr, 0);
+            ctx->Draw(3, 0);
+            ctx->PSSetShader(g_blit_ps, nullptr, 0);
+        }
 
         // 11a.2 one-shot probe: read one pixel of the blit source and one of
         // the canvas after the draw. Runs once per run, a few seconds in (so
@@ -1129,8 +1328,13 @@ bool create_canvases(const d3d11::State& st, const XrView views[2]) {
 
 }  // namespace
 
+bool begin_and_arm();   // build 38, defined below
+
 bool init(const d3d11::State& st) {
-    if (g_session != XR_NULL_HANDLE || g_failed.load()) return g_session != XR_NULL_HANDLE;
+    if (g_failed.load()) return false;
+    // Build 38: a session that exists but is not begun yet is poll_start()'s
+    // business, not a reason to claim success here.
+    if (g_session != XR_NULL_HANDLE) return g_active.load();
     if (!st.device || !st.context) return false;
 
     LOG_INFO("VR: initialising OpenXR on the game's D3D11 device");
@@ -1277,28 +1481,66 @@ bool init(const d3d11::State& st) {
         ir = xrCreateAction(g_actionset, &aci, &g_act_grip);
         if (XR_FAILED(ir)) { LOG_INFO("VR: 14e create grip FAILED %d, input disabled", (int)ir); return false; }
 
+        // Build 22: sticks and buttons for the XInput merge. One creation
+        // failure disables input wholesale, same policy as above.
+        struct BDef { XrAction* act; XrActionType type; const char* name;
+                      const char* loc; bool both; };
+        const BDef defs[] = {
+            {&g_act_stick,    XR_ACTION_TYPE_VECTOR2F_INPUT, "stick",      "Thumbstick",       true},
+            {&g_act_stickclk, XR_ACTION_TYPE_BOOLEAN_INPUT,  "stickclick", "Thumbstick click", true},
+            {&g_act_btn_a,    XR_ACTION_TYPE_BOOLEAN_INPUT,  "btn_a",      "A",                false},
+            {&g_act_btn_b,    XR_ACTION_TYPE_BOOLEAN_INPUT,  "btn_b",      "B",                false},
+            {&g_act_btn_x,    XR_ACTION_TYPE_BOOLEAN_INPUT,  "btn_x",      "X",                false},
+            {&g_act_btn_y,    XR_ACTION_TYPE_BOOLEAN_INPUT,  "btn_y",      "Y",                false},
+            {&g_act_menu,     XR_ACTION_TYPE_BOOLEAN_INPUT,  "menu",       "Menu",             false},
+        };
+        for (const BDef& d : defs) {
+            aci = {XR_TYPE_ACTION_CREATE_INFO};
+            aci.actionType = d.type;
+            strcpy_s(aci.actionName, d.name);
+            strcpy_s(aci.localizedActionName, d.loc);
+            if (d.both) { aci.countSubactionPaths = 2; aci.subactionPaths = g_hand; }
+            ir = xrCreateAction(g_actionset, &aci, d.act);
+            if (XR_FAILED(ir)) { LOG_INFO("VR: 22 create %s FAILED %d, input disabled", d.name, (int)ir); return false; }
+        }
+
         // Oculus Touch bindings: the aim pose (runtime-defined forward ray of
         // the controller, exactly what gun direction wants), trigger value,
         // and grip (squeeze) value.
         XrPath prof, p_aim[2], p_trig[2], p_grip[2];
+        XrPath p_stick[2], p_stickclk[2], p_a, p_b, p_x, p_y, p_menu;
         if (XR_FAILED(xrStringToPath(g_instance, "/interaction_profiles/oculus/touch_controller", &prof)) ||
             XR_FAILED(xrStringToPath(g_instance, "/user/hand/left/input/aim/pose",       &p_aim[0]))  ||
             XR_FAILED(xrStringToPath(g_instance, "/user/hand/right/input/aim/pose",      &p_aim[1]))  ||
             XR_FAILED(xrStringToPath(g_instance, "/user/hand/left/input/trigger/value",  &p_trig[0])) ||
             XR_FAILED(xrStringToPath(g_instance, "/user/hand/right/input/trigger/value", &p_trig[1])) ||
             XR_FAILED(xrStringToPath(g_instance, "/user/hand/left/input/squeeze/value",  &p_grip[0])) ||
-            XR_FAILED(xrStringToPath(g_instance, "/user/hand/right/input/squeeze/value", &p_grip[1]))) {
+            XR_FAILED(xrStringToPath(g_instance, "/user/hand/right/input/squeeze/value", &p_grip[1])) ||
+            XR_FAILED(xrStringToPath(g_instance, "/user/hand/left/input/thumbstick",        &p_stick[0]))    ||
+            XR_FAILED(xrStringToPath(g_instance, "/user/hand/right/input/thumbstick",       &p_stick[1]))    ||
+            XR_FAILED(xrStringToPath(g_instance, "/user/hand/left/input/thumbstick/click",  &p_stickclk[0])) ||
+            XR_FAILED(xrStringToPath(g_instance, "/user/hand/right/input/thumbstick/click", &p_stickclk[1])) ||
+            XR_FAILED(xrStringToPath(g_instance, "/user/hand/right/input/a/click",          &p_a))           ||
+            XR_FAILED(xrStringToPath(g_instance, "/user/hand/right/input/b/click",          &p_b))           ||
+            XR_FAILED(xrStringToPath(g_instance, "/user/hand/left/input/x/click",           &p_x))           ||
+            XR_FAILED(xrStringToPath(g_instance, "/user/hand/left/input/y/click",           &p_y))           ||
+            XR_FAILED(xrStringToPath(g_instance, "/user/hand/left/input/menu/click",        &p_menu))) {
             LOG_INFO("VR: 13b binding paths FAILED, input disabled");
             return false;
         }
-        XrActionSuggestedBinding sb[6] = {
-            {g_act_aim,  p_aim[0]},  {g_act_aim,  p_aim[1]},
-            {g_act_trig, p_trig[0]}, {g_act_trig, p_trig[1]},
-            {g_act_grip, p_grip[0]}, {g_act_grip, p_grip[1]},
+        XrActionSuggestedBinding sb[15] = {
+            {g_act_aim,      p_aim[0]},      {g_act_aim,      p_aim[1]},
+            {g_act_trig,     p_trig[0]},     {g_act_trig,     p_trig[1]},
+            {g_act_grip,     p_grip[0]},     {g_act_grip,     p_grip[1]},
+            {g_act_stick,    p_stick[0]},    {g_act_stick,    p_stick[1]},
+            {g_act_stickclk, p_stickclk[0]}, {g_act_stickclk, p_stickclk[1]},
+            {g_act_btn_a,    p_a},           {g_act_btn_b,    p_b},
+            {g_act_btn_x,    p_x},           {g_act_btn_y,    p_y},
+            {g_act_menu,     p_menu},
         };
         XrInteractionProfileSuggestedBinding ipsb{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
         ipsb.interactionProfile = prof;
-        ipsb.countSuggestedBindings = 6;
+        ipsb.countSuggestedBindings = 15;
         ipsb.suggestedBindings = sb;
         ir = xrSuggestInteractionProfileBindings(g_instance, &ipsb);
         if (XR_FAILED(ir)) { LOG_INFO("VR: 13b suggest bindings FAILED %d, input disabled", (int)ir); return false; }
@@ -1421,8 +1663,6 @@ bool init(const d3d11::State& st) {
     }
 
     // --- begin session ---
-    XrSessionBeginInfo sbi{XR_TYPE_SESSION_BEGIN_INFO};
-    sbi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     // Session must reach READY before begin; poll briefly for the event.
     for (int i = 0; i < 400 && g_state_xr != XR_SESSION_STATE_READY; ++i) {
         XrEventDataBuffer ev{XR_TYPE_EVENT_DATA_BUFFER};
@@ -1435,26 +1675,72 @@ bool init(const d3d11::State& st) {
         }
         if (g_state_xr != XR_SESSION_STATE_READY) Sleep(25);
     }
+    // BUILD 38: not reaching READY in ten seconds is NOT a failure, it is a
+    // headset that is asleep, idle in the Oculus home, or still coming up over
+    // Link. Until now this marked VR dead for the whole run (g_failed latched,
+    // and dllmain only ever called init once), so launching the game before
+    // the headset was awake meant restarting the game. Now the session is left
+    // alive and poll_start(), called once a second from the init thread, begins
+    // it the moment READY arrives.
     if (g_state_xr != XR_SESSION_STATE_READY) {
-        LOG_ERROR("VR: session never reached READY. Is the headset awake and on?");
-        g_failed.store(true);
+        LOG_WARN("VR: session is %s, not READY yet (headset asleep, idle in "
+                 "the Oculus home, or Link still coming up). NOT giving up: "
+                 "put the headset on and the mirror arms automatically.",
+                 state_name(g_state_xr));
+        g_pending.store(true);
         return false;
     }
-    r = xrBeginSession(g_session, &sbi);
+    return begin_and_arm();
+}
+
+// BUILD 38: the tail of init, split out so a deferred start can reuse it.
+bool begin_and_arm() {
+    XrSessionBeginInfo sbi{XR_TYPE_SESSION_BEGIN_INFO};
+    sbi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    const XrResult r = xrBeginSession(g_session, &sbi);
     if (XR_FAILED(r)) return fail("xrBeginSession", r);
 
     LOG_INFO("VR: session begun. Submitting the game frame to the headset.");
     LOG_INFO("VR: build 11f, big flat scope (%.2f rad window) + FP demo", g_scope_disp_fov);
-    LOG_INFO("VR: FP keys: Numpad 8 toggle, 7/4 fwd, 6/5 side, 3/0 up/down (0.10 m steps)");
-    LOG_INFO("VR: fullscreen %s, fov %.2f rad (Numpad 1 toggle, 2/+ step 0.10)",
-             headpose::fs_enabled() ? "ON" : "OFF", headpose::fs_fov());
-    LOG_INFO("VR: desktop view %s, crop fov %.2f rad (Numpad / toggle; steady "
-             "left eye for recording)", g_desk_on ? "ON" : "OFF", g_desk_fov);
-    LOG_INFO("VR: Home recenters. Numpad + and - step the eye separation by");
-    LOG_INFO("VR: 0.05, Numpad * resets it to 1.00; each change is logged.");
+    LOG_INFO("VR: keys: Home recenter, Numpad 8 first person, Numpad Decimal head aim.");
+    LOG_INFO("VR: all tuning lives in grwxr.cfg, hot-reloaded ~1 s after any save");
+    LOG_INFO("VR: (edit by hand or with cfg_gui.exe). Build 21.");
+    LOG_INFO("VR: fullscreen %s, fov %.2f rad; desktop view %s, crop %.2f rad",
+             headpose::fs_enabled() ? "ON" : "OFF", headpose::fs_fov(),
+             g_desk_on ? "ON" : "OFF", g_desk_fov);
     LOG_INFO("VR: Judge in the headset; the desktop mirror vibrates by design.");
     g_active.store(true);
+    g_pending.store(false);
     return true;
+}
+
+// Build 38: called once a second from the init thread while a created session
+// has not begun. Drains session events and begins the moment the runtime says
+// READY, so waking the headset after launch arms the mirror with no relaunch.
+// Returns true exactly once, on the tick the session actually begins.
+bool poll_start() {
+    if (!g_pending.load() || g_failed.load() || g_session == XR_NULL_HANDLE)
+        return false;
+    XrEventDataBuffer ev{XR_TYPE_EVENT_DATA_BUFFER};
+    while (xrPollEvent(g_instance, &ev) == XR_SUCCESS) {
+        if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+            g_state_xr = ((XrEventDataSessionStateChanged*)&ev)->state;
+            LOG_INFO("VR: session state -> %s", state_name(g_state_xr));
+        }
+        ev = {XR_TYPE_EVENT_DATA_BUFFER};
+    }
+    if (g_state_xr == XR_SESSION_STATE_EXITING ||
+        g_state_xr == XR_SESSION_STATE_LOSS_PENDING) {
+        LOG_ERROR("VR: runtime ended the session before it began (%s). "
+                  "Restart the game with the headset awake.",
+                  state_name(g_state_xr));
+        g_pending.store(false);
+        g_failed.store(true);
+        return false;
+    }
+    if (g_state_xr != XR_SESSION_STATE_READY) return false;
+    LOG_INFO("VR: headset is awake, session reached READY. Arming now.");
+    return begin_and_arm();
 }
 
 void on_present(const d3d11::State& st) {
@@ -1527,187 +1813,28 @@ void on_present(const d3d11::State& st) {
         s_was_down = down;
     }
 
-    // Build 10c: live eye-separation tuning, same edge-triggered pattern.
-    // Numpad 9 steps ipd_scale +0.05, Numpad - steps -0.05, Numpad * resets
-    // to the startup value (cfg default).
-    // Build 10m: the 10h coarse merge-hunt keys are REMOVED. The merge
-    // measurement is done, and VK_RETURN is global, so any Enter press
-    // (menus, chat) silently bumped depth by +0.5 (hazard 15; it fired in
-    // the 20:44 run, kicking a tuned -0.50 back to 0.00 right before quit).
-    // Increase moved from Numpad + to Numpad 9 (user request), and the
-    // sweep range [-20, +20] tightened back to [-2, +2].
-    {
-        static bool s_add = false, s_sub = false, s_mul = false;
-        const bool add = (GetAsyncKeyState(VK_NUMPAD9)  & 0x8000) != 0;
-        const bool sub = (GetAsyncKeyState(VK_SUBTRACT) & 0x8000) != 0;
-        const bool mul = (GetAsyncKeyState(VK_MULTIPLY) & 0x8000) != 0;
-        float s = headpose::ipd_scale();
-        bool changed = false;
-        if (add && !s_add) { s += 0.05f; changed = true; }
-        if (sub && !s_sub) { s -= 0.05f; changed = true; }
-        if (mul && !s_mul) { s = g_ipd_default; changed = true; }
-        if (changed) {
-            if (s < -2.0f) s = -2.0f;
-            if (s >  2.0f) s =  2.0f;
-            headpose::set_ipd_scale(s);
-            note("VR: ipd scale = %.2f (persist it as ipd_scale=%.2f in grwxr.cfg)", s, s);
-        }
-        s_add = add; s_sub = sub; s_mul = mul;
-    }
+    // Build 21: every numpad TUNING key is removed. Tuning now lives in
+    // grwxr.cfg, hot-reloaded about a second after any save (poll_config on
+    // the init thread), edited by hand or with tools/cfg_gui. Only the three
+    // PLAY toggles remain as keys: Home (recenter, above), Numpad 8 (first
+    // person, below) and Numpad Decimal (head aim, below). Removed: 9 - *
+    // (ipd), 7 4 6 5 3 0 (first-person offsets), 1 2 + (fullscreen fov),
+    // / (desktop view).
 
-    // Build 11c: first-person demo controls, same edge-triggered pattern.
-    // Numpad 8 toggles the forward push, Numpad 7 / Numpad 4 step the
-    // distance by +-0.10 m for in-headset tuning of "inside the head".
+    // Build 11c/15e/16a: first-person toggle. The offset tuning that shared
+    // this block moved to the cfg.
     {
-        static bool s_tog = false, s_up = false, s_dn = false;
+        static bool s_tog = false;
         const bool tog = (GetAsyncKeyState(VK_NUMPAD8) & 0x8000) != 0;
-        const bool up  = (GetAsyncKeyState(VK_NUMPAD7) & 0x8000) != 0;
-        const bool dn  = (GetAsyncKeyState(VK_NUMPAD4) & 0x8000) != 0;
         if (tog && !s_tog) {
             const bool on = !headpose::fp_enabled();
             headpose::set_fp_enabled(on);
-            note("VR: first-person demo %s (fp_forward %.2f m, Numpad 7/4 steps)",
-                 on ? "ON" : "OFF", headpose::fp_forward());
+            note("VR: first person %s", on ? "ON" : "OFF");
         }
         // Build 18: the head-hide override simply follows the FP state.
         // Re-published every poll (not only on the edge) so the detour is
         // correct even if FP was toggled before the hook finished installing.
         camera::set_head_hide(headpose::fp_enabled());
-        // Build 15e: Numpad 7/4 now step whichever distance is actually in
-        // play, so no new keys are needed (hazard 24). Anchored: eye height
-        // above the character origin. Not anchored: the 11c forward push.
-        // Build 16a: when the HEAD BONE anchor is the one in play, those same
-        // keys tune fp_head_eye (the joint-to-eye trim, 0.02 m steps because
-        // the whole range is a few centimeters) instead of fp_eye. Still no
-        // new keys: the pair always steps whatever the viewpoint is actually
-        // riding on.
-        bool moved = false;
-        const bool head_live = headpose::fp_head_anchor() &&
-                               headpose::head_node() != 0xFFFFu;
-        if (headpose::player_obj() && head_live) {
-            float e = headpose::fp_head_eye();
-            if (up && !s_up) { e += 0.02f; moved = true; }
-            if (dn && !s_dn) { e -= 0.02f; moved = true; }
-            if (moved) {
-                if (e < -0.5f) e = -0.5f;
-                if (e >  1.0f) e =  1.0f;
-                headpose::set_fp_head_eye(e);
-                note("VR: fp_head_eye = %.2f m above the HEAD BONE "
-                     "(persist as fp_head_eye=%.2f in grwxr.cfg)", e, e);
-            }
-        } else if (headpose::player_obj()) {
-            float e = headpose::fp_eye();
-            if (up && !s_up) { e += 0.05f; moved = true; }
-            if (dn && !s_dn) { e -= 0.05f; moved = true; }
-            if (moved) {
-                if (e < 0.0f) e = 0.0f;
-                if (e > 2.5f) e = 2.5f;
-                headpose::set_fp_eye(e);
-                note("VR: fp_eye = %.2f m above the character "
-                     "(persist as fp_eye=%.2f in grwxr.cfg)", e, e);
-            }
-        } else {
-            float d = headpose::fp_forward();
-            if (up && !s_up) { d += 0.10f; moved = true; }
-            if (dn && !s_dn) { d -= 0.10f; moved = true; }
-            if (moved) {
-                if (d < 0.0f) d = 0.0f;
-                if (d > 4.0f) d = 4.0f;
-                headpose::set_fp_forward(d);
-                note("VR: fp_forward = %.2f m (persist as fp_forward=%.2f in grwxr.cfg)", d, d);
-            }
-        }
-        // Build 11f: side (Numpad 6 right, Numpad 5 left) and up (Numpad 3
-        // up, Numpad 0 down), 0.10 m steps, for centering the view on the
-        // head (the right-shoulder camera makes a pure forward push land
-        // right of it). Build 15e.3: like Numpad 7/4, 6/5 step whichever
-        // side offset is in play: fp_anchor_side (0.05 m) while pinned,
-        // the 11f fp_side otherwise.
-        static bool s_r = false, s_l = false, s_u2 = false, s_d2 = false;
-        const bool kr = (GetAsyncKeyState(VK_NUMPAD6) & 0x8000) != 0;
-        const bool kl = (GetAsyncKeyState(VK_NUMPAD5) & 0x8000) != 0;
-        const bool ku = (GetAsyncKeyState(VK_NUMPAD3) & 0x8000) != 0;
-        const bool kd = (GetAsyncKeyState(VK_NUMPAD0) & 0x8000) != 0;
-        if (headpose::player_obj()) {
-            bool moved2 = false;
-            float as = headpose::fp_anchor_side();
-            if (kr && !s_r) { as += 0.05f; moved2 = true; }
-            if (kl && !s_l) { as -= 0.05f; moved2 = true; }
-            if (moved2) {
-                if (as < -1.0f) as = -1.0f;
-                if (as >  1.0f) as =  1.0f;
-                headpose::set_fp_anchor_side(as);
-                note("VR: fp_anchor_side = %.2f m (persist as "
-                     "fp_anchor_side=%.2f in grwxr.cfg)", as, as);
-            }
-        } else {
-            bool moved2 = false;
-            float sd = headpose::fp_side();
-            if (kr && !s_r) { sd += 0.10f; moved2 = true; }
-            if (kl && !s_l) { sd -= 0.10f; moved2 = true; }
-            if (moved2) {
-                if (sd < -2.0f) sd = -2.0f;
-                if (sd >  2.0f) sd =  2.0f;
-                headpose::set_fp_side(sd);
-                note("VR: fp_side = %.2f (persist as fp_side in grwxr.cfg)",
-                     sd);
-            }
-        }
-        {
-            bool moved3 = false;
-            float ud = headpose::fp_up();
-            if (ku && !s_u2) { ud += 0.10f; moved3 = true; }
-            if (kd && !s_d2) { ud -= 0.10f; moved3 = true; }
-            if (moved3) {
-                if (ud < -2.0f) ud = -2.0f;
-                if (ud >  2.0f) ud =  2.0f;
-                headpose::set_fp_up(ud);
-                note("VR: fp_up = %.2f (persist as fp_up in grwxr.cfg)", ud);
-            }
-        }
-        s_r = kr; s_l = kl; s_u2 = ku; s_d2 = kd;
-        s_tog = tog; s_up = up; s_dn = dn;
-    }
-
-    // Build 12a: fullscreen controls, same edge-triggered pattern. Numpad 1
-    // toggles the world-band fov override, Numpad 2 / Numpad + step the
-    // render fov by -/+0.10 rad for in-headset tuning (more fov = more
-    // coverage but softer image at a fixed render resolution).
-    {
-        static bool s_tog = false, s_dn = false, s_up = false;
-        const bool tog = (GetAsyncKeyState(VK_NUMPAD1) & 0x8000) != 0;
-        const bool dn  = (GetAsyncKeyState(VK_NUMPAD2) & 0x8000) != 0;
-        const bool up  = (GetAsyncKeyState(VK_ADD)     & 0x8000) != 0;
-        if (tog && !s_tog) {
-            const bool on = !headpose::fs_enabled();
-            headpose::set_fs_enabled(on);
-            note("VR: fullscreen %s (fov %.2f rad, Numpad 2/+ steps)",
-                 on ? "ON" : "OFF", headpose::fs_fov());
-        }
-        bool moved = false;
-        float f = headpose::fs_fov();
-        if (up && !s_up) { f += 0.10f; moved = true; }
-        if (dn && !s_dn) { f -= 0.10f; moved = true; }
-        if (moved) {
-            if (f < 0.8f) f = 0.8f;
-            if (f > 2.5f) f = 2.5f;
-            headpose::set_fs_fov(f);
-            note("VR: fullscreen_fov = %.2f rad (persist as fullscreen_fov=%.2f in grwxr.cfg)",
-                 f, f);
-        }
-        s_tog = tog; s_dn = dn; s_up = up;
-    }
-
-    // Build 12c: desktop recording view toggle, same edge-triggered pattern.
-    {
-        static bool s_tog = false;
-        const bool tog = (GetAsyncKeyState(VK_DIVIDE) & 0x8000) != 0;
-        if (tog && !s_tog) {
-            g_desk_on = !g_desk_on;
-            note("VR: desktop view %s (crop fov %.2f rad, desktop_fov in grwxr.cfg)",
-                 g_desk_on ? "ON (steady left eye, normal fov)" : "OFF (raw wide render)",
-                 g_desk_fov);
-        }
         s_tog = tog;
     }
     // Build 19: Numpad Decimal toggles VR HEAD AIM (repurposed from the
@@ -1720,10 +1847,14 @@ void on_present(const d3d11::State& st) {
                 note("aim: VR head aim unavailable (setter hooks not installed)");
             } else {
                 g_vraim_on = !g_vraim_on;
-                note("aim: VR HEAD AIM %s (signs yaw%+.0f pitch%+.0f, "
-                     "aim_yaw_sign/aim_pitch_sign in grwxr.cfg)",
-                     g_vraim_on ? "ON: bullets follow your gaze" : "OFF",
-                     g_aim_sign_yaw, g_aim_sign_pitch);
+                const bool ctl = g_aim_source.load(std::memory_order_relaxed) == 1;
+                note("aim: VR AIM %s (source: %s; aim_source/aim_ctrl_smooth "
+                     "in grwxr.cfg)",
+                     g_vraim_on
+                         ? (ctl ? "ON: bullets follow the right controller"
+                                : "ON: bullets follow your gaze")
+                         : "OFF",
+                     ctl ? "controller" : "head");
             }
         }
         s_yb = yb;
@@ -1733,6 +1864,8 @@ void on_present(const d3d11::State& st) {
         // BUILD 14h: nor fire.
         if (g_ads_rmb.load(std::memory_order_relaxed)) ads_send(false);
         if (g_fire_lmb.load(std::memory_order_relaxed)) fire_send(false);
+        // Build 22: nor keep feeding the pad merge a stale snapshot.
+        headpose::set_touch_pad(0, nullptr, false);
         return;
     }
 
@@ -1803,18 +1936,86 @@ void on_present(const d3d11::State& st) {
                     g_in_grip[h].store(tf.currentState, std::memory_order_relaxed);
             }
             g_in_seen.store(seen, std::memory_order_relaxed);
+
+            // Build 22: assemble the Touch-as-gamepad snapshot. Left stick =
+            // move, right stick = turn, triggers map straight across, grips
+            // are the bumpers, stick clicks and A/B/X/Y direct, left menu =
+            // Start. XInputMerge consumes it on the game's input thread.
+            {
+                uint32_t btn = 0;
+                float    ax[6] = {};
+                XrActionStateGetInfo  gi2{XR_TYPE_ACTION_STATE_GET_INFO};
+                XrActionStateVector2f v2{XR_TYPE_ACTION_STATE_VECTOR2F};
+                XrActionStateBoolean  ab{XR_TYPE_ACTION_STATE_BOOLEAN};
+                for (int h = 0; h < 2; ++h) {
+                    gi2.action = g_act_stick;
+                    gi2.subactionPath = g_hand[h];
+                    v2 = {XR_TYPE_ACTION_STATE_VECTOR2F};
+                    const XrResult vr2 = xrGetActionStateVector2f(g_session, &gi2, &v2);
+                    // Build 22.1 diagnostic: why is a stick zero? (rc, active)
+                    g_in_stick_rc[h].store(((int)vr2 << 1) |
+                                               (v2.isActive ? 1 : 0),
+                                           std::memory_order_relaxed);
+                    if (XR_SUCCEEDED(vr2) && v2.isActive) {
+                        ax[h * 2 + 0] = v2.currentState.x;
+                        ax[h * 2 + 1] = v2.currentState.y;
+                    }
+                    gi2.action = g_act_stickclk;
+                    ab = {XR_TYPE_ACTION_STATE_BOOLEAN};
+                    if (XR_SUCCEEDED(xrGetActionStateBoolean(g_session, &gi2, &ab)) &&
+                        ab.isActive && ab.currentState)
+                        btn |= h == 0 ? headpose::PAD_LTHUMB : headpose::PAD_RTHUMB;
+                    if (g_in_grip[h].load(std::memory_order_relaxed) >= 0.6f)
+                        btn |= h == 0 ? headpose::PAD_LB : headpose::PAD_RB;
+                }
+                const struct { XrAction a; uint32_t bit; } bmap[] = {
+                    {g_act_btn_a, headpose::PAD_A}, {g_act_btn_b, headpose::PAD_B},
+                    {g_act_btn_x, headpose::PAD_X}, {g_act_btn_y, headpose::PAD_Y},
+                    {g_act_menu,  headpose::PAD_START},
+                };
+                gi2.subactionPath = XR_NULL_PATH;
+                for (const auto& m : bmap) {
+                    gi2.action = m.a;
+                    ab = {XR_TYPE_ACTION_STATE_BOOLEAN};
+                    if (XR_SUCCEEDED(xrGetActionStateBoolean(g_session, &gi2, &ab)) &&
+                        ab.isActive && ab.currentState)
+                        btn |= m.bit;
+                }
+                ax[4] = g_in_trig[0].load(std::memory_order_relaxed);
+                ax[5] = g_in_trig[1].load(std::memory_order_relaxed);
+                // Build 22.2: live means the ACTIONS are answering, not that
+                // the poses track. A controller resting out of camera view
+                // loses pose while its stick and buttons still report; gating
+                // the pad on pose killed the sticks whenever tracking
+                // flickered. Pose validity (seen) still gates the aim rays,
+                // never the pad.
+                const bool acts_live =
+                    (g_in_stick_rc[0].load(std::memory_order_relaxed) & 1) ||
+                    (g_in_stick_rc[1].load(std::memory_order_relaxed) & 1);
+                headpose::set_touch_pad(btn, ax, acts_live || seen != 0);
+            }
         }
     }
 
-    // BUILD 14d/14e: controller aim steer, gated on the right grip. Uses
-    // the input state stored just above.
-    steer_aim();
+    // Build 22: while the Touch-as-gamepad merge is live, the mouse-synthesis
+    // paths stand down wholesale. The game flips its control scheme to
+    // whichever device spoke last; feeding it synthetic mouse AND pad input
+    // in the same frames would flap the scheme (and double-fire: RT is the
+    // pad's own fire). Any held synthetic button is released on the way out.
+    if (xin::merging_live()) {
+        if (g_ads_rmb.load(std::memory_order_relaxed)) ads_send(false);
+        if (g_fire_lmb.load(std::memory_order_relaxed)) fire_send(false);
+    } else {
+        // BUILD 14d/14e: controller aim steer, gated on the right grip. Uses
+        // the input state stored just above.
+        steer_aim();
 
-    // BUILD 14f: right trigger drives the game's own ADS.
-    ads_input();
-    // BUILD 14h: full pull fires. After ads_input so a single frame that
-    // crosses both thresholds aims before it shoots.
-    fire_input();
+        // BUILD 14f: right trigger drives the game's own ADS.
+        ads_input();
+        // BUILD 14h: full pull fires. After ads_input so a single frame that
+        // crosses both thresholds aims before it shoots.
+        fire_input();
+    }
 
     XrFrameBeginInfo fbi{XR_TYPE_FRAME_BEGIN_INFO};
     if (XR_FAILED(xrBeginFrame(g_session, &fbi))) return;
@@ -2082,6 +2283,17 @@ void drain_log() {
 // so headset-only runs stay uncluttered.
 void drain_input() {
     if (!g_input_ok) return;
+    // Build 23.1: controller-aim diagnostic, logged whenever VR aim is on
+    // with the controller source, even if pose flags look off.
+    if (g_vraim_on && g_aim_source.load(std::memory_order_relaxed) == 1) {
+        LOG_INFO("ctlaim: ctl yaw %+.1f pitch %+.1f | head yaw %+.1f "
+                 "pitch %+.1f | yaw_ok %d",
+                 g_ctl_diag[0].load(std::memory_order_relaxed) * 57.29578f,
+                 g_ctl_diag[1].load(std::memory_order_relaxed) * 57.29578f,
+                 g_ctl_diag[2].load(std::memory_order_relaxed) * 57.29578f,
+                 g_ctl_diag[3].load(std::memory_order_relaxed) * 57.29578f,
+                 g_ctl_diag_ok.load(std::memory_order_relaxed) ? 1 : 0);
+    }
     const uint32_t seen = g_in_seen.load(std::memory_order_relaxed);
     if (!seen) return;
     float p[2][3], q[2][4], t[2];
@@ -2091,11 +2303,16 @@ void drain_input() {
         t[h] = g_in_trig[h].load(std::memory_order_relaxed);
     }
     LOG_INFO("input: L%c(%.3f %.3f %.3f) q(%.3f %.3f %.3f %.3f) trig %.2f | "
-             "R%c(%.3f %.3f %.3f) q(%.3f %.3f %.3f %.3f) trig %.2f",
+             "R%c(%.3f %.3f %.3f) q(%.3f %.3f %.3f %.3f) trig %.2f | "
+             "stick rc/act L=%d/%d R=%d/%d",
              (seen & 1u) ? '+' : '-', p[0][0], p[0][1], p[0][2],
              q[0][0], q[0][1], q[0][2], q[0][3], t[0],
              (seen & 2u) ? '+' : '-', p[1][0], p[1][1], p[1][2],
-             q[1][0], q[1][1], q[1][2], q[1][3], t[1]);
+             q[1][0], q[1][1], q[1][2], q[1][3], t[1],
+             g_in_stick_rc[0].load(std::memory_order_relaxed) >> 1,
+             g_in_stick_rc[0].load(std::memory_order_relaxed) & 1,
+             g_in_stick_rc[1].load(std::memory_order_relaxed) >> 1,
+             g_in_stick_rc[1].load(std::memory_order_relaxed) & 1);
 
     // BUILD 14d: aim steer liveness. yaw/pitch are the last computed
     // controller-vs-head offsets (only updated while the trigger is held);
@@ -2154,6 +2371,29 @@ void shutdown() {
     if (g_space)      { xrDestroySpace(g_space);         g_space = XR_NULL_HANDLE; }
     if (g_session)   { xrDestroySession(g_session);     g_session = XR_NULL_HANDLE; }
     if (g_instance)  { xrDestroyInstance(g_instance);   g_instance = XR_NULL_HANDLE; }
+}
+
+// Build 21: cfg hot-reload. load_config() is idempotent (every key clamps
+// and lands in an atomic or seqlock publish), so re-running it on a file
+// change IS the live-tuning mechanism: save grwxr.cfg (by hand or from
+// tools/cfg_gui) and the values apply within about a second. Called at 1 Hz
+// from the init thread's drain loop, never from Present (rule 8: file I/O).
+void poll_config() {
+    static FILETIME s_last = {};
+    static bool     s_have = false;
+    const std::wstring path = log::data_dir() + L"\\grwxr.cfg";
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad))
+        return;                       // missing or mid-replace: retry next tick
+    if (!s_have) {                    // baseline is the init-time load
+        s_last = fad.ftLastWriteTime;
+        s_have = true;
+        return;
+    }
+    if (CompareFileTime(&fad.ftLastWriteTime, &s_last) == 0) return;
+    s_last = fad.ftLastWriteTime;
+    LOG_INFO("VR: grwxr.cfg changed on disk, reloading");
+    load_config();
 }
 
 }  // namespace vr

@@ -32,6 +32,10 @@
 #include "AnselProbe.h"
 #include "CameraProbe.h"
 #include "FactoryHook.h"
+#include "XInputMerge.h"
+#include "RenderDocCapture.h"
+#include "PaletteProbe.h"
+#include "WeaponProbe.h"
 
 // Forward every export of the real dxgi.dll to dxgi_real.dll.
 // deploy.bat places a copy of C:\Windows\System32\dxgi.dll as dxgi_real.dll
@@ -89,6 +93,35 @@ DWORD WINAPI init_thread(LPVOID) {
         LOG_WARN("dxgi_real.dll not loaded yet (normal: forwards resolve lazily)");
     }
 
+    // Build 26: RENDERDOC CAPTURE MODE, cfg-gated, off by default.
+    //
+    // This must happen HERE, before anything else touches graphics, because
+    // renderdoc.dll has to be loaded before the game creates its D3D11 device
+    // in order to hook it. RenderDoc's own injection cannot reach this process
+    // at all (Uplay broker + Secure Boot; see docs/RENDERDOC-GUIDE.md 3b), so
+    // loading it from inside is the only route left.
+    //
+    // When it is on, the VR path STANDS DOWN completely: no factory spoof, no
+    // Present hook, no OpenXR, no probes. RenderDoc and our proxy would
+    // otherwise both be hooking the same swapchain, which is exactly the
+    // situation that produces empty or misleading captures. The mod becomes a
+    // dxgi forwarder plus a capture key, nothing more.
+    if (grwxr::rdoc::enabled()) {
+        LOG_INFO("");
+        LOG_INFO("=== RENDERDOC CAPTURE MODE (renderdoc_capture=1 in grwxr.cfg) ===");
+        LOG_INFO("VR is STOOD DOWN: no factory spoof, no Present hook, no OpenXR.");
+        LOG_INFO("Set renderdoc_capture=0 and relaunch to get VR back.");
+        if (!grwxr::rdoc::install()) {
+            LOG_WARN("rdoc: capture mode requested but unavailable. The game runs "
+                     "UNMODIFIED (rule 7). Fix the cfg or set renderdoc_capture=0.");
+        }
+        for (int tick = 0; ; ++tick) {
+            Sleep(1000);
+            grwxr::rdoc::poll();
+            grwxr::rdoc::drain();
+        }
+    }
+
     // Build 15a: the factory stubs may already have fired (the game creates
     // its device the moment dxgi is loaded); report their state and the
     // upsize target now, then drain their events with the other modules.
@@ -140,6 +173,13 @@ DWORD WINAPI init_thread(LPVOID) {
     LOG_INFO("phase 4 step 2: installing the read-only projection probe (Q9)");
     grwxr::camera::install();
 
+    // Build 39: read-only observer on the pooled placement SetTransform,
+    // hunting the weapon's handle (user scope call: "the gun rides the
+    // controller"). A signature or thunk mismatch logs and installs nothing.
+    LOG_INFO("");
+    LOG_INFO("build 39: installing the weapon placement observer");
+    grwxr::wp::install();
+
     LOG_INFO("phase 2: installing D3D11 Present hook");
     if (!grwxr::d3d11::install()) {
         LOG_WARN("phase 2 hook NOT installed. Game continues unmodified (rule 7).");
@@ -159,22 +199,42 @@ DWORD WINAPI init_thread(LPVOID) {
         grwxr::d3d11::drain_capture_log();
         grwxr::vr::drain_log();
         grwxr::vr::drain_input();
+        grwxr::vr::poll_config();
+        grwxr::xin::poll_install();
+        grwxr::xin::drain();
         grwxr::ansel::drain();
         grwxr::camera::drain();
         grwxr::factory::drain();
+        grwxr::wp::drain();
 
         // Bring OpenXR up once the device exists, on OUR thread, not the render
         // thread. Session creation is slow and allocates; it must not happen
         // inside Present (project rule 8).
-        static bool vr_tried = false;
+        static bool vr_tried = false, vr_armed = false;
         const auto& st = grwxr::d3d11::state();
         if (!vr_tried && st.ready && st.device) {
             vr_tried = true;
-            if (grwxr::vr::init(st)) {
-                grwxr::d3d11::set_present_callback(&grwxr::vr::on_present);
-                LOG_INFO("VR mirror armed: the game frame is now going to the headset.");
-            }
+            vr_armed = grwxr::vr::init(st);
+        } else if (vr_tried && !vr_armed) {
+            // Build 38: the headset was not awake when the game launched. Keep
+            // watching; the session begins by itself when it wakes, instead of
+            // the old behaviour of failing for the whole run.
+            vr_armed = grwxr::vr::poll_start();
         }
+        if (vr_armed && !grwxr::d3d11::has_present_callback()) {
+            grwxr::d3d11::set_present_callback(&grwxr::vr::on_present);
+            LOG_INFO("VR mirror armed: the game frame is now going to the headset.");
+        }
+
+        // Build 33: the skinning-palette probe (PaletteProbe.h). Installed
+        // once the game's immediate context exists; inert until NUMPAD MINUS
+        // arms a capture window. All its logging happens in poll(), here.
+        static bool pal_tried = false;
+        if (!pal_tried && st.ready && st.context) {
+            pal_tried = true;
+            grwxr::pal::install(st.device, st.context);
+        }
+        grwxr::pal::poll();
 
         const unsigned long long now = grwxr::d3d11::frame_count();
         LOG_INFO("hb %4d  frames=%llu  (+%llu in the last second)",

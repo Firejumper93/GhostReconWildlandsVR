@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include <cstdint>   // build 22: the pad snapshot types below
+
 namespace grwxr {
 namespace headpose {
 
@@ -204,6 +206,31 @@ unsigned long long pops_mono();
 // which is the camera hook's signal to use the raw base untouched.
 void set_aim_cum(float yaw_geo, float pitch_geo);
 bool aim_cum(float* yaw_geo, float* pitch_geo);
+
+// Build 22: TOUCH-AS-GAMEPAD snapshot. The render thread publishes the Touch
+// controllers' button and axis state once per sync; the XInputGetState detour
+// (XInputMerge) reads it on the game's input thread and merges it into the
+// pad state the game polls. Plain relaxed atomics: fields tear independently
+// and one frame of skew is harmless for input.
+//
+// The button mask reuses the XINPUT wButtons bit layout verbatim (stable ABI
+// constants) so the detour merges with a single OR:
+enum : uint32_t {
+    PAD_DPAD_UP    = 0x0001, PAD_DPAD_DOWN  = 0x0002,
+    PAD_DPAD_LEFT  = 0x0004, PAD_DPAD_RIGHT = 0x0008,
+    PAD_START      = 0x0010, PAD_BACK       = 0x0020,
+    PAD_LTHUMB     = 0x0040, PAD_RTHUMB     = 0x0080,
+    PAD_LB         = 0x0100, PAD_RB         = 0x0200,
+    PAD_A          = 0x1000, PAD_B          = 0x2000,
+    PAD_X          = 0x4000, PAD_Y          = 0x8000,
+};
+
+// axes: [0] left stick x, [1] left stick y, [2] right stick x, [3] right
+// stick y (all -1..1, up/right positive, matching XInput), [4] left trigger,
+// [5] right trigger (0..1). live=false clears the snapshot (doff, session
+// park), which makes the detour a pure pass-through.
+void set_touch_pad(uint32_t buttons, const float axes[6], bool live);
+bool touch_pad(uint32_t* buttons, float axes[6]);  // false while not live
 
 }  // namespace headpose
 }  // namespace grwxr

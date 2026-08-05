@@ -27,6 +27,12 @@ namespace vr {
 // Returns false and logs loudly on failure, leaving the game untouched.
 bool init(const d3d11::State& st);
 
+// Build 38: if init() created the session but the headset was not awake yet,
+// call this once a second from the init thread. It begins the session as soon
+// as the runtime reports READY and returns true on that one tick, so the
+// caller can arm the present callback. Cheap and safe to call every tick.
+bool poll_start();
+
 // Called every frame from the Present hook. Copies the backbuffer and submits.
 // Must not log (project rule 8).
 void on_present(const d3d11::State& st);
@@ -43,6 +49,10 @@ void drain_log();
 // BUILD 13b: 1 Hz controller pose/trigger log line, heartbeat thread only.
 // Silent until g_input_ok and at least one hand tracks.
 void drain_input();
+
+// Build 21: re-read grwxr.cfg when its mtime changes (live tuning without
+// hotkeys). Init thread only: it does file I/O.
+void poll_config();
 
 }  // namespace vr
 }  // namespace grwxr

@@ -11,7 +11,7 @@
 ;   * docs/RE-notes.md documents six projection variants with different shapes.
 ;     Guessing which arguments are floats in xmm and which are pointers in
 ;     integer registers is exactly the kind of plausible-but-wrong step that
-;     the project rules forbid. Get it backwards and we forward garbage to the engine.
+;     the project rules forbids. Get it backwards and we forward garbage to the engine.
 ;   * on_calc_mvp takes 21 arguments. Writing that prototype by hand, from a
 ;     static reading of one call site, and then having the engine execute it, is
 ;     not a risk worth taking to answer a question about call counts.

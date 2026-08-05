@@ -66,6 +66,10 @@ const State& state();
 using PresentCallback = void (*)(const State&);
 void set_present_callback(PresentCallback cb);
 
+// Build 38: lets the init thread arm the callback exactly once without
+// tracking that state itself.
+bool has_present_callback();
+
 // Present captures the device but writes no log lines (rule 8). The init thread
 // calls this to emit the capture details off the render thread.
 void drain_capture_log();

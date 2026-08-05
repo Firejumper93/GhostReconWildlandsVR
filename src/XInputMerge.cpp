@@ -43,6 +43,10 @@ PFN_GetState      g_orig = nullptr;
 std::atomic<uint64_t> g_calls{0};
 std::atomic<uint64_t> g_merges{0};
 std::atomic<uint64_t> g_fabricated{0};   // polls answered with no physical pad
+std::atomic<uint64_t> g_placeheld{0};    // build 40: polls answered with a
+                                         // neutral CONNECTED pad while Touch
+                                         // was not live yet, so the game does
+                                         // not latch "no controller"
 std::atomic<uint32_t> g_last_btn{0};
 std::atomic<uint32_t> g_pkt{0};
 
@@ -67,7 +71,30 @@ DWORD WINAPI hook_GetState(DWORD idx, State* st) {
 
     uint32_t btn = 0;
     float    ax[6];
-    if (!headpose::touch_pad(&btn, ax)) return r;   // Touch not live
+    const bool live = headpose::touch_pad(&btn, ax);
+
+    if (!live) {
+        // BUILD 40 FIX, THE STARTUP RACE THAT KILLED TOUCH INPUT ENTIRELY.
+        //
+        // Measured 2026-08-05 (log grwxr-25496): the merge installed at
+        // 00:43:47, the XR session only reached FOCUSED at 00:44:17, and the
+        // game polled XInputGetState exactly 23 times in between. Every one of
+        // those polls fell through this branch, so the game saw
+        // ERROR_DEVICE_NOT_CONNECTED, concluded there was no controller, and
+        // NEVER POLLED AGAIN: calls stayed at 23 for the rest of the run even
+        // in open-world gameplay. Touch was live 30 seconds later and nothing
+        // was listening. That is why "motion controls didn't even work".
+        //
+        // The fix is to never let the game observe "no pad" while we intend to
+        // supply one. Report a CONNECTED pad with neutral state until Touch
+        // comes up, so the game keeps polling and simply reads no input.
+        // A real pad's state is passed through untouched.
+        if (r == kSuccess) return r;          // physical pad: never interfere
+        memset(st, 0, sizeof(*st));
+        st->dwPacketNumber = g_pkt.fetch_add(1, std::memory_order_relaxed) + 1;
+        g_placeheld.fetch_add(1, std::memory_order_relaxed);
+        return kSuccess;
+    }
 
     if (r != kSuccess) {
         // No physical pad: fabricate a connected one from Touch alone.
@@ -180,11 +207,12 @@ void drain() {
     uint32_t btn = 0;
     float    ax[6] = {};
     const bool live = headpose::touch_pad(&btn, ax);
-    LOG_INFO("xin: calls=%llu merged=%llu fabricated=%llu last_btn=0x%04X "
+    LOG_INFO("xin: calls=%llu merged=%llu fabricated=%llu held=%llu last_btn=0x%04X "
              "%s ax L(%+.2f %+.2f) R(%+.2f %+.2f) T(%.2f %.2f)%s",
              (unsigned long long)c,
              (unsigned long long)g_merges.load(std::memory_order_relaxed),
              (unsigned long long)g_fabricated.load(std::memory_order_relaxed),
+             (unsigned long long)g_placeheld.load(std::memory_order_relaxed),
              g_last_btn.load(std::memory_order_relaxed),
              live ? "live" : "dead",
              ax[0], ax[1], ax[2], ax[3], ax[4], ax[5],

@@ -113,22 +113,28 @@ triggers and grips into the ordinary gamepad input the game already understands.
 That is convenient and it works reliably, but it is not motion control, and it
 should not be described as such.
 
-The only motion-tracked input layered on top of that is **aim direction** taken
-from where the right controller points. That part is the weakest thing in the mod
-and the most likely to disappoint you. It is being worked on and it will change.
-What follows is what it actually is today, not what it is aiming to become.
+Two motion-tracked things are layered on top of that as of v0.6.0: **head aim**
+(bullets follow your gaze, now the default) and **hand markers** (two colored dots
+drawn where your controllers actually are, with real stereo depth; verified to track
+well). Controller-DRIVEN aim, the v0.5.0 default, is **retired as a default**: in
+this engine the gameplay aim direction IS the camera, so steering aim from the
+controller inevitably turns your view and fights head-look. It remains available as
+a deprecated experiment (`aim_source = 1`). What follows is what it actually is
+today, not what it is aiming to become.
 
-**There is no gun in your hands.** Your bullets follow your controller, but the
-weapon model does not move with it: the character still holds the rifle wherever
-the third-person animation puts it. You are pointing an invisible line at things.
-This is the single biggest gap and it is the current development focus.
+**There is no gun in your hands.** The character still holds the rifle wherever
+the third-person animation puts it. This is the single biggest gap and it is the
+current development focus: the engine's object-placement system has been mapped,
+four candidate weapon handles are identified, and this release includes a visual
+instrument (`wp_markers`) for confirming which one is the gun.
 
-**Aim chases your controller, it does not track it.** The mod cannot set the game's
-aim directly, so it feeds turn input into the game's own aim system until the aim
-catches up with where you are pointing. In practice that means a soft, slightly
-laggy, "steering" feel rather than a 1:1 weapon in your hand, and fast flicks
-overshoot or lag behind. Smoothing (`aim_ctrl_smooth`) trades one for the other;
-neither setting makes it feel native.
+**Why controller aim was retired as the default.** The mod cannot set the game's
+aim direction without also turning the camera, because they are the same thing in
+this engine. Every scheme tried (continuous steering, injection during engine aim
+updates) either turned your view against your head or produced a laggy chase. The
+honest resolution: your head aims and looks (which IS 1:1), the controller is a
+gamepad plus tracked hand markers, and the route to a gun that follows your hand is
+overriding the SHOT direction rather than the aim, which is active research.
 
 **Hip fire is inaccurate, and that part is the real game.** Wildlands applies a wide
 hip-fire spread cone. Pointing precisely does not help, because the game rolls the
@@ -137,12 +143,10 @@ sights is exact, which is how we know spread is vanilla behavior rather than
 something the mod causes. Defeating hip-fire spread under VR aim is designed and
 queued, but it is NOT in this release.
 
-**Aiming down sights abandons controller aim.** Holding the left trigger switches
-aim back to your head, because the game draws its sight picture at view center: if
-we left aim on the controller, the sight picture and the impacts would disagree.
-So you get two different aiming models depending on the trigger, which is
-inconsistent to play. Optics are head-anchored, not gun-anchored, for the same
-reason.
+**Aiming down sights is consistent with head aim.** The game draws its sight
+picture at view center, which under head aim is exactly where your bullets go, so
+the sight picture and the impacts agree. Optics are head-anchored, not
+gun-anchored.
 
 **There are no hands, no gestures, and no weapon manipulation.** No grabbing, no
 gesture reloads, no physical mag changes, no two-handed grip. Reload, swap, vehicle
@@ -158,9 +162,10 @@ are designed; neither ships here.
 
 ## Known limitations (honest list)
 
-- **No real motion controls.** Touch is emulated as a gamepad; only aim direction is
-  motion-tracked, and it is rough: no visible gun in your hands, aim chases rather
-  than tracks, hip fire blooms, ADS switches back to head aim. Read "Controller
+- **No real motion controls.** Touch is emulated as a gamepad; the motion-tracked
+  parts are head aim and the hand-position markers. There is no visible gun in your
+  hands and no hand interactions. Controller-driven aim was retired as a default
+  because it fights head-look (the game's aim is the camera). Read "Controller
   support, honestly" above; it is the honest account, not a teaser.
 - The camera can occasionally attach to the wrong body after a respawn or fast travel.
   Toggling first person off and on while facing your character re-acquires it.
@@ -184,47 +189,48 @@ evidence comes in.
 
 | Feature | Progress | Where it stands |
 |---|---|---|
-| The gun visibly rides your controller (physical sighting) | ~40% | Bullets already follow the controller; the engine's object-placement path is fully mapped and a probe locating the weapon's placement handle is in testing |
-| Hip-fire accuracy at ADS grade under VR aim | ~70% | The exact engine flag is located and verified unique in this build; one write route decision remains before it ships |
+| The gun visibly rides your controller (physical sighting) | ~50% | The engine's object-placement API is fully mapped, four candidate weapon handles are found, and this release ships a visual instrument that identifies the right one at a glance; the remaining work is the transform-override write and the shot-direction override |
+| Hip-fire accuracy at ADS grade under VR aim | ~70% | The exact engine flag is located and verified unique in both supported builds; one write route decision remains before it ships |
+| Epic / Ubisoft Connect support | ~85% | Shipped experimentally in v0.6.0: the store binary's full address table was derived offline and sits behind a build-identity check; it awaits its first confirmation from a store-build tester |
 | Performance pass for dense towns | ~30% | The engine's shadow-quality lever is located and writable live; a measurement run will decide what ships |
 | Aerial vehicle interior camera | ~20% | Ground-vehicle first person already works in practice; helicopter and plane interiors need their camera behavior characterized first |
 | VR arms and hands (IK) | ~15% | The GPU skinning data format was recovered from the game's own shipped shaders; which render path draws the player is the remaining unknown. The engine's own IK system is confirmed present, which is the long-term route |
 
-Shipped since the last release: Touch-as-emulated-gamepad support, controller-pointing
-hip-fire aim with a reticle, first-person body blur removal, instant head hide, config GUI
-with hot reload, resilient VR startup.
+Shipped since the last release (v0.6.0): experimental Epic/Ubisoft Connect support,
+hand markers, the head-aim default (controller-aim retirement), the Touch
+startup-race fix (controllers no longer die when the headset comes up late or no
+gamepad is plugged in), recenter-on-first-person-toggle, and the weapon-handle
+identification instrument.
 
 A public **beta** is planned once the top items land.
 
 ## Which version of the game do I need?
 
-**The Steam build.** This is not a preference, it is a hard technical limit right now.
+**Steam is verified. Epic and Ubisoft Connect are supported experimentally as of
+v0.6.0.**
 
 The mod finds the engine's camera and projection code at specific addresses inside
-`GRW.exe`. The Epic Games and Ubisoft Connect releases ship a **different build** of
-that executable: it is about 12 MB larger and the code sits about 21 MB further along,
-so every address the mod knows is wrong there.
+`GRW.exe`, and the store releases ship a **different build** of that executable. As of
+v0.6.0 the mod carries a full address table for BOTH known builds and identifies which
+one it is running inside from the executable's own headers, so Epic and Ubisoft
+Connect installs get the same feature set as Steam. Honest status: every store
+address was derived and machine-verified offline against a real store executable, and
+each one is re-verified in place before anything is patched, but at release time no
+store-build user had yet confirmed it end to end in a headset. Treat it as
+experimental and please report your log either way.
 
-What happens if you try anyway: the mod notices the mismatch, says so in its log, and
-**installs nothing**. Your game runs completely unmodified and nothing is damaged. But
-because the camera hook is what provides head tracking, stereo depth and the fullscreen
-view, you get **a small flat window floating in the headset that does not respond to
-head movement**. Controllers and buttons may still work, which makes it look like the
-mod is "half working"; it is not, it is correctly refusing to patch a binary it does
-not recognize.
-
-If you see this, check `GRWVR\grwxr-<pid>.log` in your game folder for a line reading
-"This is NOT the binary we analysed". That confirms it.
-
-Supporting other stores is possible (the mod's code-pattern scanner already *finds*
-the right function on those builds, it just cannot place the rest of its address map),
-but it needs work that has not been done. It is on the list, without a date.
+If the mod meets a `GRW.exe` it does not recognize (a future game patch, or a build
+we have not analysed), it says so in its log, names both builds it knows, and
+**installs nothing**: your game runs completely unmodified. The symptom of that state
+is a small flat window in the headset that does not respond to head movement, with
+controllers possibly still working. Check `GRWVR\grwxr-<pid>.log` for the
+"build pin:" line to confirm.
 
 ## Requirements
 
-- Ghost Recon Wildlands, **Steam edition** (tested against the 2023-09-14 Steam build).
-  Epic Games and Ubisoft Connect versions are a different build and are NOT supported
-  yet; see above.
+- Ghost Recon Wildlands. **Steam edition, verified** (2023-09-14 build), or **Epic /
+  Ubisoft Connect, experimental** (2023-09-08 build; supported since v0.6.0, awaiting
+  first tester confirmation; see above).
 - A PC VR headset with an OpenXR runtime. Tested only on Meta Quest 3 over Link cable
   with the Meta Quest Link runtime.
 - **Asynchronous Spacewarp must be disabled** (Oculus Debug Tool, set ASW to Disabled).
@@ -304,7 +310,7 @@ save, or use the included slider GUI (`tools\cfg_gui\cfg_gui.exe`).
 | Key | Action |
 |---|---|
 | Home | Recenter (look where you want forward to be, then press) |
-| Numpad 8 | First person on / off (head hiding follows it automatically) |
+| Numpad 8 | First person on / off (head hiding follows it automatically; also recenters, so a stale reference cannot poison the view) |
 | Numpad . (Decimal) | 1:1 head aim on / off (bullets follow your gaze; default off) |
 
 ### Touch controllers (emulated as a gamepad)
@@ -316,9 +322,10 @@ emulation, not motion control. The one motion-tracked addition:
 
 | Input | Action |
 |---|---|
-| Right controller, point | Hip-fire aim: the dot reticle and bullets follow the controller ray |
+| Head | Aim: bullets follow your gaze (toggle with Numpad Decimal) |
+| Both controllers | Hand markers: blue (left) and orange (right) dots drawn where your hands are |
 | Right trigger, full squeeze | Fire (hold for automatic fire) |
-| Left trigger (hold) | Aim down sights: aim follows your head so the sight picture is true; the dot hides |
+| Left trigger (hold) | Aim down sights (the sight picture is at view center, which is where head aim points, so it stays true) |
 
 A physical gamepad still works if you prefer it (the Touch snapshot merges with it).
 
@@ -337,10 +344,12 @@ key in comments. The ones most worth knowing:
 | `fp_eye` | First-person eye height above the character origin, meters (fallback anchor only) |
 | `fp_anchor_side` | First-person lateral centering, meters |
 | `aim_yaw_sign`, `aim_pitch_sign` | Head-aim direction calibration (defaults -1 and +1 for the current game build; flip one only if head aim turns the wrong way on that axis) |
-| `aim_source` | `1` (default) hip-fire aim follows the right controller; `0` follows the head |
+| `aim_source` | `0` (default since v0.6.0) aim follows the head; `1` is the retired controller-aim experiment, which fights head-look |
 | `aim_ctrl_smooth` | Controller-aim smoothing, 0 to 1 (default 0.35) |
 | `aim_reticle` | `1` (default) draws the hip-fire dot reticle; `0` hides it |
 | `xinput_touch` | `1` (default) merges Touch controllers into the gamepad; `0` passes through untouched |
+| `hand_markers` | `1` (default) draws the two hand-position dots; `0` hides them |
+| `wp_markers` | `0` (default in the shipped config) research aid: colored dots on the engine objects nearest the camera, used to identify the weapon's placement handle; turn on only if you are helping with that hunt |
 | `aim_steer`, `aim_ads`, `aim_fire` | Controller-pointing aim, trigger ADS and trigger fire; set any to `0` to disable |
 | `desktop_fov` | Crop of the desktop recording view, `0` disables |
 

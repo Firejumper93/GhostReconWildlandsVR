@@ -57,12 +57,29 @@ bool aim_available();
 bool aim_pending(int axis);
 int  aim_arm(int axis, float delta_engine_units);
 
-// Build 39: the camera's world position as captured once per built frame at
-// the camera hook (Camera+0x000 row 3). For correlation probes only: the read
-// is deliberately unsynchronized, so a caller on another thread can see a
-// position torn between two frames. That error is centimetres; the weapon
-// probe's filter radius is metres. Returns zeros before the first capture.
-void base_pos(float out[3]);
+// Build 39.1: the player camera's world position, read from the camera object
+// itself (Camera+0x000 row 3) rather than from the VR-only published copy.
+//
+// RETURNS FALSE when no camera position is available (no mode-0 camera seen
+// yet, or the read faulted). A correlation probe MUST check this: comparing
+// distances against a zero position silently produces "nothing is near the
+// player", which is indistinguishable from a real negative result.
+//
+// The read is deliberately unsynchronized, so a caller on another thread can
+// see a position torn between two frames. That error is centimetres.
+bool base_pos(float out[3]);
+
+// Build 45: the player camera's full world frame, read from the camera
+// object (Camera+0x000). rot is the 3x3 rotation packed row-major:
+// row 0 = right, row 1 = forward, row 2 = up (row-vector convention,
+// world z up; docs/RE-notes.md "camera pose (world) matrix"). pos is the
+// translation row. Returns false when no mode-0 camera has been seen, the
+// read faults, the position fails the build-40 sanity bounds, or any
+// rotation row is not unit length (mid-swap garbage reads fine; hazard from
+// build 39.1 defect 1). Unsynchronized like base_pos; a torn frame is
+// centimetres/millidegrees and callers using it for marker placement
+// tolerate that.
+bool base_frame(float rot[9], float pos[3]);
 
 // Build 18: while on, the SetHidden detour forces the head-visibility
 // component hidden on every engine call (the engine re-asserts visibility

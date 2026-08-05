@@ -5,6 +5,50 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
+## v0.6.0-alpha (builds 39-46, 2026-08-05, PACKAGED RELEASE)
+
+### Added
+
+- **Experimental Epic / Ubisoft Connect support** (build 46). The mod now carries a
+  full address table for the store build of `GRW.exe` (a September 2023 sibling of
+  the Steam build), derived offline against a real store executable and re-verified
+  in place before anything is patched. The mod identifies the loaded binary from its
+  own headers; an unknown binary is named in the log and nothing installs. **Honest
+  status: machine-verified offline, not yet confirmed in a headset by a store-build
+  user.** Look for the new "build pin:" line near the top of the log.
+- **Hand markers** (build 42, verified in the headset: "tracks incredibly well").
+  Blue (left) and orange (right) dots drawn where your controllers actually are,
+  with real stereo depth. New key `hand_markers` (default 1).
+- **Weapon-handle identification instrument** (builds 39-45, research aid, default
+  OFF). `wp_markers = 1` draws up to six colored dots on the engine objects placed
+  nearest the camera and logs a color-to-handle legend each second (`wpm:` lines).
+  Looking at which color sits on your rifle identifies the weapon's placement
+  handle, which is the next step toward the gun visibly riding your controller.
+  Untested in the headset at release time; it draws into the mod's own overlay only.
+- **First-person toggle recenters** (build 44). Numpad 8 now recenters as it
+  toggles, so a stale head reference cannot silently skew a session.
+
+### Changed
+
+- **Head aim is now the default** (`aim_source = 0`). Controller-DRIVEN aim (the
+  v0.5.0 default) is retired: in this engine the gameplay aim direction is the
+  camera, so steering aim from the controller turns your view and fights head-look.
+  This was measured, not guessed (see "Controller support, honestly" in the README).
+  The controller remains a full emulated gamepad, now with hand markers; the gun
+  following your hand is being pursued through the object-placement route instead.
+
+### Fixed
+
+- **Touch controllers dead unless a gamepad was plugged in, or when the headset came
+  up after the game** (build 40). The game probes for a gamepad once at startup and
+  stops polling forever if none answers. The mod now presents a connected (neutral)
+  pad from the very first poll and hands over to Touch when it arrives. This was the
+  single most reported issue from testers.
+- The weapon-placement research probe could return a silently empty result during
+  level transitions (builds 39.1-40): camera positions are now sanity-checked, and
+  every probe failure mode names itself in the log instead of masquerading as
+  another.
+
 ## v0.5.0-alpha (builds 20-38, 2026-08-04, PACKAGED RELEASE)
 
 The first packaged release since v0.1.1-alpha. If your installed version still shows

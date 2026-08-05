@@ -2,6 +2,7 @@
 #include "CameraProbe.h"
 #include "HeadPose.h"
 #include "Log.h"
+#include "WeaponProbe.h"
 #include "XInputMerge.h"
 
 #define XR_USE_PLATFORM_WIN32
@@ -76,6 +77,14 @@ std::atomic<float>     g_steer_yaw_last{0.0f}, g_steer_pitch_last{0.0f};
 // Build 19: VR head aim state (see the aim_pump comment block below for the
 // design). Render thread only; the signs are cfg keys read at init.
 bool  g_vraim_on       = false;         // Numpad Decimal toggles
+// BUILD 41: cfg aim_on_start (default ON). Motion aim used to start OFF and
+// the ONLY way to arm it was a blind Numpad Decimal press inside the headset.
+// That is how a working build gets reported as "motion controls didn't work":
+// the gamepad emulation is automatic, so everything FEELS connected while the
+// headline feature is simply switched off. Presence of the feature must not
+// depend on the user finding a key they cannot see.
+std::atomic<int> g_aim_on_start{1};
+std::atomic<bool> g_vraim_armed_once{false};
 float g_aim_sign_yaw   = 1.0f;          // cfg aim_yaw_sign  (+1 or -1)
 float g_aim_sign_pitch = 1.0f;          // cfg aim_pitch_sign
 float g_aim_cum[2]     = {0.0f, 0.0f};  // absorbed by the engine, geometric rad
@@ -261,6 +270,35 @@ ID3D11PixelShader*        g_blit_ps   = nullptr;
 // screen-centered and cannot show it). Render thread only.
 ID3D11PixelShader*        g_dot_ps    = nullptr;
 bool  g_dot_enable = true;    // cfg aim_reticle, 0 hides it
+// BUILD 42: HAND MARKERS. Two coloured blobs drawn where the controllers
+// actually are, left blue / right orange. This is the "gizmo first" step both
+// reference projects used (docs/REF-cyberpunk-ik-pattern.md section 6,
+// docs/REF-halo-mcc-pattern.md): prove the controller-to-view maths with drawn
+// geometry BEFORE betting a bone write on it. It touches no engine memory, no
+// skeleton and no animation, so nothing in the game can fight it.
+bool  g_hand_enable  = true;          // cfg hand_markers, 0 hides them
+float g_head_pos[3]  = {0, 0, 0};     // head position, reference space
+bool  g_head_pos_ok  = false;
+bool  g_hand_on[2]   = {false, false};
+float g_hand_tx[2][2] = {};           // [hand][eye] tangent from view centre
+float g_hand_ty[2][2] = {};
+float g_hand_tr[2][2] = {};           // [hand][eye] tangent radius
+ID3D11PixelShader* g_hand_ps[2] = {nullptr, nullptr};   // 0 left, 1 right
+std::atomic<bool>  g_in_track[2] = {};   // per hand: located this frame
+// BUILD 45: WEAPON-CANDIDATE MARKERS. One coloured blob per watched
+// placement handle (wp::marker), drawn at the handle's ENGINE world position
+// converted through the game camera's own basis. This is the hand-marker
+// instrument generalised from "controller position in XR space" to "any
+// world position the engine gives us" (CURRENT-STATE, session 24): the user
+// looks at which colour sits on the gun and that handle is the weapon.
+// Read-only with respect to the engine; draws into our canvas only.
+constexpr int kWpm = wp::kWatch;   // slot index = colour index, fixed
+bool  g_wpm_enable = true;              // cfg wp_markers, 0 hides them
+bool  g_wpm_on[kWpm] = {};
+float g_wpm_tx[kWpm][2] = {};           // [slot][eye] tangent from centre
+float g_wpm_ty[kWpm][2] = {};
+float g_wpm_tr[kWpm][2] = {};
+ID3D11PixelShader* g_wpm_ps[kWpm] = {};
 bool  g_dot_on = false;       // this frame: draw it
 float g_dot_tx = 0.0f;        // tangent offsets from view center
 float g_dot_ty = 0.0f;
@@ -471,6 +509,13 @@ void load_config() {
         // 1 = right controller ray (hip-fire, the default).
         if (sscanf_s(line, " aim_source = %f", &v) == 1)
             g_aim_source.store(v >= 0.5f ? 1 : 0, std::memory_order_relaxed);
+        if (sscanf_s(line, " aim_on_start = %f", &v) == 1)
+            g_aim_on_start.store(v >= 0.5f ? 1 : 0, std::memory_order_relaxed);
+        if (sscanf_s(line, " hand_markers = %f", &v) == 1)
+            g_hand_enable = v > 0.0f;
+        // Build 45: weapon-candidate markers. 0 hides them (hot-reload).
+        if (sscanf_s(line, " wp_markers = %f", &v) == 1)
+            g_wpm_enable = v > 0.0f;
         if (sscanf_s(line, " aim_ctrl_smooth = %f", &v) == 1) {
             if (v < 0.05f) v = 0.05f;
             if (v > 1.0f)  v = 1.0f;
@@ -537,6 +582,18 @@ void quat_to_rows(const Quat& q, float R[9]) {
     R[0] = 1.0f - 2.0f * (yy + zz); R[1] = 2.0f * (xy + wz);        R[2] = 2.0f * (xz - wy);
     R[3] = 2.0f * (xy - wz);        R[4] = 1.0f - 2.0f * (xx + zz); R[5] = 2.0f * (yz + wx);
     R[6] = 2.0f * (xz + wy);        R[7] = 2.0f * (yz - wx);        R[8] = 1.0f - 2.0f * (xx + yy);
+}
+
+// BUILD 42: express a reference-space vector in the head's own frame,
+// out = conj(q) * v * q. Used only by the hand markers.
+void quat_rotate_inv(const Quat& q, const float v[3], float out[3]) {
+    const float x = -q.x, y = -q.y, z = -q.z, w = q.w;   // conjugate
+    const float tx = 2.0f * (y * v[2] - z * v[1]);
+    const float ty = 2.0f * (z * v[0] - x * v[2]);
+    const float tz = 2.0f * (x * v[1] - y * v[0]);
+    out[0] = v[0] + w * tx + (y * tz - z * ty);
+    out[1] = v[1] + w * ty + (z * tx - x * tz);
+    out[2] = v[2] + w * tz + (x * ty - y * tx);
 }
 
 bool g_have_ref = false;
@@ -851,6 +908,89 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
                 g_dot_on = true;
             }
         }
+
+        // BUILD 42: hand markers. Deliberately independent of the aim
+        // reference and of g_ctl_yaw: both the head and the controllers come
+        // from the SAME xrLocateSpace pass in reference space, so a stale or
+        // wrong recenter cannot move these. That is what makes them a valid
+        // instrument rather than another thing to calibrate.
+        g_hand_on[0] = g_hand_on[1] = false;
+        if (g_hand_enable && g_head_pos_ok &&
+            headpose::read_fov(0.7853982f) >= 0.65f) {   // hazard 25: not in optics
+            const float half_ipd =
+                0.5f * headpose::read_ipd(0.063f);
+            for (int h = 0; h < 2; ++h) {
+                if (!g_in_track[h].load(std::memory_order_relaxed)) continue;
+                const float rel[3] = {
+                    g_in_pos[h][0].load(std::memory_order_relaxed) - g_head_pos[0],
+                    g_in_pos[h][1].load(std::memory_order_relaxed) - g_head_pos[1],
+                    g_in_pos[h][2].load(std::memory_order_relaxed) - g_head_pos[2]};
+                float lv[3];
+                quat_rotate_inv(q, rel, lv);      // head-local: +x right, +y up, -z fwd
+                bool any = false;
+                for (int e = 0; e < 2; ++e) {
+                    // Eye offset is a pure x shift in head-local space, so the
+                    // markers carry real stereo disparity. Without this they
+                    // would sit at optical infinity and fuse at the wrong
+                    // depth, which reads as "floating markers", not hands.
+                    const float ex = lv[0] - (e == 0 ? -half_ipd : half_ipd);
+                    const float fwd = -lv[2];
+                    if (fwd < 0.08f) continue;    // at or behind the eye
+                    const float tx = ex / fwd, ty = lv[1] / fwd;
+                    if (tx < -3.0f || tx > 3.0f || ty < -3.0f || ty > 3.0f) continue;
+                    float tr = 0.045f / fwd;      // ~9 cm blob, shrinks with range
+                    if (tr > 0.6f) tr = 0.6f;     // hand against the lens
+                    if (tr < 0.004f) tr = 0.004f;
+                    g_hand_tx[h][e] = tx;
+                    g_hand_ty[h][e] = ty;
+                    g_hand_tr[h][e] = tr;
+                    any = true;
+                }
+                g_hand_on[h] = any;
+            }
+        }
+
+        // BUILD 45: weapon-candidate markers. Unlike the hand markers these
+        // are placed from ENGINE world positions, so the conversion uses the
+        // GAME CAMERA's own basis (base_frame: row 0 right, row 1 forward,
+        // row 2 up, world z up, metres), not the XR head pose. That means a
+        // marker lands where the object appears IN THE GAME FRAME, which is
+        // exactly right for identification; during fast head motion it lags
+        // the content by the same reprojection offset the content itself
+        // carries, which is acceptable for a "which colour is on the gun"
+        // read. Same optics gate as the hands (hazard 25).
+        for (int i = 0; i < kWpm; ++i) g_wpm_on[i] = false;
+        if (g_wpm_enable && headpose::read_fov(0.7853982f) >= 0.65f) {
+            float R[9], C[3];
+            if (camera::base_frame(R, C)) {
+                const float half_ipd = 0.5f * headpose::read_ipd(0.063f);
+                for (int i = 0; i < kWpm; ++i) {
+                    float wpos[3];
+                    if (!wp::marker(i, wpos)) continue;
+                    const float rw[3] = {wpos[0] - C[0], wpos[1] - C[1],
+                                         wpos[2] - C[2]};
+                    const float lx = rw[0] * R[0] + rw[1] * R[1] + rw[2] * R[2];
+                    const float lf = rw[0] * R[3] + rw[1] * R[4] + rw[2] * R[5];
+                    const float lu = rw[0] * R[6] + rw[1] * R[7] + rw[2] * R[8];
+                    if (lf < 0.15f) continue;   // at or behind the camera
+                    bool any = false;
+                    for (int e = 0; e < 2; ++e) {
+                        const float ex = lx - (e == 0 ? -half_ipd : half_ipd);
+                        const float tx = ex / lf, ty = lu / lf;
+                        if (tx < -3.0f || tx > 3.0f || ty < -3.0f || ty > 3.0f)
+                            continue;
+                        float tr = 0.030f / lf;   // ~6 cm blob at the object
+                        if (tr > 0.5f)   tr = 0.5f;
+                        if (tr < 0.004f) tr = 0.004f;
+                        g_wpm_tx[i][e] = tx;
+                        g_wpm_ty[i][e] = ty;
+                        g_wpm_tr[i][e] = tr;
+                        any = true;
+                    }
+                    g_wpm_on[i] = any;
+                }
+            }
+        }
     }
 
     // Build 13a: the absolute XR-space orientation travels with the rotation
@@ -1049,7 +1189,47 @@ bool create_blit_resources(const d3d11::State& st) {
         "    float3 col = float3(1.0, 0.30, 0.15);\n"
         "    if (r > 0.72) col *= 0.25;\n"
         "    return float4(col, 1.0);\n"
-        "}\n";
+        "}\n"
+        // Build 42: hand markers, left blue / right orange, bright rim
+        // so they read against sky and against dark interiors.
+        "float4 ps_hand_l(float4 pos : SV_Position,\n"
+        "                 float2 uv : TEXCOORD0) : SV_Target {\n"
+        "    float r = length(uv - 0.5) * 2.0;\n"
+        "    if (r > 1.0) discard;\n"
+        "    float3 col = float3(0.20, 0.55, 1.0);\n"
+        "    if (r > 0.75) col = float3(0.85, 0.95, 1.0);\n"
+        "    return float4(col, 1.0);\n"
+        "}\n"
+        "float4 ps_hand_r(float4 pos : SV_Position,\n"
+        "                 float2 uv : TEXCOORD0) : SV_Target {\n"
+        "    float r = length(uv - 0.5) * 2.0;\n"
+        "    if (r > 1.0) discard;\n"
+        "    float3 col = float3(1.0, 0.45, 0.10);\n"
+        "    if (r > 0.75) col = float3(1.0, 0.90, 0.70);\n"
+        "    return float4(col, 1.0);\n"
+        "}\n"
+        // Build 45: weapon-candidate markers. Shared body; each entry point
+        // only sets its colour. Dark rim so every colour reads on both sky
+        // and shadow, and so they cannot be mistaken for the rimless-bright
+        // hand markers.
+        "float4 wp_body(float2 uv, float3 col) {\n"
+        "    float r = length(uv - 0.5) * 2.0;\n"
+        "    if (r > 1.0) discard;\n"
+        "    if (r > 0.70) col *= 0.20;\n"
+        "    return float4(col, 1.0);\n"
+        "}\n"
+        "float4 ps_wp0(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target\n"
+        "    { return wp_body(uv, float3(1.00, 0.12, 0.10)); }\n"   // RED
+        "float4 ps_wp1(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target\n"
+        "    { return wp_body(uv, float3(0.12, 0.95, 0.18)); }\n"   // GREEN
+        "float4 ps_wp2(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target\n"
+        "    { return wp_body(uv, float3(1.00, 0.92, 0.10)); }\n"   // YELLOW
+        "float4 ps_wp3(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target\n"
+        "    { return wp_body(uv, float3(1.00, 0.15, 0.95)); }\n"   // MAGENTA
+        "float4 ps_wp4(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target\n"
+        "    { return wp_body(uv, float3(0.10, 0.95, 1.00)); }\n"   // CYAN
+        "float4 ps_wp5(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target\n"
+        "    { return wp_body(uv, float3(1.00, 1.00, 1.00)); }\n";  // WHITE
 
     ID3DBlob* vsb = nullptr;
     ID3DBlob* psb = nullptr;
@@ -1127,6 +1307,70 @@ bool create_blit_resources(const d3d11::State& st) {
                      err ? (const char*)err->GetBufferPointer() : "?");
         }
         if (err) err->Release();
+
+        // Build 42: hand markers. Each shader is independent; a failure
+        // costs that marker only, never the blit (rule: a probe must degrade,
+        // not break the thing that works).
+        {
+            const char* hnames[2] = {"ps_hand_l", "ps_hand_r"};
+            for (int h = 0; h < 2; ++h) {
+                ID3DBlob* hb = nullptr;
+                ID3DBlob* he = nullptr;
+                if (SUCCEEDED(compile(kSrc, sizeof(kSrc) - 1, "grwxr_blit",
+                                      nullptr, nullptr, hnames[h], "ps_4_0",
+                                      0, 0, &hb, &he))) {
+                    if (FAILED(st.device->CreatePixelShader(hb->GetBufferPointer(),
+                                                            hb->GetBufferSize(),
+                                                            nullptr, &g_hand_ps[h])))
+                        LOG_WARN("VR: 42 hand shader %d creation failed", h);
+                    hb->Release();
+                } else {
+                    LOG_WARN("VR: 42 hand shader %s compile failed: %s", hnames[h],
+                             he ? (const char*)he->GetBufferPointer() : "?");
+                }
+                if (he) he->Release();
+            }
+            LOG_INFO("VR: 42 hand markers %s (left BLUE, right ORANGE). "
+                     "They are drawn where the controllers actually are, "
+                     "independent of the aim reference, so they stay correct "
+                     "even if recentering is off. hand_markers=0 in "
+                     "grwxr.cfg hides them.",
+                     (g_hand_ps[0] && g_hand_ps[1]) ? "armed" : "PARTIALLY armed");
+        }
+
+        // Build 45: weapon-candidate marker shaders, same independence rule
+        // as the hand markers: any single failure costs that colour only.
+        {
+            const char* wnames[kWpm] = {"ps_wp0", "ps_wp1", "ps_wp2",
+                                        "ps_wp3", "ps_wp4", "ps_wp5"};
+            int made = 0;
+            for (int i = 0; i < kWpm; ++i) {
+                ID3DBlob* wb = nullptr;
+                ID3DBlob* we = nullptr;
+                if (SUCCEEDED(compile(kSrc, sizeof(kSrc) - 1, "grwxr_blit",
+                                      nullptr, nullptr, wnames[i], "ps_4_0",
+                                      0, 0, &wb, &we))) {
+                    if (SUCCEEDED(st.device->CreatePixelShader(
+                            wb->GetBufferPointer(), wb->GetBufferSize(),
+                            nullptr, &g_wpm_ps[i])))
+                        ++made;
+                    else
+                        LOG_WARN("VR: 45 wp marker shader %d creation failed", i);
+                    wb->Release();
+                } else {
+                    LOG_WARN("VR: 45 wp marker shader %s compile failed: %s",
+                             wnames[i],
+                             we ? (const char*)we->GetBufferPointer() : "?");
+                }
+                if (we) we->Release();
+            }
+            LOG_INFO("VR: 45 weapon-candidate markers armed (%d/%d shaders). "
+                     "Colour order RED GREEN YELLOW MAGENTA CYAN WHITE; the "
+                     "wpm: log line maps colours to placement handles each "
+                     "second. Look at the gun and name the colour sitting on "
+                     "it. wp_markers=0 in grwxr.cfg hides them.",
+                     made, kWpm);
+        }
     }
     return ok;
 }
@@ -1187,6 +1431,42 @@ bool blit_into(int eye, ID3D11DeviceContext* ctx, float fovy) {
             dv.MaxDepth = 1.0f;
             ctx->RSSetViewports(1, &dv);
             ctx->PSSetShader(g_dot_ps, nullptr, 0);
+            ctx->Draw(3, 0);
+            ctx->PSSetShader(g_blit_ps, nullptr, 0);
+        }
+
+        // Build 42: the hand markers, same viewport-as-bounding-box trick.
+        for (int h = 0; h < 2; ++h) {
+            if (!g_hand_on[h] || !g_hand_ps[h]) continue;
+            const float rx = g_hand_tr[h][eye] * g_sx[eye];
+            const float ry = g_hand_tr[h][eye] * g_sy[eye];
+            D3D11_VIEWPORT hv;
+            hv.TopLeftX = g_cx[eye] + g_hand_tx[h][eye] * g_sx[eye] - rx;
+            hv.TopLeftY = g_cy[eye] - g_hand_ty[h][eye] * g_sy[eye] - ry;
+            hv.Width    = 2.0f * rx;
+            hv.Height   = 2.0f * ry;
+            hv.MinDepth = 0.0f;
+            hv.MaxDepth = 1.0f;
+            ctx->RSSetViewports(1, &hv);
+            ctx->PSSetShader(g_hand_ps[h], nullptr, 0);
+            ctx->Draw(3, 0);
+            ctx->PSSetShader(g_blit_ps, nullptr, 0);
+        }
+
+        // Build 45: the weapon-candidate markers, identical mechanism.
+        for (int i = 0; i < kWpm; ++i) {
+            if (!g_wpm_on[i] || !g_wpm_ps[i]) continue;
+            const float rx = g_wpm_tr[i][eye] * g_sx[eye];
+            const float ry = g_wpm_tr[i][eye] * g_sy[eye];
+            D3D11_VIEWPORT wv;
+            wv.TopLeftX = g_cx[eye] + g_wpm_tx[i][eye] * g_sx[eye] - rx;
+            wv.TopLeftY = g_cy[eye] - g_wpm_ty[i][eye] * g_sy[eye] - ry;
+            wv.Width    = 2.0f * rx;
+            wv.Height   = 2.0f * ry;
+            wv.MinDepth = 0.0f;
+            wv.MaxDepth = 1.0f;
+            ctx->RSSetViewports(1, &wv);
+            ctx->PSSetShader(g_wpm_ps[i], nullptr, 0);
             ctx->Draw(3, 0);
             ctx->PSSetShader(g_blit_ps, nullptr, 0);
         }
@@ -1829,7 +2109,18 @@ void on_present(const d3d11::State& st) {
         if (tog && !s_tog) {
             const bool on = !headpose::fp_enabled();
             headpose::set_fp_enabled(on);
-            note("VR: first person %s", on ? "ON" : "OFF");
+            // BUILD 44 (user request): the first-person toggle ALSO recenters.
+            // A stale head reference is invisible until it has already ruined
+            // a test (2026-08-05: the reference was ~110 deg off, which read
+            // as "the character faces hard to the left" and cost a run before
+            // the log identified it). Folding the recenter into the toggle
+            // means the reference is always freshly captured at the moment you
+            // enter first person, looking where you are actually looking, so
+            // that doubt cannot re-enter. Home still recenters on its own.
+            g_have_ref = false;
+            note("VR: first person %s, and RECENTERED (the head reference "
+                 "re-captures from where you are looking now).",
+                 on ? "ON" : "OFF");
         }
         // Build 18: the head-hide override simply follows the FP state.
         // Re-published every poll (not only on the edge) so the detour is
@@ -1841,6 +2132,20 @@ void on_present(const d3d11::State& st) {
     // build-17 one-shot experiment, which it supersedes). Default off.
     {
         static bool s_yb = false;
+        // BUILD 41: arm motion aim once, automatically, as soon as the setter
+        // hooks exist. Numpad Decimal still toggles it off and on afterwards;
+        // cfg aim_on_start=0 restores the old start-disabled behaviour.
+        if (!g_vraim_armed_once.load(std::memory_order_relaxed) &&
+            g_aim_on_start.load(std::memory_order_relaxed) == 1 &&
+            camera::aim_available()) {
+            g_vraim_armed_once.store(true, std::memory_order_relaxed);
+            g_vraim_on = true;
+            note("aim: VR AIM ARMED AUTOMATICALLY at startup (source: %s). "
+                 "Numpad Decimal toggles it; aim_on_start=0 in grwxr.cfg "
+                 "starts it off instead.",
+                 g_aim_source.load(std::memory_order_relaxed) == 1
+                     ? "right controller" : "head");
+        }
         const bool yb = (GetAsyncKeyState(VK_DECIMAL) & 0x8000) != 0;
         if (yb && !s_yb) {
             if (!camera::aim_available()) {
@@ -1890,6 +2195,18 @@ void on_present(const d3d11::State& st) {
     XrQuaternionf head_ori{0.0f, 0.0f, 0.0f, 1.0f};
     if (XR_SUCCEEDED(xrLocateSpace(g_view_space, g_space,
                                    fs.predictedDisplayTime, &loc))) {
+        // Build 42: the head POSITION, needed to place the hand markers
+        // relative to the eyes. Orientation-only tracking is common while a
+        // headset settles, so this is flagged separately and the markers
+        // simply do not draw until it is valid.
+        if (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) {
+            g_head_pos[0] = loc.pose.position.x;
+            g_head_pos[1] = loc.pose.position.y;
+            g_head_pos[2] = loc.pose.position.z;
+            g_head_pos_ok = true;
+        } else {
+            g_head_pos_ok = false;
+        }
         update_head(loc.locationFlags, loc.pose.orientation);
         // BUILD 10j: this is the orientation the frame's content is composed
         // with (both eyes share it); the submit path attaches it to both views.
@@ -1916,6 +2233,7 @@ void on_present(const d3d11::State& st) {
                     (hl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
                     (hl.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
                     seen |= 1u << h;
+                    g_in_track[h].store(true, std::memory_order_relaxed);
                     g_in_pos[h][0].store(hl.pose.position.x, std::memory_order_relaxed);
                     g_in_pos[h][1].store(hl.pose.position.y, std::memory_order_relaxed);
                     g_in_pos[h][2].store(hl.pose.position.z, std::memory_order_relaxed);
@@ -1923,6 +2241,8 @@ void on_present(const d3d11::State& st) {
                     g_in_ori[h][1].store(hl.pose.orientation.y, std::memory_order_relaxed);
                     g_in_ori[h][2].store(hl.pose.orientation.z, std::memory_order_relaxed);
                     g_in_ori[h][3].store(hl.pose.orientation.w, std::memory_order_relaxed);
+                } else {
+                    g_in_track[h].store(false, std::memory_order_relaxed);
                 }
                 XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
                 gi.action = g_act_trig;

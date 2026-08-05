@@ -27,6 +27,7 @@
 
 #include "Log.h"
 #include "D3D11Hook.h"
+#include "GameBuild.h"
 #include "Crash.h"
 #include "VRMirror.h"
 #include "AnselProbe.h"
@@ -160,6 +161,12 @@ DWORD WINAPI init_thread(LPVOID) {
         LOG_INFO("  %-24s 0x%p  %s", nm, (void*)h, pn);
     }
     LOG_INFO("--- end module survey ---");
+
+    // Build 46: identify the loaded binary and pick its address table
+    // (fail-closed; see GameBuild.h). Logged before any consumer installs so
+    // a refusal below always has its reason above it in the log.
+    LOG_INFO("");
+    grwxr::gamebuild::log_identity();
 
     // --- PHASE 2: capture the game's D3D11 device via a vtable hook ---------
     LOG_INFO("");

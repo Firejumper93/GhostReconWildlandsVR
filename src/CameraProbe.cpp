@@ -62,6 +62,8 @@
 
 #include "CameraProbe.h"
 
+#include "GameBuild.h"
+
 #include "D3D11Hook.h"
 #include "HeadPose.h"
 #include "Log.h"
@@ -135,40 +137,40 @@ namespace {
 constexpr const char* kProjSig =
     "48 89 E0 53 48 81 EC 90 00 00 00 0F 29 70 E8 48 89 CB F3";
 
+// Build 46: the RVAs moved to GameBuild.cpp, one table per analysed binary,
+// selected by the fail-closed PE-header pin. This array keeps only the
+// build-independent metadata, in the SAME ROW ORDER as Build::cam. Entry 0
+// must still resolve to the signature-scanned anchor or nothing is installed
+// at all; that check validates whichever table the pin selected.
 struct Target {
-    uintptr_t   thunk_rva;
-    uintptr_t   expected_fn_rva;
     bool        rcx_is_camera;   // key rows on rcx, and read camera fields
     const char* name;
 };
 
-// docs/RE-notes.md. Read from this exact binary, pinned by SHA256, with
-// tools/find_callers.py. Entry 0 must resolve to the signature-scanned address
-// or nothing is installed at all; that check validates the whole table.
 constexpr Target kTargets[] = {
-    {0x01347280, 0x0C50C0E0, false, "proj[0] 0x0C50C0E0 (anchor)"},
-    {0x01347460, 0x0C50C2E0, false, "proj[1] 0x0C50C2E0"},
-    {0x01347530, 0x0C50C420, false, "proj[2] 0x0C50C420 (gameplay)"},
-    {0x01347840, 0x0C50C7E0, false, "proj[3] 0x0C50C7E0 (skew path)"},
-    {0x01345720, 0x0C5094D0, false, "proj[4] 0x0C5094D0"},
-    {0x01345800, 0x0C509720, false, "proj[5] 0x0C509720"},
-    {0x0135F720, 0x0C5E47E0, true,  "on_calc_mvp 0x0C5E47E0"},
-    {0x01349DF0, 0x0C510B20, true,  "selector 0x0C510B20"},
+    {false, "proj[0] (anchor)"},
+    {false, "proj[1]"},
+    {false, "proj[2] (gameplay)"},
+    {false, "proj[3] (skew path)"},
+    {false, "proj[4]"},
+    {false, "proj[5]"},
+    {true,  "on_calc_mvp"},
+    {true,  "selector"},
     // Build 14a, skeleton/HIK runtime probe. Both thunks were located OFFLINE
     // against the pinned binary (docs/RE-notes.md "Task function pointers
     // extracted" and "The HIK datablock reader") and both are the same
     // 5-byte-jmp-in-16-byte-slot shape as the camera thunks. Read-only: the
     // recorder captures registers and counts, nothing engine-visible changes.
-    {0x01865A10, 0x0DA1A990, false, "SkeletonPostUpdate 0x0DA1A990"},
-    {0x018BE500, 0x0DC4F9B0, false, "HIK datablock reader 0x0DC4F9B0"},
+    {false, "SkeletonPostUpdate"},
+    {false, "HIK datablock reader"},
     // Build 15L (session 18): THE PLAYER PREDICATE. Offline decompilation
-    // found cPlayerComponent::OnInit (RVA 0x11412C60, named by its own log
-    // format strings) and, inside it, this thunk called with rcx = the
-    // component. [component+0x10] is the OWNING ENTITY, i.e. the local
-    // player's entity: the exact identity every probe since 15e failed to
-    // find by scanning. Read-only capture; the predicate is then
-    // [skeleton+0x10] == that entity.
-    {0x02713160, 0x114A6DE0, false, "cPlayerComponent::OnInit callee"},
+    // found cPlayerComponent::OnInit (named by its own log format strings)
+    // and, inside it, this thunk called with rcx = the component.
+    // [component+0x10] is the OWNING ENTITY, i.e. the local player's entity:
+    // the exact identity every probe since 15e failed to find by scanning.
+    // Read-only capture; the predicate is then [skeleton+0x10] == that
+    // entity.
+    {false, "cPlayerComponent::OnInit callee"},
 };
 constexpr int kNumTargets = (int)(sizeof(kTargets) / sizeof(kTargets[0]));
 
@@ -630,14 +632,15 @@ bool read_bone_world(uint64_t skel, unsigned int idx, float out[3]) {
 // verified bytes. Register proof of the prototype (this=rcx, yaw radians in
 // xmm1): the integrate site does `movaps xmm1,xmm0` right before its call
 // (bytes read from the pinned exe at 0x124D34CB, session 20).
-constexpr uintptr_t kSetYawSlotRva   = 0x006777C0;
+// Build 46: the slot RVAs live in GameBuild.cpp per binary. The expected
+// bytes, including the dispatch offsets 0x570/0x5D0, are IDENTICAL in both
+// analysed builds (the store scan matched the full sequence exactly once).
 constexpr uint8_t   kSetYawExpect[10] = {0x48, 0x8B, 0x01,              // mov rax,[rcx]
                                          0x48, 0xFF, 0xA0,              // jmp qword ptr [rax+
                                          0x70, 0x05, 0x00, 0x00};       //   0x570]
 
 // Build 19: the pitch setter, same slot shape, dispatch offset 0x5D0
 // (RE-notes "THE ABSOLUTE AIM ANGLE EXISTS", printer-proved accessor set).
-constexpr uintptr_t kSetPitchSlotRva   = 0x005FA190;
 constexpr uint8_t   kSetPitchExpect[10] = {0x48, 0x8B, 0x01,
                                            0x48, 0xFF, 0xA0,
                                            0xD0, 0x05, 0x00, 0x00};
@@ -661,9 +664,7 @@ hook::ThunkHook g_setpitch_hook;
 // the table's slot +0x1F0 must resolve (through its 5-byte jmp thunk if
 // present) to the function found by THIS unique signature, which is the
 // class's own slot-0x0F member (RVA 0x124E15A0 in the pinned binary).
-constexpr uintptr_t kHeadTableRva     = 0x04A66410;
-constexpr uintptr_t kHeadSetterThunk  = 0x029DC7D0;
-constexpr uintptr_t kHeadSetterImpl   = 0x12582AC0;
+// Build 46: table/thunk/impl RVAs live in GameBuild.cpp per binary.
 constexpr const char* kHeadSlotFnSig  =
     "48 89 5C 24 08 57 48 83 EC 20 48 83 7A 20 00 48 89 D3 48 89 CF 74 ? "
     "49 89 D0 31 D2 E8";
@@ -684,8 +685,7 @@ hook::ThunkHook g_headhide_hook;
 // parked accuracy patch). The AOB must be unique AND at the documented RVA
 // AND the byte must read 01 before anything is written; any failure leaves
 // the game untouched (rule 7). uninstall() restores the byte.
-constexpr uintptr_t   kNoBlurMatchRva = 0x124DE4CC;
-constexpr size_t      kNoBlurImmOff   = 5;
+constexpr size_t      kNoBlurImmOff   = 5;   // match RVA is per-build (GameBuild.cpp)
 constexpr const char* kNoBlurSig      =
     "45 89 E6 40 B6 01 E8 ? ? ? ? 3D F3 46 68 82";
 uint8_t* g_noblur_byte = nullptr;
@@ -1212,6 +1212,16 @@ bool install() {
     g_module_size = img->size;
     LOG_INFO("camera: image base 0x%p, size 0x%zX", (void*)img->base, img->size);
 
+    // Build 46: the fail-closed pin. No table for this binary means nothing
+    // installs, exactly like the old anchor-RVA refusal, but with the reason
+    // named up front (see the "build pin:" line above this one in the log).
+    const gamebuild::Build* gb = gamebuild::get();
+    if (!gb) {
+        LOG_ERROR("camera: no address table for this GRW.exe build. Probe "
+                  "NOT installed. The game runs unmodified.");
+        return false;
+    }
+
     size_t matches = 0;
     auto found = sig::find_unique(*img, kProjSig, &matches);
     if (!found) {
@@ -1226,10 +1236,10 @@ bool install() {
     }
     const uintptr_t anchor_rva = (uintptr_t)*found - g_module;
     LOG_INFO("camera: anchor found at RVA 0x%08zX, %zu match", (size_t)anchor_rva, matches);
-    if (anchor_rva != kTargets[0].expected_fn_rva) {
-        LOG_ERROR("camera: anchor is at RVA 0x%08zX but the thunk table was built "
-                  "for 0x%08zX. This is NOT the binary we analysed.",
-                  (size_t)anchor_rva, (size_t)kTargets[0].expected_fn_rva);
+    if (anchor_rva != gb->cam[0].fn) {
+        LOG_ERROR("camera: anchor is at RVA 0x%08zX but the %s thunk table "
+                  "was built for 0x%08zX. This is NOT the binary we analysed.",
+                  (size_t)anchor_rva, gb->name, (size_t)gb->cam[0].fn);
         return false;
     }
 
@@ -1245,9 +1255,9 @@ bool install() {
 
     int ok = 0;
     for (int i = 0; i < kNumTargets; ++i) {
-        uint8_t* fn = img->base + kTargets[i].expected_fn_rva;
+        uint8_t* fn = img->base + gb->cam[i].fn;
         grwxr_probe_originals[i] = fn;
-        if (g_hooks[i].install(img->base + kTargets[i].thunk_rva, fn, entries[i],
+        if (g_hooks[i].install(img->base + gb->cam[i].thunk, fn, entries[i],
                                kTargets[i].name)) {
             ++ok;
         }
@@ -1268,16 +1278,16 @@ bool install() {
     // the entry reachable.
     {
         memcpy(&grwxr_setyaw_disp, kSetYawExpect + 6, sizeof(grwxr_setyaw_disp));
-        g_setyaw_hook.install_raw(img->base + kSetYawSlotRva, kSetYawExpect,
+        g_setyaw_hook.install_raw(img->base + gb->setyaw_slot, kSetYawExpect,
                                   sizeof(kSetYawExpect),
                                   (void*)&grwxr_setyaw_entry,
-                                  "SetYaw vdispatch 0x006777C0");
+                                  "SetYaw vdispatch");
         memcpy(&grwxr_setpitch_disp, kSetPitchExpect + 6,
                sizeof(grwxr_setpitch_disp));
-        g_setpitch_hook.install_raw(img->base + kSetPitchSlotRva,
+        g_setpitch_hook.install_raw(img->base + gb->setpitch_slot,
                                     kSetPitchExpect, sizeof(kSetPitchExpect),
                                     (void*)&grwxr_setpitch_entry,
-                                    "SetPitch vdispatch 0x005FA190");
+                                    "SetPitch vdispatch");
         if (g_setyaw_hook.installed() && g_setpitch_hook.installed())
             LOG_INFO("aim: both setters hooked. Numpad Decimal toggles VR "
                      "head aim (default off).");
@@ -1293,11 +1303,11 @@ bool install() {
         bool hh_ok = true;
         size_t m = 0;
         auto setter = sig::find_unique(*img, kHeadSetterSig, &m);
-        if (!setter || *setter != img->base + kHeadSetterImpl) {
+        if (!setter || *setter != img->base + gb->head_setter_impl) {
             LOG_ERROR("hide: SetHidden signature %s (matches=%zu, expected "
                       "RVA 0x%08zX). Head hide OFF, everything else runs.",
                       setter ? "matched at the WRONG address" : "missed",
-                      m, (size_t)kHeadSetterImpl);
+                      m, (size_t)gb->head_setter_impl);
             hh_ok = false;
         }
         auto slotfn = sig::find_unique(*img, kHeadSlotFnSig, &m);
@@ -1310,7 +1320,7 @@ bool install() {
             // Slot +0x1F0 of the candidate table must resolve to *slotfn,
             // directly or through one 5-byte jmp thunk.
             uint64_t slotval = 0;
-            memcpy(&slotval, img->base + kHeadTableRva + 0x1F0,
+            memcpy(&slotval, img->base + gb->head_table + 0x1F0,
                    sizeof(slotval));
             const uint8_t* p = (const uint8_t*)slotval;
             const uint8_t* resolved = p;
@@ -1328,14 +1338,14 @@ bool install() {
             }
         }
         if (hh_ok) {
-            grwxr_headhide_impl = (uint64_t)(img->base + kHeadSetterImpl);
-            if (g_headhide_hook.install(img->base + kHeadSetterThunk,
-                                        img->base + kHeadSetterImpl,
+            grwxr_headhide_impl = (uint64_t)(img->base + gb->head_setter_impl);
+            if (g_headhide_hook.install(img->base + gb->head_setter_thunk,
+                                        img->base + gb->head_setter_impl,
                                         (void*)&grwxr_headhide_entry,
-                                        "SetHidden 0x12582AC0")) {
+                                        "SetHidden")) {
                 // Published LAST: the asm entry ignores everything until the
                 // table pointer is nonzero.
-                grwxr_headhide_table = (uint64_t)(img->base + kHeadTableRva);
+                grwxr_headhide_table = (uint64_t)(img->base + gb->head_table);
                 LOG_INFO("hide: armed. The head object hides whenever first "
                          "person is on (class table verified via slot fn).");
             }
@@ -1351,10 +1361,10 @@ bool install() {
             LOG_ERROR("blur: no-camera-blur signature %s (matches=%zu). "
                       "Blur patch OFF, everything else runs.",
                       m ? "AMBIGUOUS" : "missed", m);
-        } else if (*hit != img->base + kNoBlurMatchRva) {
+        } else if (*hit != img->base + gb->noblur_match) {
             LOG_ERROR("blur: signature matched at RVA 0x%08zX, expected "
                       "0x%08zX (game updated?). Blur patch OFF.",
-                      (size_t)(*hit - img->base), (size_t)kNoBlurMatchRva);
+                      (size_t)(*hit - img->base), (size_t)gb->noblur_match);
         } else if ((*hit)[kNoBlurImmOff] != 0x01) {
             LOG_ERROR("blur: byte at match+%zu reads 0x%02X, expected 01. "
                       "Blur patch OFF.",
@@ -2578,12 +2588,84 @@ void snap_drain() {
 
 }  // namespace
 
-// Build 39: see CameraProbe.h. Unsynchronized by design; the comment there
-// states the tolerance argument.
-void base_pos(float out[3]) {
+// Build 39.1: see CameraProbe.h.
+//
+// FIXED DEFECT (found before build 39 was ever run): the first version read
+// g_base_pos, which is written ONLY inside write_pose_head, which runs ONLY
+// when headpose::read() succeeds, i.e. only while VR is armed and publishing.
+// Everywhere else (menus, loading, before the session arms, headset asleep,
+// any desktop run) it stays {0,0,0}, every world position is then thousands of
+// metres away, and a proximity probe silently reports NOTHING. That reads as
+// "the subsystem does not place this object" when the truth is "we had no
+// camera position": a false negative that costs a test run to disprove.
+//
+// The authoritative source is the camera object itself. g_player_cam is stored
+// on EVERY mode-0 on_calc_mvp call, with no VR precondition, and the engine
+// keeps Camera+0x000's row 3 current every frame. Read that, and say out loud
+// whether the read worked.
+bool base_pos(float out[3]) {
+    const uint64_t cam = g_player_cam.load(std::memory_order_relaxed);
+    if (cam) {
+        __try {
+            const float* m = (const float*)(cam + kOffPose);
+            const float x = m[12], y = m[13], z = m[14];
+            // BUILD 40: SANITY-CHECK THE READ. Measured 2026-08-05 (log
+            // grwxr-25496): during a level transition this returned
+            // (6.2e22, 1.0e15, 9.2e5). The pointer was still readable, so SEH
+            // caught nothing; the camera object was simply stale or mid-swap.
+            // Garbage that READS FINE is the dangerous case, because every
+            // distance computed from it is silently wrong rather than absent.
+            // Wildlands' world is tens of km, so anything past 1e6 m or any
+            // non-finite value is not a camera position.
+            const float lim = 1.0e6f;
+            if (x == x && y == y && z == z &&          // not NaN
+                x > -lim && x < lim &&
+                y > -lim && y < lim &&
+                z > -lim && z < lim) {
+                out[0] = x; out[1] = y; out[2] = z;
+                return true;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // fall through to the published copy
+        }
+    }
     out[0] = g_base_pos[0];
     out[1] = g_base_pos[1];
     out[2] = g_base_pos[2];
+    return (g_base_pos[0] != 0.0f || g_base_pos[1] != 0.0f ||
+            g_base_pos[2] != 0.0f);
+}
+
+// Build 45: see CameraProbe.h. Same source and sanity rules as base_pos,
+// plus a unit-length check on each rotation row, because a camera object
+// mid-swap can hold a matrix that reads fine and means nothing. POD locals
+// only, so SEH needs no unwinding.
+bool base_frame(float rot[9], float pos[3]) {
+    const uint64_t cam = g_player_cam.load(std::memory_order_relaxed);
+    if (!cam) return false;
+    __try {
+        const float* m = (const float*)(cam + kOffPose);
+        const float x = m[12], y = m[13], z = m[14];
+        const float lim = 1.0e6f;
+        if (!(x == x && y == y && z == z &&
+              x > -lim && x < lim && y > -lim && y < lim &&
+              z > -lim && z < lim))
+            return false;
+        for (int r = 0; r < 3; ++r) {
+            const float a = m[r * 4 + 0];
+            const float b = m[r * 4 + 1];
+            const float c = m[r * 4 + 2];
+            const float len2 = a * a + b * b + c * c;
+            if (!(len2 > 0.81f && len2 < 1.21f)) return false;
+            rot[r * 3 + 0] = a;
+            rot[r * 3 + 1] = b;
+            rot[r * 3 + 2] = c;
+        }
+        pos[0] = x; pos[1] = y; pos[2] = z;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 void drain() {

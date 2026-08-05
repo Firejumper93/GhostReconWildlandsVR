@@ -40,6 +40,7 @@
 #define NOMINMAX
 #include <windows.h>
 
+#include "GameBuild.h"
 #include "Log.h"
 
 #include <atomic>
@@ -48,10 +49,9 @@ namespace grwxr {
 namespace ansel {
 namespace {
 
-// docs/RE-notes.md: IAT slot RVAs, from tools/pe_inventory.py.
-constexpr uintptr_t kIatSetConfiguration = 0x162AD098;
-constexpr uintptr_t kIatUpdateCamera     = 0x162AD0A0;
-constexpr uintptr_t kIatIsAnselAvailable = 0x162AD0A8;
+// Build 46: IAT slot RVAs are per-build (GameBuild.cpp; originally from
+// tools/pe_inventory.py, store values from the import directory). The
+// owner-module sanity check below still guards every write.
 
 using SetConfigFn = int(__cdecl*)(const void* cfg);
 SetConfigFn g_orig_setconfig = nullptr;
@@ -233,7 +233,12 @@ bool install() {
         return false;
     }
 
-    g_slot = (void**)((uintptr_t)base + kIatSetConfiguration);
+    const gamebuild::Build* gb = gamebuild::get();
+    if (!gb) {
+        LOG_WARN("ansel: no address table for this GRW.exe build. Not hooking.");
+        return false;
+    }
+    g_slot = (void**)((uintptr_t)base + gb->ansel_setconfig);
 
     // Sanity: the slot should currently point into anselsdk64.dll.
     HMODULE owner = nullptr;
@@ -265,7 +270,7 @@ bool install() {
     LOG_INFO("ansel: call happened before we loaded; use the Ghidra xref fallback.");
 
     // --- updateCamera, the camera-override observation hook -----------------
-    g_slot_updatecam = (void**)((uintptr_t)base + kIatUpdateCamera);
+    g_slot_updatecam = (void**)((uintptr_t)base + gb->ansel_updatecam);
     HMODULE owner2 = nullptr;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,

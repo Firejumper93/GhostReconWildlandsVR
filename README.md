@@ -20,7 +20,7 @@
 > no weapon manipulation. See "Controller support, honestly" below and read it
 > before you decide whether this build is worth your time.
 >
-> **STEAM BUILD ONLY, for now.** The Epic Games and Ubisoft Connect copies of
+> **STEAM BUILD CONFIRMED, UBISOFT LAUNCHER UNTESTED, for now.** The Epic Games and Ubisoft Connect copies of
 > Wildlands are a DIFFERENT BUILD of the game executable, and every engine
 > address this mod uses is specific to the Steam build. On those versions the mod
 > detects the mismatch, refuses to install its engine hooks (your game is left

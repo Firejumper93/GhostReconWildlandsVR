@@ -19,14 +19,19 @@ temporal anti-aliasing (TAA)** with this mod.
 
 - **Full Touch controller play, no gamepad needed** (builds 22-22.2). The mod merges
   the Touch controllers into the game as a gamepad: sticks, triggers, grips,
-  A/B/X/Y, menu. New key `xinput_touch` (default 1).
-- **Controller-driven hip-fire aim with a visible dot reticle** (builds 23-24). Hip
-  fire follows the right controller's ray, drawn per eye like a native VR game. New
-  keys `aim_source` (default 1 = controller), `aim_ctrl_smooth` (default 0.35),
-  `aim_reticle` (default 1).
+  A/B/X/Y, menu. New key `xinput_touch` (default 1). This part works well.
+- **Controller-driven hip-fire aim with a dot reticle** (builds 23-24). Hip fire
+  follows the right controller's ray. New keys `aim_source` (default 1 = controller),
+  `aim_ctrl_smooth` (default 0.35), `aim_reticle` (default 1). **Set expectations
+  before you try it: see "Motion controls, honestly" in the README.** Summary: there
+  is no visible gun in your hands, aim CHASES your controller through the game's own
+  aim system rather than tracking it 1:1, and hip fire uses the game's wide vanilla
+  spread cone so pointing precisely does not make shots land precisely.
 - **Aim-down-sights look-to-aim split** (build 25). Holding the left trigger switches
-  aim to the head and hides the dot, so the game's sight picture matches where
-  bullets land. Transitional until the weapon itself rides the controller.
+  aim BACK to the head and hides the dot, because the game draws its sight picture at
+  view center; leaving aim on the controller made the picture and the impacts
+  disagree. The cost is that you play with two different aiming models depending on
+  the trigger. Transitional until the weapon itself rides the controller.
 - **Config GUI and hot reload** (build 21). `grwxr.cfg` is re-read about one second
   after any save; `tools\cfg_gui\cfg_gui.exe` is a standalone slider editor. All
   numpad tuning keys were REMOVED: only Home (recenter), Numpad 8 (first person) and
@@ -44,6 +49,15 @@ temporal anti-aliasing (TAA)** with this mod.
 - **A vertical-aim runaway** under controller aim when the controller pointed nearly
   straight down (builds 20, 23.1): pitch accounting is now bounded and near-vertical
   rays no longer drag yaw.
+
+### Known rough edges in this release
+
+- **Motion controls are the weakest part of the mod.** No gun visibly in your hands,
+  aim chases rather than tracks, hip fire is inaccurate by the game's design, ADS
+  abandons controller aim, and there are no hands, gestures or weapon manipulation.
+  The README section "Motion controls, honestly" spells out each one. Fixing the
+  first of these (the weapon model riding your controller) is the current focus.
+- Hip-fire spread defeat under VR aim is designed but NOT in this release.
 
 ### Performance
 

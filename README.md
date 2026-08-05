@@ -7,14 +7,22 @@
 > recommended while testing.
 >
 > **THIS IS NOT A COMPLETE VR EXPERIENCE.** This mod is in the EARLY STAGES of
-> development and testing. Stereo depth, a fullscreen 4K view, full Touch
-> controller play (no gamepad needed), controller-driven aiming with a visible
-> reticle, and a real first-person camera (anchored to your character's head
-> bone, head hidden, close-range body blur removed) all work, but there are no
-> IK arms or hands yet and comfort issues remain. It has been tested on a single
-> hardware configuration. Try it as an experiment and a preview, not as a
-> finished way to play the game. Development is active and every release changes
-> things.
+> development and testing. The rendering side is genuinely good: stereo depth, a
+> fullscreen 4K view, and a real first-person camera anchored to your character's
+> head bone (head hidden, close-range body blur removed).
+>
+> **The motion controls are the weak part and you should expect to be
+> disappointed by them.** They work in the sense that the game reads your Touch
+> controllers and your aim follows where you point, but it does not feel like a
+> native VR shooter: there is no visible gun in your hands, aim chases your
+> controller instead of tracking it, hip fire is inaccurate by the game's own
+> design, and aiming down sights abandons controller aim entirely. Details in
+> "Motion controls, honestly" below. Read that section before you decide whether
+> this build is worth your time.
+>
+> Tested on a single hardware configuration. Try it as an experiment and a
+> preview, not as a finished way to play the game. Development is active and
+> every release changes things.
 
 A native OpenXR VR mod for Tom Clancy's Ghost Recon Wildlands (AnvilNext 2.0, DirectX 11).
 Head-tracked stereoscopic 3D rendered by the game's own engine, injected through a
@@ -56,12 +64,10 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, and the
   is a config key, so it doubles as the quality-versus-frame-rate knob.
 - **Full Touch controller play, no gamepad needed.** The mod fabricates a gamepad from
   the Touch controllers: sticks move and turn, triggers aim and fire, grips and
-  A/B/X/Y and menu all work. Pick up the Touch controllers and play.
-- **Controller-driven hip-fire aim with a visible reticle.** Hip fire follows the
-  right controller's ray, shown as a small dot reticle per eye like a native VR game,
-  so ballistics, HUD and crosshair stay true. Holding the left trigger (aim down
-  sights) switches to look-to-aim so the game's sight picture matches where bullets
-  land; this split is transitional until the weapon itself rides the controller.
+  A/B/X/Y and menu all work. Pick up the Touch controllers and play. (This part
+  works well. The *aiming* built on top of it does not yet; see below.)
+- **Controller-driven hip-fire aim with a dot reticle**, with real caveats. See
+  "Motion controls, honestly".
 - **True first person, anchored to your head bone.** A toggle moves the viewpoint onto
   the player character's actual animated head bone: eye height tracks standing, crouch
   and prone automatically, the camera stays glued to the head while moving, and the
@@ -90,13 +96,55 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, and the
 - A cropped, non-alternating desktop mirror suitable for recording
 - Stable at 72 fps on the test system through extended open-world play
 
+## Motion controls, honestly
+
+This is the weakest part of the mod and the part most likely to disappoint you. It
+is being worked on and it will change. What follows is what it actually is today,
+not what it is aiming to become.
+
+**There is no gun in your hands.** Your bullets follow your controller, but the
+weapon model does not move with it: the character still holds the rifle wherever
+the third-person animation puts it. You are pointing an invisible line at things.
+This is the single biggest gap and it is the current development focus.
+
+**Aim chases your controller, it does not track it.** The mod cannot set the game's
+aim directly, so it feeds turn input into the game's own aim system until the aim
+catches up with where you are pointing. In practice that means a soft, slightly
+laggy, "steering" feel rather than a 1:1 weapon in your hand, and fast flicks
+overshoot or lag behind. Smoothing (`aim_ctrl_smooth`) trades one for the other;
+neither setting makes it feel native.
+
+**Hip fire is inaccurate, and that part is the real game.** Wildlands applies a wide
+hip-fire spread cone. Pointing precisely does not help, because the game rolls the
+shot inside that cone. It reads as "the mod is broken" and it is not: aiming down
+sights is exact, which is how we know spread is vanilla behavior rather than
+something the mod causes. Defeating hip-fire spread under VR aim is designed and
+queued, but it is NOT in this release.
+
+**Aiming down sights abandons controller aim.** Holding the left trigger switches
+aim back to your head, because the game draws its sight picture at view center: if
+we left aim on the controller, the sight picture and the impacts would disagree.
+So you get two different aiming models depending on the trigger, which is
+inconsistent to play. Optics are head-anchored, not gun-anchored, for the same
+reason.
+
+**There are no hands, no gestures, and no weapon manipulation.** No grabbing, no
+gesture reloads, no physical mag changes, no two-handed grip. Reload, swap, vehicle
+entry and everything else are ordinary button presses.
+
+**The reticle is a flat dot at infinity.** It shows the ray direction. It does not
+sit at target depth, so it will not converge on close targets the way a real red dot
+does.
+
+Where this is going: the weapon model riding your controller (so you physically
+raise the gun to your eye), and ADS-grade accuracy under VR aim at all times. Both
+are designed; neither ships here.
+
 ## Known limitations (honest list)
 
-- **No IK arms or hands, and the weapon model does not yet visibly ride your
-  controller.** Bullets already follow the controller; making the gun model agree is
-  the current development focus.
-- Hip-fire accuracy uses the game's normal hip-fire spread; ADS-grade accuracy under
-  VR aim (without forcing the game's ADS state) is designed and queued.
+- **The motion controls are rough.** No visible gun in your hands, aim chases rather
+  than tracks, hip fire blooms, and ADS switches back to head aim. Read "Motion
+  controls, honestly" above; it is the honest account, not a teaser.
 - The camera can occasionally attach to the wrong body after a respawn or fast travel.
   Toggling first person off and on while facing your character re-acquires it.
 - Vehicles in first person are unfinished. Ground vehicles are playable and fun in

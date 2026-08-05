@@ -21,16 +21,7 @@
 > before you decide whether this build is worth your time.
 >
 > **STEAM BUILD CONFIRMED, UBISOFT LAUNCHER UNTESTED, for now.** The Epic Games and Ubisoft Connect copies of
-> Wildlands are a DIFFERENT BUILD of the game executable, and every engine
-> address this mod uses is specific to the Steam build. On those versions the mod
-> detects the mismatch, refuses to install its engine hooks (your game is left
-> completely unmodified), and you get a small flat window in the headset with no
-> head tracking and no depth. That is expected today, not a bug you can
-> configure away. See "Which version of the game do I need?" below.
->
-> Tested on a single hardware configuration. Try it as an experiment and a
-> preview, not as a finished way to play the game. Development is active and
-> every release changes things.
+
 
 A native OpenXR VR mod for Tom Clancy's Ghost Recon Wildlands (AnvilNext 2.0, DirectX 11).
 Head-tracked stereoscopic 3D rendered by the game's own engine, injected through a

@@ -20,6 +20,14 @@
 > no weapon manipulation. See "Controller support, honestly" below and read it
 > before you decide whether this build is worth your time.
 >
+> **STEAM BUILD ONLY, for now.** The Epic Games and Ubisoft Connect copies of
+> Wildlands are a DIFFERENT BUILD of the game executable, and every engine
+> address this mod uses is specific to the Steam build. On those versions the mod
+> detects the mismatch, refuses to install its engine hooks (your game is left
+> completely unmodified), and you get a small flat window in the headset with no
+> head tracking and no depth. That is expected today, not a bug you can
+> configure away. See "Which version of the game do I need?" below.
+>
 > Tested on a single hardware configuration. Try it as an experiment and a
 > preview, not as a finished way to play the game. Development is active and
 > every release changes things.
@@ -188,9 +196,35 @@ with hot reload, resilient VR startup.
 
 A public **beta** is planned once the top items land.
 
+## Which version of the game do I need?
+
+**The Steam build.** This is not a preference, it is a hard technical limit right now.
+
+The mod finds the engine's camera and projection code at specific addresses inside
+`GRW.exe`. The Epic Games and Ubisoft Connect releases ship a **different build** of
+that executable: it is about 12 MB larger and the code sits about 21 MB further along,
+so every address the mod knows is wrong there.
+
+What happens if you try anyway: the mod notices the mismatch, says so in its log, and
+**installs nothing**. Your game runs completely unmodified and nothing is damaged. But
+because the camera hook is what provides head tracking, stereo depth and the fullscreen
+view, you get **a small flat window floating in the headset that does not respond to
+head movement**. Controllers and buttons may still work, which makes it look like the
+mod is "half working"; it is not, it is correctly refusing to patch a binary it does
+not recognize.
+
+If you see this, check `GRWVR\grwxr-<pid>.log` in your game folder for a line reading
+"This is NOT the binary we analysed". That confirms it.
+
+Supporting other stores is possible (the mod's code-pattern scanner already *finds*
+the right function on those builds, it just cannot place the rest of its address map),
+but it needs work that has not been done. It is on the list, without a date.
+
 ## Requirements
 
-- Ghost Recon Wildlands, Steam edition (tested against the 2023-09-14 Steam build)
+- Ghost Recon Wildlands, **Steam edition** (tested against the 2023-09-14 Steam build).
+  Epic Games and Ubisoft Connect versions are a different build and are NOT supported
+  yet; see above.
 - A PC VR headset with an OpenXR runtime. Tested only on Meta Quest 3 over Link cable
   with the Meta Quest Link runtime.
 - **Asynchronous Spacewarp must be disabled** (Oculus Debug Tool, set ASW to Disabled).

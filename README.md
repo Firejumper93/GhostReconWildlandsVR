@@ -11,14 +11,14 @@
 > fullscreen 4K view, and a real first-person camera anchored to your character's
 > head bone (head hidden, close-range body blur removed).
 >
-> **The motion controls are the weak part and you should expect to be
-> disappointed by them.** They work in the sense that the game reads your Touch
-> controllers and your aim follows where you point, but it does not feel like a
-> native VR shooter: there is no visible gun in your hands, aim chases your
-> controller instead of tracking it, hip fire is inaccurate by the game's own
-> design, and aiming down sights abandons controller aim entirely. Details in
-> "Motion controls, honestly" below. Read that section before you decide whether
-> this build is worth your time.
+> **THERE ARE NO REAL MOTION CONTROLS. Your Touch controllers are read as an
+> EMULATED GAMEPAD.** Sticks, buttons, triggers and grips are translated into
+> ordinary gamepad input, which is not motion control and does not feel like a
+> native VR shooter. The only motion-tracked thing on top of that is aim
+> DIRECTION from the right controller's pointing angle, and even that chases
+> rather than tracks. There is no gun in your hands, no hands, no gestures, and
+> no weapon manipulation. See "Controller support, honestly" below and read it
+> before you decide whether this build is worth your time.
 >
 > Tested on a single hardware configuration. Try it as an experiment and a
 > preview, not as a finished way to play the game. Development is active and
@@ -30,19 +30,19 @@ Head-tracked stereoscopic 3D rendered by the game's own engine, injected through
 
 **Status: experimental alpha, in ongoing development.** Stereo fusion with real depth
 was achieved on 2026-07-29, the fullscreen view on 2026-07-30, 4K internal rendering,
-motion-controller aiming and anchored first person on 2026-08-01/02, head-bone
-first person, head hiding, and continuous 1:1 head aim on 2026-08-03, and full Touch
-controller play, controller-driven hip-fire aim with a reticle, and removal of the
-first-person close-range body blur on 2026-08-03/04. This is a development snapshot,
+controller-pointing aim and anchored first person on 2026-08-01/02, head-bone
+first person, head hiding, and continuous 1:1 head aim on 2026-08-03, and Touch
+controllers as an emulated gamepad, controller-pointing hip-fire aim with a reticle,
+and removal of the first-person close-range body blur on 2026-08-03/04. This is a development snapshot,
 not a finished mod. Expect rough edges. Performance numbers here come from one test
 system; different hardware, headsets, and settings may perform noticeably worse. The
 mod is being actively optimized and improved, so expect frequent changes.
 
 **If you tested an earlier release** (v0.1.x through v0.3.x): the "flat screen
 floating in space" is long gone. Current builds render a fullscreen, head-tracked,
-stereoscopic view with real depth, play entirely on the Touch controllers, aim with
-the right controller with a visible dot reticle, and support a true first-person
-mode. If your install still shows a floating window, you are on the old release:
+stereoscopic view with real depth, let you play on the Touch controllers (emulated
+as a gamepad, not true motion controls), aim by pointing the right controller, and
+support a true first-person mode. If your install still shows a floating window, you are on the old release:
 delete the old `dxgi.dll` and install this one.
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, and the
@@ -62,12 +62,13 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, and the
   swapchain and reports a 4K client area to the engine, so the whole pipeline renders
   at 3840x2160 and the capture is sharp from an ordinary 1080p desktop. The render size
   is a config key, so it doubles as the quality-versus-frame-rate knob.
-- **Full Touch controller play, no gamepad needed.** The mod fabricates a gamepad from
-  the Touch controllers: sticks move and turn, triggers aim and fire, grips and
-  A/B/X/Y and menu all work. Pick up the Touch controllers and play. (This part
-  works well. The *aiming* built on top of it does not yet; see below.)
-- **Controller-driven hip-fire aim with a dot reticle**, with real caveats. See
-  "Motion controls, honestly".
+- **Touch controllers work as an EMULATED GAMEPAD, so no physical gamepad is
+  needed.** Sticks, triggers, grips, A/B/X/Y and menu are translated into ordinary
+  gamepad input. This is gamepad emulation, NOT motion control: it is reliable and
+  convenient, and it is not what "VR motion controllers" normally means.
+- **Aim direction from the right controller's pointing angle**, with a dot reticle
+  and real caveats. This is the only motion-tracked input beyond head tracking.
+  See "Controller support, honestly".
 - **True first person, anchored to your head bone.** A toggle moves the viewpoint onto
   the player character's actual animated head bone: eye height tracks standing, crouch
   and prone automatically, the camera stays glued to the head while moving, and the
@@ -96,11 +97,18 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, and the
 - A cropped, non-alternating desktop mirror suitable for recording
 - Stable at 72 fps on the test system through extended open-world play
 
-## Motion controls, honestly
+## Controller support, honestly
 
-This is the weakest part of the mod and the part most likely to disappoint you. It
-is being worked on and it will change. What follows is what it actually is today,
-not what it is aiming to become.
+**Start here: there are no real motion controls in this mod.** Your Touch
+controllers are read as an *emulated gamepad*: the mod translates sticks, buttons,
+triggers and grips into the ordinary gamepad input the game already understands.
+That is convenient and it works reliably, but it is not motion control, and it
+should not be described as such.
+
+The only motion-tracked input layered on top of that is **aim direction** taken
+from where the right controller points. That part is the weakest thing in the mod
+and the most likely to disappoint you. It is being worked on and it will change.
+What follows is what it actually is today, not what it is aiming to become.
 
 **There is no gun in your hands.** Your bullets follow your controller, but the
 weapon model does not move with it: the character still holds the rifle wherever
@@ -142,9 +150,10 @@ are designed; neither ships here.
 
 ## Known limitations (honest list)
 
-- **The motion controls are rough.** No visible gun in your hands, aim chases rather
-  than tracks, hip fire blooms, and ADS switches back to head aim. Read "Motion
-  controls, honestly" above; it is the honest account, not a teaser.
+- **No real motion controls.** Touch is emulated as a gamepad; only aim direction is
+  motion-tracked, and it is rough: no visible gun in your hands, aim chases rather
+  than tracks, hip fire blooms, ADS switches back to head aim. Read "Controller
+  support, honestly" above; it is the honest account, not a teaser.
 - The camera can occasionally attach to the wrong body after a respawn or fast travel.
   Toggling first person off and on while facing your character re-acquires it.
 - Vehicles in first person are unfinished. Ground vehicles are playable and fun in
@@ -173,8 +182,8 @@ evidence comes in.
 | Aerial vehicle interior camera | ~20% | Ground-vehicle first person already works in practice; helicopter and plane interiors need their camera behavior characterized first |
 | VR arms and hands (IK) | ~15% | The GPU skinning data format was recovered from the game's own shipped shaders; which render path draws the player is the remaining unknown. The engine's own IK system is confirmed present, which is the long-term route |
 
-Shipped since the last release: full Touch controller support, controller hip-fire
-aim with a reticle, first-person body blur removal, instant head hide, config GUI
+Shipped since the last release: Touch-as-emulated-gamepad support, controller-pointing
+hip-fire aim with a reticle, first-person body blur removal, instant head hide, config GUI
 with hot reload, resilient VR startup.
 
 A public **beta** is planned once the top items land.
@@ -264,11 +273,12 @@ save, or use the included slider GUI (`tools\cfg_gui\cfg_gui.exe`).
 | Numpad 8 | First person on / off (head hiding follows it automatically) |
 | Numpad . (Decimal) | 1:1 head aim on / off (bullets follow your gaze; default off) |
 
-### Touch controllers (no gamepad needed)
+### Touch controllers (emulated as a gamepad)
 
 The mod merges the Touch controllers into the game as a gamepad, so the full normal
-control scheme works: sticks move and turn, face buttons and grips act as their
-gamepad equivalents. On top of that:
+control scheme works and no physical gamepad is needed: sticks move and turn, face
+buttons and grips act as their gamepad equivalents. To be clear, that is gamepad
+emulation, not motion control. The one motion-tracked addition:
 
 | Input | Action |
 |---|---|
@@ -297,7 +307,7 @@ key in comments. The ones most worth knowing:
 | `aim_ctrl_smooth` | Controller-aim smoothing, 0 to 1 (default 0.35) |
 | `aim_reticle` | `1` (default) draws the hip-fire dot reticle; `0` hides it |
 | `xinput_touch` | `1` (default) merges Touch controllers into the gamepad; `0` passes through untouched |
-| `aim_steer`, `aim_ads`, `aim_fire` | Motion-control features, set any to `0` to disable |
+| `aim_steer`, `aim_ads`, `aim_fire` | Controller-pointing aim, trigger ADS and trigger fire; set any to `0` to disable |
 | `desktop_fov` | Crop of the desktop recording view, `0` disables |
 
 ## Disabling and uninstalling

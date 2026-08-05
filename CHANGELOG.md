@@ -17,13 +17,15 @@ temporal anti-aliasing (TAA)** with this mod.
 
 ### Added
 
-- **Full Touch controller play, no gamepad needed** (builds 22-22.2). The mod merges
-  the Touch controllers into the game as a gamepad: sticks, triggers, grips,
-  A/B/X/Y, menu. New key `xinput_touch` (default 1). This part works well.
+- **Touch controllers as an EMULATED GAMEPAD, so no physical gamepad is needed**
+  (builds 22-22.2). The mod translates sticks, triggers, grips, A/B/X/Y and menu into
+  ordinary gamepad input. New key `xinput_touch` (default 1). This works reliably.
+  **It is gamepad emulation, NOT motion control**, and should not be described as
+  motion controls: no hands, no gestures, no weapon manipulation.
 - **Controller-driven hip-fire aim with a dot reticle** (builds 23-24). Hip fire
   follows the right controller's ray. New keys `aim_source` (default 1 = controller),
   `aim_ctrl_smooth` (default 0.35), `aim_reticle` (default 1). **Set expectations
-  before you try it: see "Motion controls, honestly" in the README.** Summary: there
+  before you try it: see "Controller support, honestly" in the README.** Summary: there
   is no visible gun in your hands, aim CHASES your controller through the game's own
   aim system rather than tracking it 1:1, and hip fire uses the game's wide vanilla
   spread cone so pointing precisely does not make shots land precisely.
@@ -52,11 +54,14 @@ temporal anti-aliasing (TAA)** with this mod.
 
 ### Known rough edges in this release
 
-- **Motion controls are the weakest part of the mod.** No gun visibly in your hands,
-  aim chases rather than tracks, hip fire is inaccurate by the game's design, ADS
-  abandons controller aim, and there are no hands, gestures or weapon manipulation.
-  The README section "Motion controls, honestly" spells out each one. Fixing the
-  first of these (the weapon model riding your controller) is the current focus.
+- **There are no real motion controls.** Touch is emulated as a gamepad; the only
+  motion-tracked input beyond head tracking is aim DIRECTION from where the right
+  controller points, and that is the weakest part of the mod: no gun visibly in your
+  hands, aim chases rather than tracks, hip fire is inaccurate by the game's design,
+  ADS abandons controller aim, and there are no hands, gestures or weapon
+  manipulation. The README section "Controller support, honestly" spells out each
+  one. Fixing the first of these (the weapon model riding your controller) is the
+  current focus.
 - Hip-fire spread defeat under VR aim is designed but NOT in this release.
 
 ### Performance
@@ -107,7 +112,7 @@ is the focus of the next update.
 
 ## v0.3.0-alpha (build 15L, 2026-08-02)
 
-The blur is gone, motion controls arrived, and first person now attaches to your
+The blur is gone, controller-pointing aim arrived, and first person now attaches to your
 actual character. Headline known issue: first person is anchored to the character's
 origin rather than the head bone, so the viewpoint can sit slightly off, does not
 follow idle animation, and does not compensate for crouch or prone. Head-bone
@@ -122,7 +127,7 @@ tracking is the focus of the next update.
   render pipeline runs at that resolution. The v0.2.0 blur is fixed at the source, and
   no display or driver setting is required. Lower the two keys (for example
   3200x1800) to trade sharpness for frame rate.
-- **Motion-controller aiming** (build 14d). Pointing the right Touch controller away
+- **Controller-pointing aim** (build 14d). Pointing the right Touch controller away
   from head center turns the game's own aim, injected as relative mouse motion, so
   ballistics, HUD and crosshair stay true. Tunable via `aim_deadzone_deg`, `aim_gain`,
   `aim_max_rate`; `aim_steer=0` disables.

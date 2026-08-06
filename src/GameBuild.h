@@ -41,6 +41,62 @@ struct Build {
     uintptr_t setyaw_slot;
     uintptr_t setpitch_slot;
 
+    // Build 50: the matching GETTER stubs (vtable +0x5B0 yaw, +0x5F0 pitch),
+    // for the aim-reader census (AimTrace.h). Derived 2026-08-06 with
+    // tools/sig_scan.py: the 13-byte sequence hits exactly once in each
+    // binary, and the Steam control lands on the RVA RE-notes documents.
+    uintptr_t getyaw_slot;
+    uintptr_t getpitch_slot;
+
+    // Build 51: the PER-SHOT aim reader, found by build 50's census on
+    // 2026-08-06 (ten calls for ten rounds fired, then flat). These are
+    // RETURN addresses: the instruction after `call <getter stub>` inside
+    // the function at 0x124B8360, which computes
+    //     [r15+0xAC] = wrap(perAxisOffset + currentYaw)
+    //     [r15+0xB0] = wrap(perAxisOffset + currentPitch)
+    // 0 = not derived for this binary, and the override refuses to arm.
+    // AimTrace verifies the E8 rel32 in front of each site really resolves
+    // to the matching getter stub before trusting either (rule 7).
+    uintptr_t shot_yaw_site;
+    uintptr_t shot_pitch_site;
+
+    // Build 53: the per-shot weapon routine that owns those two reads, and
+    // its E9 thunk. Found by walking up from the read sites: the function is
+    // virtual (no direct callers, one vtable slot at 0x04A673D0), so the only
+    // way to learn who invokes it is to hook it and let it name its caller.
+    // 0 = not derived for this binary.
+    uintptr_t wfire_thunk;
+    uintptr_t wfire_impl;
+
+    // Build 54: hknpWorld::castRay, the Havok world raycast, and its E9
+    // thunk. Found 2026-08-06 by cross-referencing Havok's own monitor-timer
+    // string literal "TtWorldCastRay" (0x03C737A8), which HK_TIMER_BEGIN
+    // writes into the profiling stream from INSIDE the function it names.
+    // Signature: castRay(hknpWorld* rcx, RayInput* rdx, Collector* r8).
+    // Only EIGHT call sites exist in the image; the shot trace is one.
+    uintptr_t raycast_thunk;
+    uintptr_t raycast_impl;
+
+    // Build 55: GetAimOrientation, the function that turns the aim SCALARS
+    // into a DIRECTION. Verified body: rcx = out quaternion, rdx = aim
+    // sub-object (parent = rdx-0x48), r8 = int* mode; when *mode == -1 and
+    // the dirty byte [parent+0x4B0] is clear it returns the cached quaternion
+    // at [parent+0x420], otherwise it rebuilds base * yaw * pitch * roll.
+    // The recoil node sets that dirty flag, which is the causal link.
+    uintptr_t aimquat_thunk;
+    uintptr_t aimquat_impl;
+
+    // Build 56: THE PROJECTILE SPAWN. 0x12458BD0 allocates a 0x180-byte
+    // cBallisticProjectileComponent and fills it. Verified byte for byte:
+    //   movaps xmm1,[owner+0x150] -> [proj+0x50]   m_vBulletShootOrigin
+    //   movaps xmm0,[owner+0x140] -> [proj+0x100]  m_vBulletSimulationDirection
+    //   mov    [proj+0x20], owner                  back-pointer
+    // So the shot direction is NOT computed here: it is read from
+    // [owner+0x140]. Class name and field names came from CRC32-cracking the
+    // Anvil reflection tables, so they are the engine's own names.
+    uintptr_t spawn_thunk;
+    uintptr_t spawn_impl;
+
     // Head hide. The method table RVA is identical in both builds (data
     // layout survived the recompile); kept per-build anyway so an unknown
     // future build cannot inherit it silently.

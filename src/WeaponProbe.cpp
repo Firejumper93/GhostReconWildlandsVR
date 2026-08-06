@@ -93,6 +93,22 @@ struct Watch {
 };
 Watch g_watch[kWatch] = {};
 
+// Build 47 write state. set_write() stores from the render thread once per
+// frame; the hot path reads. Position uses plain float stores (a torn read
+// costs centimetres for one call, and the setter runs again next frame); the
+// slot gate is a single aligned LONG so off means off immediately. g_w_tick
+// makes the write fail-safe: if the render thread stops pushing (VR lost,
+// cfg reload in flight), the write stops within 250 ms instead of holding a
+// stale controller position forever.
+volatile LONG      g_w_handle  = 0;      // 24-bit handle to write, 0 = by slot
+volatile LONG      g_w_slot    = -1;     // watch-slot index to write, -1 off
+volatile LONG      g_w_mode    = 1;      // 1 lift, 2 ride the controller
+float              g_w_up      = 0.30f;  // lift height, metres
+float              g_w_ctrl[3] = {};     // right controller, engine world
+volatile LONG      g_w_ctrl_ok = 0;
+volatile LONG      g_w_count   = 0;      // writes this second, drain logs it
+volatile ULONGLONG g_w_tick    = 0;      // last push, GetTickCount64
+
 // Hot path. No logging, no allocation, no locks (rule 8): interlocked ops,
 // a handful of float ops, and at most 16 probe steps.
 void record(void* ctx, uint32_t key, const float* t) {
@@ -150,7 +166,35 @@ void record(void* ctx, uint32_t key, const float* t) {
 }
 
 uint64_t observer(void* ctx, uint32_t handle, const float* t, uint32_t flags) {
-    if (t) record(ctx, handle, t);
+    if (t) {
+        record(ctx, handle, t);
+
+        // Build 47: the write. record() above stored the ENGINE's intended
+        // position, so the marker keeps showing where the animation wanted
+        // the handle while the object (if this works) sits where we put it,
+        // which makes the divergence itself visible. The modified transform
+        // lives on our stack; the caller's buffer is never touched.
+        const LONG wh = g_w_handle;
+        const LONG ws = g_w_slot;
+        const bool hit =
+            wh ? ((handle & 0xFFFFFF) == (uint32_t)wh)
+               : (ws >= 0 && g_watch[ws].on && g_watch[ws].key == handle);
+        if (hit && (GetTickCount64() - g_w_tick) < 250) {
+            float mod[16];
+            memcpy(mod, t, sizeof(mod));
+            if (g_w_mode == 2) {
+                if (!g_w_ctrl_ok)
+                    return g_orig(ctx, handle, t, flags);  // no pose, no write
+                mod[12] = g_w_ctrl[0];
+                mod[13] = g_w_ctrl[1];
+                mod[14] = g_w_ctrl[2];
+            } else {
+                mod[14] += g_w_up;   // engine world is z-up
+            }
+            InterlockedIncrement(&g_w_count);
+            return g_orig(ctx, handle, mod, flags);
+        }
+    }
     return g_orig(ctx, handle, t, flags);
 }
 
@@ -343,6 +387,31 @@ void drain() {
             LOG_INFO("%s  (which colour sits ON the gun?)", leg);
     }
 
+    // Build 47: write status, once per second while armed. writes=0 with a
+    // live target means the setter never carried that handle this second,
+    // which is a measurement (the engine stopped placing it), not silence.
+    {
+        static const char* kCol[kWatch] = {"RED",     "GREEN", "YELLOW",
+                                           "MAGENTA", "CYAN",  "WHITE"};
+        const LONG wc = InterlockedExchange(&g_w_count, 0);
+        const LONG wh = g_w_handle;
+        const LONG ws = g_w_slot;
+        if (wh) {
+            LOG_INFO("wpw: WRITING h%06X (by handle) mode=%ld ctrl=%s "
+                     "writes=%ld this second",
+                     (unsigned)wh, (long)g_w_mode,
+                     g_w_ctrl_ok ? "ok" : "NONE", (long)wc);
+        } else if (ws >= 0 && ws < kWatch) {
+            LOG_INFO("wpw: WRITING %s (h%06X/t%02X) mode=%ld ctrl=%s "
+                     "writes=%ld this second",
+                     kCol[ws],
+                     g_watch[ws].on ? (g_watch[ws].key & 0xFFFFFF) : 0,
+                     g_watch[ws].on ? (g_watch[ws].key >> 24) : 0,
+                     (long)g_w_mode, g_w_ctrl_ok ? "ok" : "NONE",
+                     (long)wc);
+        }
+    }
+
     if (!cam_ok) {
         static bool said = false;
         if (!said) {
@@ -353,6 +422,22 @@ void drain() {
                      "the mode-0 gameplay camera has been seen once.");
         }
     }
+}
+
+void set_write(uint32_t handle, int slot, int mode, float up,
+               const float ctrl_world[3], bool ctrl_ok) {
+    if (ctrl_ok) {
+        g_w_ctrl[0] = ctrl_world[0];
+        g_w_ctrl[1] = ctrl_world[1];
+        g_w_ctrl[2] = ctrl_world[2];
+    }
+    InterlockedExchange(&g_w_ctrl_ok, ctrl_ok ? 1 : 0);
+    g_w_up   = up;
+    g_w_tick = GetTickCount64();
+    InterlockedExchange(&g_w_mode, (mode == 2) ? 2 : 1);
+    InterlockedExchange(&g_w_handle, (LONG)(handle & 0xFFFFFF));
+    InterlockedExchange(&g_w_slot,
+                        (slot >= 0 && slot < kWatch) ? slot : -1);
 }
 
 bool marker(int slot, float out_pos[3]) {

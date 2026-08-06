@@ -1,4 +1,5 @@
 #include "VRMirror.h"
+#include "AimTrace.h"
 #include "CameraProbe.h"
 #include "HeadPose.h"
 #include "Log.h"
@@ -92,6 +93,21 @@ float g_aim_zero[2]    = {0.0f, 0.0f};  // head-angle baseline (re-zeroed while
                                         // off or fov-gated: no snap on resume)
 float g_aim_out[2]     = {0.0f, 0.0f};  // armed, not yet observed consumed
 bool  g_aim_outf[2]    = {false, false};
+// Build 49 fix 2: recenter also RESYNCS the aim accounting. g_aim_cum
+// survives a recenter, so after one the compose faces base-minus-cum while
+// the character aims at base: the body runs off at exactly the accumulated
+// angle (tonight's log had 140 deg in cum) and recentering visibly "never
+// fixes it". Every head-reference recapture now sets this; aim_pump zeroes
+// the accounting and re-captures the baseline as soon as no injection is in
+// flight, which snaps view and body back into agreement.
+std::atomic<bool> g_aim_resync{false};
+// Build 49 fix 3: the stall kicker. The pump is PARASITIC (hazard 45): armed
+// deltas wait for the engine's own aim-setter calls, which stop while the
+// player is idle, so aim goes numb until the next shot. When a delta has
+// been pending too long, inject one alternating +-1-count mouse move (net
+// zero over pairs, ~0.03 deg momentary) purely to make the engine run its
+// aim path and consume. Rate-limited, foreground-gated like steer_aim.
+std::atomic<long> g_aim_kicks{0};       // lifetime, for the 1 Hz diag line
 
 // Build 23: the aim SOURCE. The pump is source-agnostic (it drives the
 // engine's absolute pair toward whatever target angles it is handed, and the
@@ -299,6 +315,30 @@ float g_wpm_tx[kWpm][2] = {};           // [slot][eye] tangent from centre
 float g_wpm_ty[kWpm][2] = {};
 float g_wpm_tr[kWpm][2] = {};
 ID3D11PixelShader* g_wpm_ps[kWpm] = {};
+// BUILD 47: the placement write test (WeaponProbe.h set_write). cfg-driven,
+// hot-reloaded, default OFF. slot picks the colour to write (0 RED 1 GREEN
+// 2 YELLOW 3 MAGENTA 4 CYAN 5 WHITE, -1 off and the kill switch); mode 1
+// lifts the handle wp_write_up metres straight up (the writability
+// diagnostic), mode 2 pins its position to the right controller. Parsed on
+// the init thread, read on the render thread; int/float tearing is not a
+// hazard here and the wp:: side re-clamps everything.
+int   g_wpw_slot = -1;
+int   g_wpw_mode = 1;
+float g_wpw_up   = 0.30f;
+// Build 48: direct handle targeting (hex, 0 = off / use the slot). Colour
+// slots proved to RESHUFFLE mid-session; the handle read off the wpm/wpw
+// log lines is the stable name for a target within a session.
+unsigned g_wpw_handle = 0;
+// Build 51: the per-shot aim override, degrees, held here so either cfg key
+// can be edited alone without the other resetting to zero.
+float g_shot_yaw_deg   = 0.0f;
+float g_shot_pitch_deg = 0.0f;
+// Build 52: override target RVAs, 0 = the build-pinned per-shot sites.
+unsigned g_shot_site_yaw   = 0;
+unsigned g_shot_site_pitch = 0;
+// Build 55: the aim orientation quaternion override.
+float g_aq_deg  = 0.0f;
+int   g_aq_axis = 2;
 bool  g_dot_on = false;       // this frame: draw it
 float g_dot_tx = 0.0f;        // tangent offsets from view center
 float g_dot_ty = 0.0f;
@@ -505,6 +545,11 @@ void load_config() {
         // instant kill switch).
         if (sscanf_s(line, " xinput_touch = %f", &v) == 1)
             xin::set_enabled(v > 0.0f);
+        // Build 49: 0 removes stick pitch (right stick Y) from the game
+        // entirely, so the head is the only thing that can pitch the view.
+        // Flip to 1 for aircraft until the on-foot gate exists.
+        if (sscanf_s(line, " stick_pitch = %f", &v) == 1)
+            xin::set_stick_pitch(v > 0.0f);
         // Build 23: what the VR aim toggle drives. 0 = head (build 19),
         // 1 = right controller ray (hip-fire, the default).
         if (sscanf_s(line, " aim_source = %f", &v) == 1)
@@ -516,6 +561,24 @@ void load_config() {
         // Build 45: weapon-candidate markers. 0 hides them (hot-reload).
         if (sscanf_s(line, " wp_markers = %f", &v) == 1)
             g_wpm_enable = v > 0.0f;
+        // Build 47: the placement write test. Defaults keep it OFF.
+        if (sscanf_s(line, " wp_write_slot = %f", &v) == 1) {
+            int s = (int)v;
+            g_wpw_slot = (s >= 0 && s < kWpm) ? s : -1;
+        }
+        if (sscanf_s(line, " wp_write_mode = %f", &v) == 1)
+            g_wpw_mode = (v >= 1.5f) ? 2 : 1;
+        // Build 48: hex handle, read off the wpm:/wpw: log lines. 0 = off.
+        {
+            unsigned h = 0;
+            if (sscanf_s(line, " wp_write_handle = %x", &h) == 1)
+                g_wpw_handle = h & 0xFFFFFF;
+        }
+        if (sscanf_s(line, " wp_write_up = %f", &v) == 1) {
+            if (v < -1.0f) v = -1.0f;
+            if (v >  1.0f) v =  1.0f;
+            g_wpw_up = v;
+        }
         if (sscanf_s(line, " aim_ctrl_smooth = %f", &v) == 1) {
             if (v < 0.05f) v = 0.05f;
             if (v > 1.0f)  v = 1.0f;
@@ -524,8 +587,65 @@ void load_config() {
         // Build 24: the controller-aim reticle dot. 0 hides it.
         if (sscanf_s(line, " aim_reticle = %f", &v) == 1)
             g_dot_enable = v > 0.0f;
+        // Build 50: print the aim-reader census (AimTrace.h). Log-only either
+        // way; this key controls the log line, not the recording, so arming it
+        // mid-session shows the whole run rather than starting from zero.
+        if (sscanf_s(line, " aim_trace = %f", &v) == 1)
+            aimtrace::set_logging(v > 0.0f);
+        // Build 51: the per-shot aim override, in DEGREES, applied only to
+        // what the shot reader sees. 0 disarms. Clamped hard: this is a test
+        // lever, and a large angle would just send rounds into the scenery.
+        if (sscanf_s(line, " aim_shot_yaw_deg = %f", &v) == 1) {
+            if (v < -45.0f) v = -45.0f;
+            if (v >  45.0f) v =  45.0f;
+            g_shot_yaw_deg = v;
+            aimtrace::set_shot_offset(g_shot_yaw_deg * 0.01745329f,
+                                      g_shot_pitch_deg * 0.01745329f);
+        }
+        // Alternate the sign every round: the readable test with no crosshair.
+        if (sscanf_s(line, " aim_shot_alternate = %f", &v) == 1)
+            aimtrace::set_shot_alternate(v > 0.0f);
+        // Build 56: rotate the BULLET's own direction at spawn. Degrees.
+        if (sscanf_s(line, " bullet_yaw_deg = %f", &v) == 1) {
+            if (v < -90.0f) v = -90.0f;
+            if (v >  90.0f) v =  90.0f;
+            aimtrace::set_bullet_yaw(v);
+        }
+        // Build 55: rotate the engine's own aim quaternion. Degrees, 0 off.
+        if (sscanf_s(line, " aim_quat_deg = %f", &v) == 1) {
+            if (v < -90.0f) v = -90.0f;
+            if (v >  90.0f) v =  90.0f;
+            g_aq_deg = v;
+            aimtrace::set_aim_quat(g_aq_deg, g_aq_axis);
+        }
+        if (sscanf_s(line, " aim_quat_axis = %f", &v) == 1) {
+            g_aq_axis = (int)v;
+            aimtrace::set_aim_quat(g_aq_deg, g_aq_axis);
+        }
+        // Build 52: retarget the override (hex RVA, 0 = the per-shot sites).
+        // The control test points it at a read the engine demonstrably acts
+        // on, which is what tells "no effect" apart from "no write".
+        {
+            unsigned r = 0;
+            if (sscanf_s(line, " aim_shot_site_yaw = %x", &r) == 1)
+                g_shot_site_yaw = r;
+            if (sscanf_s(line, " aim_shot_site_pitch = %x", &r) == 1)
+                g_shot_site_pitch = r;
+        }
+        if (sscanf_s(line, " aim_shot_pitch_deg = %f", &v) == 1) {
+            if (v < -45.0f) v = -45.0f;
+            if (v >  45.0f) v =  45.0f;
+            g_shot_pitch_deg = v;
+            aimtrace::set_shot_offset(g_shot_yaw_deg * 0.01745329f,
+                                      g_shot_pitch_deg * 0.01745329f);
+        }
     }
     fclose(f);
+    // Applied after the whole file is parsed, so the site keys and the angle
+    // keys take effect together regardless of the order they appear in.
+    aimtrace::set_shot_sites(g_shot_site_yaw, g_shot_site_pitch);
+    aimtrace::set_shot_offset(g_shot_yaw_deg * 0.01745329f,
+                              g_shot_pitch_deg * 0.01745329f);
     g_ipd_default = headpose::ipd_scale();
     LOG_INFO("VR: grwxr.cfg read, ipd_scale = %.2f, mono_scope_fov = %.2f rad",
              headpose::ipd_scale(), headpose::mono_scope_fov());
@@ -624,6 +744,28 @@ float wrap_pi(float a) {
 
 // Once per present, right after the head rotation is computed. axis 0 = yaw,
 // 1 = pitch, both geometric radians in the game basis.
+// Build 49 fix 3: one alternating-sign 1-count mouse move, at most one per
+// 80 ms, only while the game owns the foreground. Its sole purpose is to
+// wake the engine's aim path so a pending injection gets consumed.
+void kick_engine_aim() {
+    static ULONGLONG s_last = 0;
+    static int       s_sign = 1;
+    const ULONGLONG now = GetTickCount64();
+    if (now - s_last < 80) return;
+    HWND  fg  = GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &pid);
+    if (pid != GetCurrentProcessId()) return;
+    INPUT in{};
+    in.type       = INPUT_MOUSE;
+    in.mi.dx      = s_sign;
+    in.mi.dwFlags = MOUSEEVENTF_MOVE;
+    SendInput(1, &in, sizeof(in));
+    s_sign  = -s_sign;
+    s_last  = now;
+    g_aim_kicks.fetch_add(1, std::memory_order_relaxed);
+}
+
 void aim_pump(float head_yaw, float head_pitch) {
     const float head[2] = {head_yaw, head_pitch};
     // Injection pauses below the world fov band (ADS and optics, hazard 25
@@ -632,6 +774,42 @@ void aim_pump(float head_yaw, float head_pitch) {
     // engine has it, tracking head MOVEMENT from that moment on.
     const bool live = g_vraim_on &&
                       headpose::read_fov(0.7853982f) >= 0.65f;
+
+    // Build 49 fix 2: complete a pending recenter resync. New injections
+    // pause until it lands; the kicker unblocks a parasitic stall so this
+    // cannot hang on an idle engine.
+    if (g_aim_resync.load(std::memory_order_relaxed)) {
+        bool busy = false;
+        for (int a = 0; a < 2; ++a) {
+            if (camera::aim_pending(a)) { busy = true; continue; }
+            g_aim_outf[a] = false;   // its accounting dies with the reset
+        }
+        if (busy) {
+            if (live) kick_engine_aim();
+            return;
+        }
+        g_aim_cum[0] = g_aim_cum[1] = 0.0f;
+        headpose::set_aim_cum(0.0f, 0.0f);
+        g_aim_zero[0] = head[0];
+        g_aim_zero[1] = head[1];
+        g_aim_resync.store(false, std::memory_order_relaxed);
+        note("aim: RESYNC complete (recenter): accounting zeroed, view and "
+             "body re-agree from here.");
+        return;
+    }
+
+    // Build 49 fix 3: a delta pending longer than 300 ms means the engine is
+    // idle and not consuming (hazard 45, "aim only worked while shooting").
+    // Kick it awake.
+    if (live) {
+        static ULONGLONG s_pend_since = 0;
+        const bool pending =
+            camera::aim_pending(0) || camera::aim_pending(1);
+        const ULONGLONG now = GetTickCount64();
+        if (!pending)             s_pend_since = 0;
+        else if (!s_pend_since)   s_pend_since = now;
+        else if (now - s_pend_since > 300) kick_engine_aim();
+    }
     for (int a = 0; a < 2; ++a) {
         if (camera::aim_pending(a)) continue;   // still queued for the engine
         if (g_aim_outf[a]) {
@@ -990,6 +1168,44 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
                     g_wpm_on[i] = any;
                 }
             }
+        }
+
+        // BUILD 47: push the write target and the right controller's
+        // ENGINE-WORLD position to wp:: once per frame. World position =
+        // camera base + the same head-local offset the hand markers verified
+        // in the headset (build 42), mapped onto the game basis (base_frame:
+        // row 0 right, row 1 forward, row 2 up). The offset is clamped to
+        // 2 m from the camera (skeleton rule 5: every controller-driven
+        // transform gets a clamp before it reaches the game). When the
+        // target slot is -1 the push still happens so wp:: sees the OFF
+        // immediately, and a dead controller pushes ctrl_ok=false, which
+        // mode 2 treats as "no write this call".
+        {
+            float cw[3] = {};
+            bool  cok   = false;
+            float Rw[9], Cw[3];
+            if ((g_wpw_handle || g_wpw_slot >= 0) && g_head_pos_ok &&
+                g_in_track[1].load(std::memory_order_relaxed) &&
+                camera::base_frame(Rw, Cw)) {
+                const float rel[3] = {
+                    g_in_pos[1][0].load(std::memory_order_relaxed) - g_head_pos[0],
+                    g_in_pos[1][1].load(std::memory_order_relaxed) - g_head_pos[1],
+                    g_in_pos[1][2].load(std::memory_order_relaxed) - g_head_pos[2]};
+                float lv[3];
+                quat_rotate_inv(q, rel, lv);   // +x right, +y up, -z forward
+                float lx = lv[0], lf = -lv[2], lu = lv[1];
+                const float m2 = lx * lx + lf * lf + lu * lu;
+                if (m2 > 4.0f) {
+                    const float s = 2.0f / sqrtf(m2);
+                    lx *= s; lf *= s; lu *= s;
+                }
+                cw[0] = Cw[0] + lx * Rw[0] + lf * Rw[3] + lu * Rw[6];
+                cw[1] = Cw[1] + lx * Rw[1] + lf * Rw[4] + lu * Rw[7];
+                cw[2] = Cw[2] + lx * Rw[2] + lf * Rw[5] + lu * Rw[8];
+                cok = true;
+            }
+            wp::set_write(g_wpw_handle, g_wpw_slot, g_wpw_mode, g_wpw_up,
+                          cw, cok);
         }
     }
 
@@ -2051,6 +2267,7 @@ void on_present(const d3d11::State& st) {
                     XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                 if (XR_SUCCEEDED(xrBeginSession(g_session, &sbi))) {
                     g_have_ref = false;
+                    g_aim_resync.store(true, std::memory_order_relaxed);
                     // Build 10a: the pre-doff eye images and poses are stale
                     // in every sense; bootstrap both eyes afresh.
                     g_eye[0].valid = false;
@@ -2070,6 +2287,7 @@ void on_present(const d3d11::State& st) {
             // Both the yaw reference and the stored per-eye poses are in the
             // old space; recapture everything.
             g_have_ref = false;
+            g_aim_resync.store(true, std::memory_order_relaxed);
             g_eye[0].valid = false;
             g_eye[1].valid = false;
             note("VR: runtime recenter. Head reference will re-capture.");
@@ -2088,6 +2306,7 @@ void on_present(const d3d11::State& st) {
         const bool down = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
         if (down && !s_was_down) {
             g_have_ref = false;
+            g_aim_resync.store(true, std::memory_order_relaxed);
             note("VR: recenter requested (Home). Head reference will re-capture.");
         }
         s_was_down = down;
@@ -2118,6 +2337,7 @@ void on_present(const d3d11::State& st) {
             // enter first person, looking where you are actually looking, so
             // that doubt cannot re-enter. Home still recenters on its own.
             g_have_ref = false;
+            g_aim_resync.store(true, std::memory_order_relaxed);
             note("VR: first person %s, and RECENTERED (the head reference "
                  "re-captures from where you are looking now).",
                  on ? "ON" : "OFF");
@@ -2638,7 +2858,7 @@ void drain_input() {
     // controller-vs-head offsets (only updated while the trigger is held);
     // dx/dy are total injected mouse counts.
     if (g_steer_on.load(std::memory_order_relaxed)) {
-        LOG_INFO("aim: steer armed, last yaw %+.1f pitch %+.1f deg, injected %llu presents dx=%lld dy=%lld | ads %s, %u holds | fire %s, %u pulls",
+        LOG_INFO("aim: steer armed, last yaw %+.1f pitch %+.1f deg, injected %llu presents dx=%lld dy=%lld | ads %s, %u holds | fire %s, %u pulls | kicks=%ld",
                  g_steer_yaw_last.load(std::memory_order_relaxed),
                  g_steer_pitch_last.load(std::memory_order_relaxed),
                  (unsigned long long)g_steer_ticks.load(std::memory_order_relaxed),
@@ -2647,7 +2867,8 @@ void drain_input() {
                  g_ads_rmb.load(std::memory_order_relaxed) ? "HELD" : "idle",
                  g_ads_holds.load(std::memory_order_relaxed),
                  g_fire_lmb.load(std::memory_order_relaxed) ? "HELD" : "idle",
-                 g_fire_pulls.load(std::memory_order_relaxed));
+                 g_fire_pulls.load(std::memory_order_relaxed),
+                 g_aim_kicks.load(std::memory_order_relaxed));
     }
 }
 

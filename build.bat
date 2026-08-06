@@ -34,6 +34,7 @@ cl /nologo /std:c++20 /EHsc /O2 /W4 /MT /DNDEBUG /LD /I tools\xr_probe\extern\in
    src\dllmain.cpp src\Log.cpp src\D3D11Hook.cpp src\Crash.cpp src\VRMirror.cpp src\AnselProbe.cpp ^
    src\Sig.cpp src\ThunkHook.cpp src\CameraProbe.cpp src\HeadPose.cpp src\FactoryHook.cpp src\XInputMerge.cpp ^
    src\RenderDocCapture.cpp src\PaletteProbe.cpp src\DrawHook.cpp src\WeaponProbe.cpp src\GameBuild.cpp ^
+   src\AimTrace.cpp ^
    build\ProbeStub.obj ^
    /link /DLL /LIBPATH:tools\xr_probe\extern\lib openxr_loader.lib /OUT:build\dxgi.dll
 

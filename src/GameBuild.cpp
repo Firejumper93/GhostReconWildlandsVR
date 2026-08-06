@@ -31,6 +31,12 @@ constexpr Build kSteam = {
      {0x018BE500, 0x0DC4F9B0},    // HIK datablock reader
      {0x02713160, 0x114A6DE0}},   // cPlayerComponent::OnInit callee
     0x006777C0, 0x005FA190,       // setyaw, setpitch stubs
+    0x006764B0, 0x00677600,       // getyaw, getpitch stubs
+    0x124B855D, 0x124B85A1,       // per-shot aim read sites (build 50 census)
+    0x029AB510, 0x124B8360,       // weapon per-frame update thunk + impl
+    0x030B08E0, 0x13E68070,       // hknpWorld::castRay thunk + impl
+    0x029A8E80, 0x124B0770,       // GetAimOrientation thunk + impl
+    0x02986B20, 0x12458BD0,       // ballistic projectile spawn thunk + impl
     0x04A66410, 0x029DC7D0, 0x12582AC0,
     0x124DE4CC,
     0x030AC6A0, 0x13E5EA30,
@@ -51,6 +57,12 @@ constexpr Build kStore = {
      {0x018BE060, 0x0F3B0DA0},    // HIK datablock reader
      {0x02712FC0, 0x1310A3A0}},   // cPlayerComponent::OnInit callee
     0x006772B0, 0x005F9E90,       // setyaw, setpitch stubs
+    0x00675FA0, 0x006770F0,       // getyaw, getpitch stubs
+    0, 0,                         // per-shot aim sites NOT derived here yet
+    0, 0,                         // weapon update routine NOT derived here
+    0, 0,                         // hknpWorld::castRay NOT derived here
+    0, 0,                         // GetAimOrientation NOT derived here
+    0, 0,                         // projectile spawn NOT derived here
     0x04A66410, 0x029DC5A0, 0x13EA7F80,
     0x13E464AC,
     0x030AC4F0, 0x152E3E70,

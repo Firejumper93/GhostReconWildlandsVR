@@ -37,6 +37,7 @@
 #include "RenderDocCapture.h"
 #include "PaletteProbe.h"
 #include "WeaponProbe.h"
+#include "AimTrace.h"
 
 // Forward every export of the real dxgi.dll to dxgi_real.dll.
 // deploy.bat places a copy of C:\Windows\System32\dxgi.dll as dxgi_real.dll
@@ -187,6 +188,15 @@ DWORD WINAPI init_thread(LPVOID) {
     LOG_INFO("build 39: installing the weapon placement observer");
     grwxr::wp::install();
 
+    // Build 50: the aim-reader census. LOG-ONLY, and the route to making the
+    // SHOT follow the controller: it records which engine code reads the
+    // player's absolute aim angle, and which of those reads happen inside a
+    // trigger pull. Installed after the setters (CameraProbe) because it uses
+    // their latched player-object pointer as its filter.
+    LOG_INFO("");
+    LOG_INFO("build 50: installing the aim-reader census (log-only)");
+    grwxr::aimtrace::install();
+
     LOG_INFO("phase 2: installing D3D11 Present hook");
     if (!grwxr::d3d11::install()) {
         LOG_WARN("phase 2 hook NOT installed. Game continues unmodified (rule 7).");
@@ -213,6 +223,7 @@ DWORD WINAPI init_thread(LPVOID) {
         grwxr::camera::drain();
         grwxr::factory::drain();
         grwxr::wp::drain();
+        grwxr::aimtrace::drain();
 
         // Bring OpenXR up once the device exists, on OUR thread, not the render
         // thread. Session creation is slow and allocates; it must not happen

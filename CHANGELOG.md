@@ -5,6 +5,47 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
+## v0.6.1-alpha (builds 47-57, 2026-08-06, PACKAGED RELEASE)
+
+The headline is the camera. If you tried an earlier alpha and the view flipped over
+when you looked up, or your character always seemed to drift left no matter how
+often you recentred, both of those are fixed here and both were real bugs rather
+than tuning problems.
+
+### Fixed
+
+- **The view no longer inverts when you look up or down** (build 49, confirmed in
+  the headset). The right stick's up/down axis was pitching the engine camera
+  *underneath* the pitch coming from your head, and past vertical the two summed
+  and flipped the world over. The stick's vertical axis is now removed entirely, so
+  **your head is the only thing that pitches the view**. New config key
+  `stick_pitch`; set it to 1 temporarily if you want stick pitch back for aircraft.
+- **Recentring now actually fixes the drift** (build 49, confirmed in the headset).
+  The mod tracks how much aim it has fed the engine, and that running total used to
+  survive a recentre. The result was that after every recentre your view faced one
+  way while your character aimed another, by exactly the accumulated angle (140
+  degrees in one recorded session). That is the whole explanation for "it runs
+  slightly left and recentring never helps". Every recentre now resynchronises the
+  accounting, so view and body agree immediately.
+- **Aim keeps following your head while you stand still** (build 49). The aim
+  injection was parasitic: it waited for the engine's own aim updates, which stop
+  when you are idle, so aim appeared to work only while you were moving or
+  shooting. A small nudge now keeps that path alive when a correction is pending.
+
+### Changed
+
+- The shipped configuration now defaults `stick_pitch` to 0 (head-only pitch) and
+  ships a new `aim_probes` key defaulting to 0.
+
+### Internal
+
+- Extensive reverse-engineering work on where the game decides a shot's direction,
+  aimed at eventually making the weapon follow your motion controller rather than
+  your head. **None of it changes how the mod plays**: the research hooks are
+  disabled unless `aim_probes=1` is set, because they attach to some of the
+  engine's busiest functions and their cost has not been measured. Leaving that key
+  at 0, which is the default, means none of them are installed at all.
+
 ## v0.6.0-alpha (builds 39-46, 2026-08-05, PACKAGED RELEASE)
 
 ### Added

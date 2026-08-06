@@ -21,7 +21,7 @@ hardcodes for the pinned Steam binary. Nothing is transferred numerically:
           from the import directory.
 
 Every row prints its hit count. Anything that is not exactly-one is a MISS
-to resolve by hand, never a guess (project RE rule 2).
+to resolve by hand, never a guess (the project rules RE rule 2).
 
 Usage:
     python tools/store_port.py <steam-exe> <store-exe>

@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "XInputMerge.h"
+#include "AimTrace.h"
 #include "HeadPose.h"
 #include "Log.h"
 
@@ -35,6 +36,16 @@ constexpr DWORD kSuccess      = 0;      // ERROR_SUCCESS
 constexpr DWORD kNotConnected = 1167;   // ERROR_DEVICE_NOT_CONNECTED
 
 std::atomic<bool> g_enabled{true};      // cfg xinput_touch, default on
+// Build 49: cfg stick_pitch. 0 removes the right stick's Y axis from what
+// the game sees (Touch AND physical pad), so nothing but the head can pitch
+// the camera: stick pitch stacked under the composed head pitch and the two
+// could sum past vertical (the user's inversion). Default 1 = unchanged.
+std::atomic<bool> g_stick_pitch{true};
+// Build 50: half a pull. Above this the right trigger counts as a shot window
+// for the aim-reader census. Deliberately well above XInput's own "pressed"
+// threshold of 30, so a finger resting on the trigger does not mark every
+// frame as firing.
+constexpr uint8_t kFireGate = 128;
 bool              g_installed = false;
 void**            g_slot = nullptr;
 PFN_GetState      g_orig = nullptr;
@@ -89,8 +100,14 @@ DWORD WINAPI hook_GetState(DWORD idx, State* st) {
         // supply one. Report a CONNECTED pad with neutral state until Touch
         // comes up, so the game keeps polling and simply reads no input.
         // A real pad's state is passed through untouched.
-        if (r == kSuccess) return r;          // physical pad: never interfere
+        if (r == kSuccess) {                  // physical pad: pass through,
+            if (!g_stick_pitch.load(std::memory_order_relaxed))
+                st->Gamepad.sThumbRY = 0;     // minus stick pitch (build 49)
+            aimtrace::set_firing(st->Gamepad.bRightTrigger > kFireGate);
+            return r;
+        }
         memset(st, 0, sizeof(*st));
+        aimtrace::set_firing(false);
         st->dwPacketNumber = g_pkt.fetch_add(1, std::memory_order_relaxed) + 1;
         g_placeheld.fetch_add(1, std::memory_order_relaxed);
         return kSuccess;
@@ -118,6 +135,15 @@ DWORD WINAPI hook_GetState(DWORD idx, State* st) {
         const int b = *dst[i] < 0 ? -*dst[i] : *dst[i];
         if (a > b) *dst[i] = s[i];
     }
+    // Build 49: stick pitch removal, after the merge so it covers both
+    // sources. The zero is unconditional while the key is 0; menus in this
+    // game navigate on the left stick and dpad, and the cfg is hot-reloaded
+    // for vehicles that need pitch back.
+    if (!g_stick_pitch.load(std::memory_order_relaxed))
+        st->Gamepad.sThumbRY = 0;
+    // Build 50: publish the shot window to the aim-reader census, from the
+    // merged value the GAME sees, so Touch and a physical pad both mark it.
+    aimtrace::set_firing(st->Gamepad.bRightTrigger > kFireGate);
     // Monotonic packet number. The pad object keeps its own previous/current
     // flag arrays per poll, so "changed every poll" costs nothing.
     st->dwPacketNumber = g_pkt.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -232,6 +258,10 @@ void drain() {
 
 void set_enabled(bool on) {
     g_enabled.store(on, std::memory_order_relaxed);
+}
+
+void set_stick_pitch(bool on) {
+    g_stick_pitch.store(on, std::memory_order_relaxed);
 }
 
 bool merging_live() {

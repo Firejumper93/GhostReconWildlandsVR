@@ -27,6 +27,10 @@ void drain();
 // cfg key xinput_touch. Disabled = the detour passes through untouched.
 void set_enabled(bool on);
 
+// cfg key stick_pitch (build 49). Off = the right stick's Y axis is zeroed
+// in every pad state the game sees, so the head is the only pitch source.
+void set_stick_pitch(bool on);
+
 // True when the detour is installed, enabled, and Touch state is live.
 // VRMirror uses it to suppress the older mouse-synthesis paths (steer, ADS,
 // fire) so the game's input scheme does not flap between mouse and pad.

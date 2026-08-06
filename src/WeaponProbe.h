@@ -46,5 +46,24 @@ void drain();
 constexpr int kWatch = 6;
 bool marker(int slot, float out_pos[3]);
 
+// Build 47: the placement WRITE test. The headset run of 2026-08-05 identified
+// the watched handles as BODY ATTACHMENT SOCKETS (MAGENTA stayed on the hand
+// through a full holster and idle animation), so the experiment is: rewrite
+// one handle's transform argument inside the setter call and observe what
+// moves (the gun, the hand, both, or nothing). VRMirror pushes the target
+// once per frame from cfg (hot-reloaded, so wp_write_slot=-1 is the instant
+// kill switch):
+//   handle 24-bit placement handle to write, 0 = use slot instead. Build 48:
+//          colour slots RESHUFFLE mid-session (observed 2026-08-05, it made
+//          the user write a different handle than intended), so the log-read
+//          handle is the reliable way to name a target.
+//   slot  -1 off, else the watch-slot/colour index to write
+//   mode  1 = lift the handle `up` metres straight up (writability diagnostic)
+//         2 = pin the handle's position to the right controller (engine world)
+// Rotation is never touched in either mode; position row only. The push
+// carries a tick so a stalled render thread stops the write within 250 ms.
+void set_write(uint32_t handle, int slot, int mode, float up,
+               const float ctrl_world[3], bool ctrl_ok);
+
 }  // namespace wp
 }  // namespace grwxr

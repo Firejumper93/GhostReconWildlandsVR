@@ -32,6 +32,15 @@ than tuning problems.
   when you are idle, so aim appeared to work only while you were moving or
   shooting. A small nudge now keeps that path alive when a correction is pending.
 
+- **The most common installation failure now names itself.** If the mod's files are
+  copied into the game folder by hand instead of running `install.bat`, the game
+  crashes seconds after launch with nothing useful logged: the installer is what
+  creates `dxgi_real.dll`, and every function in the mod forwards to that file, so
+  without it the first graphics call dies inside Windows. The mod used to report
+  that state as normal. It now detects the missing file and says so loudly at the
+  top of the log. `INSTALL.txt` also warns that a game under Program Files needs the
+  installer run as administrator, or Windows silently refuses the copy.
+
 ### Changed
 
 - The shipped configuration now defaults `stick_pitch` to 0 (head-only pitch) and

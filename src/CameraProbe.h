@@ -81,6 +81,20 @@ bool base_pos(float out[3]);
 // tolerate that.
 bool base_frame(float rot[9], float pos[3]);
 
+// Build 64: weapon-skeleton identifier. set_wskel arms the 1 Hz census and
+// candidate pick on the drain thread (cfg wskel, hot-reload); off clears the
+// pick. wskel_marker returns the picked weapon-skeleton instance's live
+// world position (guarded per-frame re-read, so the marker tracks the gun);
+// false while disarmed or between valid picks.
+void set_wskel(bool on);
+bool wskel_marker(float out[3]);
+
+// Build 65: the weapon-skeleton write test (cfg wskel_write). While on and
+// the pick is a DRAWN gun, the skeleton recorder adds +0.30 m of height to
+// the instance origin and its copy each update, hard-capped; a rising edge
+// resets the cap. Requires wskel on for the pick to exist.
+void set_wskel_write(bool on);
+
 // Build 18: while on, the SetHidden detour forces the head-visibility
 // component hidden on every engine call (the engine re-asserts visibility
 // every update, so this must be a standing override, not a one-shot). Driven

@@ -57,6 +57,12 @@ uint64_t grwxr_ray_orig = 0;
 void grwxr_ray_entry();
 void grwxr_ray_record(uint64_t ret_addr, const float* ray);
 
+// Build 58: TtCastRay, the raycast body behind the wrapper's virtual call,
+// hooked at its own thunk. Shares grwxr_ray_record, so its callers land in
+// the same census and shot window as the wrapper's.
+uint64_t grwxr_ray2_orig = 0;
+void grwxr_ray2_entry();
+
 // Build 55: GetAimOrientation (see ProbeStub.asm). post() rotates the
 // quaternion the engine just produced, in the caller's own buffer.
 uint64_t grwxr_aimq_orig = 0;
@@ -67,7 +73,7 @@ void grwxr_aimq_post(float* q, uint64_t ret_addr);
 uint64_t grwxr_spawn_orig = 0;
 void grwxr_spawn_entry();
 void grwxr_spawn_pre(void* owner);
-void grwxr_spawn_post(void* owner);
+void grwxr_spawn_post(void* owner, void* proj);
 }
 
 namespace grwxr {
@@ -159,6 +165,8 @@ volatile uint32_t g_wf_f1     = 0;   // last float argument, bits
 // so 12 rows is generous. Each row keeps the last ray input it saw, which is
 // how we read the origin and direction once the shot's caller is identified.
 hook::ThunkHook g_ray_hook;
+// Build 58: the direct-entry thunk to the same raycast machinery.
+hook::ThunkHook g_ray2_hook;
 constexpr int kMaxRay = 12;
 struct RayRow {
     uint32_t rva;
@@ -215,10 +223,14 @@ volatile uint32_t g_sp_didwrite = 0;
 //
 // The build 54 census could not see that because it only had lifetime totals,
 // and the ambient traffic (wheels, AI sight) is in the tens of thousands. So
-// keep a small ring of recent caller RVAs, mark the ring position at every
+// keep a ring of recent caller RVAs, mark the ring position at every
 // projectile spawn, and count what happened either side of that mark. A
 // shot-specific caller spikes in the window; ambient traffic does not.
-constexpr int kRing = 256;
+// The ring must outlive the 2 s drain interval that harvests it: gameplay
+// runs ~2700 casts/s (measured, first live run), so 256 entries wrapped ~20x
+// before every harvest and the wrap guard discarded every window. 16384
+// covers ~6 s at that rate for 64 KB, and the hot path stays two stores.
+constexpr int kRing = 16384;
 volatile uint32_t g_ring[kRing] = {};
 volatile uint32_t g_ring_idx = 0;
 // Per-caller tallies inside the windows, accumulated over every shot.
@@ -228,6 +240,47 @@ volatile uint64_t g_win_after[kMaxRay] = {};
 volatile int      g_win_count = 0;
 volatile uint32_t g_pending_mark = 0;   // ring index captured at the last shot
 volatile uint32_t g_pending_live = 0;
+
+// Build 59: THE PROJECTILE FLIGHT RECORDER. Builds 57/58 closed every
+// reachable raycast ENTRY point without finding a shot-correlated caller, so
+// stop hunting the caster and watch the projectile itself: copy the whole
+// 0x180-byte cBallisticProjectileComponent once per frame while the round
+// flies, then diff the frames on the drain thread. Every field the engine
+// updates during flight identifies itself, wherever it lives, including the
+// hypothesised segment pair the reflection tables place SOMEWHERE runtime.
+// The instance pointer is the spawn's own return value, validated by
+// checking its +0x50 (m_vBulletShootOrigin) against the origin the spawn
+// verifiably copies there; a mismatch counts a reject and arms nothing.
+constexpr int kTrkFrames = 48;          // 2/3 s at 72 Hz, ~300-430 m of flight
+constexpr int kTrkBytes  = 0x180;
+volatile uintptr_t g_trk_proj  = 0;     // instance being traced
+volatile uint32_t  g_trk_live  = 0;     // game thread is sampling
+volatile uint32_t  g_trk_n     = 0;     // frames captured so far
+volatile uint32_t  g_trk_fault = 0;     // trace ended by a read fault
+volatile uint32_t  g_trk_died  = 0;     // trace ended by the liveness check
+volatile uint32_t  g_trk_ready = 0;     // complete, drain may print
+volatile uint64_t  g_trk_rej   = 0;     // spawn results that failed +0x50
+volatile uint64_t  g_trk_steer = 0;     // build 61: in-flight position pushes
+uint8_t g_trk_buf[kTrkFrames][kTrkBytes];
+
+// Build 62: THE CONTROLLER RAY. The published ray (world space, unit) and
+// the per-flight relocation state. The flight is relocated onto
+//   pos = ray_origin + ray_dir * dist + dev
+// where dist accumulates the ENGINE's own per-frame step length and dev
+// accumulates the engine's own deviation from a straight line (drop), so
+// ballistics stay the engine's and only the line is ours.
+volatile float    g_cr_dir[3] = {0, 0, 0};   // published by VRMirror
+volatile uint32_t g_cr_ok     = 0;
+volatile uint32_t g_cr_armed  = 0;           // cfg bullet_ctrl
+volatile uint32_t g_fly_on    = 0;           // this flight is being relocated
+volatile float    g_fly_org[3]   = {};       // ray origin = spawn origin
+volatile float    g_fly_dir[3]   = {};       // ray direction (snapshot at spawn)
+volatile float    g_fly_spdir[3] = {};       // engine spawn dir (for dev calc)
+volatile float    g_fly_dist     = 0;        // metres travelled along the ray
+volatile float    g_fly_dev[3]   = {};       // engine deviation accum (drop)
+volatile float    g_fly_last[3]  = {};       // last position we wrote
+volatile uint64_t g_fly_shots  = 0;          // rounds relocated
+volatile uint64_t g_fly_denied = 0;          // armed but no usable ray
 
 bool g_logging = false;
 
@@ -342,6 +395,110 @@ extern "C" void grwxr_wfire_record(uint64_t ret_addr, uint64_t self,
     g_wf_self  = self;
     g_wf_ctx   = ctx;
     g_wf_f1    = f1bits;
+    // Build 59: the flight recorder rides this per-frame call. One guarded
+    // 0x180-byte copy per frame while a traced round is in flight, nothing
+    // when idle (rule 8). The instance can be freed on impact mid-trace; a
+    // fault just ends the trace early and is itself a lifetime data point.
+    if (g_trk_live) {
+        const uint32_t fn = g_trk_n;
+        if (fn >= (uint32_t)kTrkFrames) {
+            g_trk_live = 0; g_trk_ready = 1;
+        } else {
+            const uint8_t* src = (const uint8_t*)g_trk_proj;
+            uint8_t* dst = g_trk_buf[fn];
+            __try {
+                // Liveness first: the shoot origin at +0x50 is constant for
+                // the whole flight, so a mismatch means the pool recycled
+                // this instance and it now belongs to someone else. Reading
+                // recycled memory only wastes a trace; WRITING it would
+                // corrupt an unrelated live object, so this check gates the
+                // build 60 steer below, not just the recording.
+                const float* org = (const float*)(src + 0x50);
+                if (org[0] != g_sp_org[0] || org[1] != g_sp_org[1] ||
+                    org[2] != g_sp_org[2]) {
+                    g_trk_died = 1; g_trk_live = 0; g_trk_ready = 1;
+                } else {
+                    for (int k = 0; k < kTrkBytes; ++k) dst[k] = src[k];
+                    g_trk_n = fn + 1;
+                    // Build 60: the spawn-time turn is discarded by the
+                    // engine's first flight tick (proved by the build 59
+                    // armed run: +0x100 read unrotated on frame 0 of every
+                    // trace). So when the yaw override is armed, re-apply
+                    // it HERE, every frame, to the live instance. The copy
+                    // above happens first, so the trace records what the
+                    // engine had, and the next frame's copy shows whether
+                    // our write survived its tick or was overwritten again.
+                    // Build 62: relocate the round onto the controller ray.
+                    // Position writes are AUTHORITATIVE and FEED BACK into
+                    // the engine's next integration step (build 61: a 1 m
+                    // per-frame push produced a CURVE, not a parallel
+                    // line). So each frame: measure the engine's own step
+                    // since our last write, bank its length into dist and
+                    // its off-axis part (drop) into dev, then snap the
+                    // round back onto the ray at the new distance.
+                    if (g_fly_on) {
+                        uint8_t* p = (uint8_t*)g_trk_proj;
+                        float* pos  = (float*)(p + 0x0B0);
+                        float* pos2 = (float*)(p + 0x0F0);
+                        float* seg  = (float*)(p + 0x0C0);
+                        const float st[3] = {pos[0] - g_fly_last[0],
+                                             pos[1] - g_fly_last[1],
+                                             pos[2] - g_fly_last[2]};
+                        const float sl = sqrtf(st[0] * st[0] + st[1] * st[1] +
+                                               st[2] * st[2]);
+                        if (sl > 0.0f && sl < 50.0f) {   // sane step only
+                            // Build 63: the partner point at +0x0C0 keeps
+                            // its own path (build 61 trace: its gap to the
+                            // head grew under our pushes) and the user saw
+                            // damage stay on the ENGINE trajectory while
+                            // the tracer followed the ray. So relocate it
+                            // too, preserving its distance behind the head
+                            // measured from the ENGINE's own values before
+                            // we overwrite them.
+                            const float gv[3] = {pos[0] - seg[0],
+                                                 pos[1] - seg[1],
+                                                 pos[2] - seg[2]};
+                            float gl = sqrtf(gv[0] * gv[0] + gv[1] * gv[1] +
+                                             gv[2] * gv[2]);
+                            if (gl > 20.0f) gl = 20.0f;   // sane segment only
+                            g_fly_dist = g_fly_dist + sl;
+                            for (int k = 0; k < 3; ++k)
+                                g_fly_dev[k] = g_fly_dev[k] +
+                                               (st[k] - g_fly_spdir[k] * sl);
+                            float np[3];
+                            for (int k = 0; k < 3; ++k) {
+                                np[k] = g_fly_org[k] +
+                                        g_fly_dir[k] * g_fly_dist +
+                                        g_fly_dev[k];
+                                pos[k]  = np[k];
+                                pos2[k] = np[k];
+                                seg[k]  = np[k] - g_fly_dir[k] * gl;
+                                g_fly_last[k] = np[k];
+                            }
+                            g_trk_steer = g_trk_steer + 1;
+                        }
+                    } else if (g_sp_armed) {
+                        // Build 61's proof probe, kept as the fallback
+                        // instrument: a 1 m/frame lateral push.
+                        uint8_t* p = (uint8_t*)g_trk_proj;
+                        const float* fdir = (const float*)(p + 0x100);
+                        float px = -fdir[1], py = fdir[0];
+                        const float len = sqrtf(px * px + py * py);
+                        if (len > 0.001f) {
+                            px /= len; py /= len;
+                            float* pos  = (float*)(p + 0x0B0);
+                            float* pos2 = (float*)(p + 0x0F0);
+                            pos[0]  += px; pos[1]  += py;
+                            pos2[0] += px; pos2[1] += py;
+                            g_trk_steer = g_trk_steer + 1;
+                        }
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                g_trk_fault = 1; g_trk_live = 0; g_trk_ready = 1;
+            }
+        }
+    }
     if (ret_addr < g_image_base || ret_addr >= g_image_end) return;
     const uint32_t rva = (uint32_t)(ret_addr - g_image_base);
     const int n = g_wf_count;
@@ -446,20 +603,101 @@ extern "C" void grwxr_spawn_pre(void* owner) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_sp_didwrite = 0; }
 }
 
-extern "C" void grwxr_spawn_post(void* owner) {
+extern "C" void grwxr_spawn_post(void* owner, void* proj) {
     using namespace grwxr::aimtrace;
-    if (!owner || !g_sp_didwrite) return;
+    if (owner && g_sp_didwrite) {
+        __try {
+            float* dir = (float*)((uint8_t*)owner + 0x140);
+            for (int k = 0; k < 4; ++k) dir[k] = g_sp_saved[k];
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        g_sp_didwrite = 0;
+    }
+    // Build 59: arm the flight recorder on this round, one trace at a time.
+    // The +0x50 check is what makes the rax-is-the-projectile assumption
+    // safe to act on: the spawn verifiably copies [owner+0x150] there, and
+    // pre() captured that same value into g_sp_org moments ago.
+    if (!proj || g_trk_live || g_trk_ready) return;
     __try {
-        float* dir = (float*)((uint8_t*)owner + 0x140);
-        for (int k = 0; k < 4; ++k) dir[k] = g_sp_saved[k];
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    g_sp_didwrite = 0;
+        const float* org = (const float*)((uint8_t*)proj + 0x50);
+        if (org[0] == g_sp_org[0] && org[1] == g_sp_org[1] &&
+            org[2] == g_sp_org[2]) {
+            g_trk_proj  = (uintptr_t)proj;
+            g_trk_n     = 0;
+            g_trk_fault = 0;
+            g_trk_died  = 0;
+            // Build 62: snapshot the controller ray for this flight. The
+            // forward-hemisphere guard (dot > 0 against the engine's own
+            // spawn direction) keeps a dangling or backwards controller
+            // from firing a round through the player (skeleton rule 5:
+            // clamp everything controller-driven before it reaches the
+            // game). A denied round flies unmodified and is counted.
+            g_fly_on = 0;
+            if (g_cr_armed) {
+                if (g_cr_ok) {
+                    const float cd[3] = {g_cr_dir[0], g_cr_dir[1], g_cr_dir[2]};
+                    float sd[3] = {g_sp_dir[0], g_sp_dir[1], g_sp_dir[2]};
+                    const float sl =
+                        sqrtf(sd[0] * sd[0] + sd[1] * sd[1] + sd[2] * sd[2]);
+                    const float dot =
+                        sl > 0.001f ? (cd[0] * sd[0] + cd[1] * sd[1] +
+                                       cd[2] * sd[2]) / sl
+                                    : -1.0f;
+                    if (dot > 0.0f) {
+                        for (int k = 0; k < 3; ++k) {
+                            g_fly_org[k]   = g_sp_org[k];
+                            g_fly_dir[k]   = cd[k];
+                            g_fly_spdir[k] = sd[k] / sl;
+                            g_fly_dev[k]   = 0.0f;
+                            g_fly_last[k]  = g_sp_org[k];
+                        }
+                        g_fly_dist = 0.0f;
+                        g_fly_on   = 1;
+                        g_fly_shots = g_fly_shots + 1;
+                    } else {
+                        g_fly_denied = g_fly_denied + 1;
+                    }
+                } else {
+                    g_fly_denied = g_fly_denied + 1;
+                }
+            }
+            g_trk_live  = 1;
+        } else {
+            g_trk_rej = g_trk_rej + 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_trk_rej = g_trk_rej + 1; }
 }
 
 namespace grwxr {
 namespace aimtrace {
 
+// The research probes hook some of the busiest functions in the process (the
+// Havok world raycast most of all). That is acceptable while we are hunting,
+// and NOT acceptable to ship to testers unmeasured, so the whole module is
+// opt-in. The cfg is not parsed yet when install() runs (VRMirror reads it
+// once the device exists), so read the single key directly here. Init thread,
+// once, no hot path involved.
+bool probes_requested() {
+    const std::wstring path = log::data_dir() + L"\\grwxr.cfg";
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return false;
+    char line[256];
+    bool on = false;
+    while (fgets(line, sizeof(line), f)) {
+        float v = 0.0f;
+        if (sscanf_s(line, " aim_probes = %f", &v) == 1) on = v > 0.0f;
+    }
+    fclose(f);
+    return on;
+}
+
 bool install() {
+    if (!probes_requested()) {
+        LOG_INFO("aimtrace: research probes are OFF (aim_probes=0 or absent "
+                 "in grwxr.cfg). Nothing is hooked; this is the shipping "
+                 "default because these probes sit on very hot engine "
+                 "functions and their frame cost is not yet measured.");
+        return false;
+    }
     const gamebuild::Build* gb = gamebuild::get();
     if (!gb) {
         LOG_WARN("aimtrace: no build pin, so no verified getter RVAs. The aim "
@@ -481,14 +719,22 @@ bool install() {
     memcpy(&grwxr_aimget_disp[0], kGetYawExpect + kDispAt, sizeof(uint32_t));
     memcpy(&grwxr_aimget_disp[1], kGetPitchExpect + kDispAt, sizeof(uint32_t));
 
-    g_getyaw_hook.install_raw(base + gb->getyaw_slot, kGetYawExpect,
-                              sizeof(kGetYawExpect),
-                              (void*)&grwxr_aimget_yaw_entry,
-                              "GetYaw vdispatch");
-    g_getpitch_hook.install_raw(base + gb->getpitch_slot, kGetPitchExpect,
-                                sizeof(kGetPitchExpect),
-                                (void*)&grwxr_aimget_pitch_entry,
-                                "GetPitch vdispatch");
+    if (gb->getyaw_slot)
+        g_getyaw_hook.install_raw(base + gb->getyaw_slot, kGetYawExpect,
+                                  sizeof(kGetYawExpect),
+                                  (void*)&grwxr_aimget_yaw_entry,
+                                  "GetYaw vdispatch");
+    else
+        LOG_WARN("aimtrace: GetYaw stub is not derived for this binary; "
+                 "its census is OFF (rule 7).");
+    if (gb->getpitch_slot)
+        g_getpitch_hook.install_raw(base + gb->getpitch_slot, kGetPitchExpect,
+                                    sizeof(kGetPitchExpect),
+                                    (void*)&grwxr_aimget_pitch_entry,
+                                    "GetPitch vdispatch");
+    else
+        LOG_WARN("aimtrace: GetPitch stub is not derived for this binary; "
+                 "its census is OFF (rule 7).");
 
     g_base = base;
     set_shot_sites(0, 0);          // 0,0 = the build-pinned per-shot sites
@@ -514,6 +760,19 @@ bool install() {
     } else {
         LOG_WARN("aimtrace: hknpWorld::castRay is not derived for this "
                  "binary; the raycast census is OFF (rule 7).");
+    }
+
+    // Build 58: TtCastRay, the body the wrapper reaches through a
+    // runtime-built virtual table. Three call sites reach it directly
+    // through this thunk and were invisible to the build 57 window.
+    if (gb->raycast2_thunk && gb->raycast2_impl) {
+        grwxr_ray2_orig = (uint64_t)(base + gb->raycast2_impl);
+        g_ray2_hook.install(base + gb->raycast2_thunk,
+                            base + gb->raycast2_impl,
+                            (void*)&grwxr_ray2_entry, "TtCastRay direct");
+    } else {
+        LOG_WARN("aimtrace: TtCastRay is not derived for this binary; the "
+                 "direct-entry raycast census is OFF (rule 7).");
     }
 
     // Build 55: GetAimOrientation. Installed but INERT until a cfg angle
@@ -691,6 +950,68 @@ void drain() {
                  d[0], d[1], d[2], o[0], o[1], o[2]);
     }
 
+    // Build 62: the controller-ray relocation state.
+    if (g_cr_armed) {
+        float cd[3] = {g_cr_dir[0], g_cr_dir[1], g_cr_dir[2]};
+        LOG_INFO("  ctrlray: ARMED ray_ok=%u relocated=%llu denied=%llu "
+                 "dist=%.1f m | ctrl dir=(%.3f %.3f %.3f)",
+                 (unsigned)g_cr_ok,
+                 (unsigned long long)g_fly_shots,
+                 (unsigned long long)g_fly_denied,
+                 (double)g_fly_dist, cd[0], cd[1], cd[2]);
+    }
+
+    // Build 59: print the completed flight trace as a per-offset diff. Only
+    // offsets that CHANGED during flight print, as hex and float across
+    // first, middle and last captured frame. Bounded to 48 rows; a trace
+    // ended by a fault says so, because the fault frame is the round's
+    // lifetime. Printing re-arms the recorder for the next spawn.
+    if (g_trk_ready) {
+        const int fn = (int)g_trk_n;
+        LOG_INFO("  flight: %d frame(s) of projectile 0x%llX%s%s%s | "
+                 "rejects=%llu steers=%llu",
+                 fn, (unsigned long long)g_trk_proj,
+                 g_trk_fault ? " | ended by FAULT" : "",
+                 g_trk_died  ? " | round DIED (instance recycled)" : "",
+                 (!g_trk_fault && !g_trk_died && fn < kTrkFrames)
+                     ? " | partial" : "",
+                 (unsigned long long)g_trk_rej,
+                 (unsigned long long)g_trk_steer);
+        if (fn >= 2) {
+            int printed = 0, changed_total = 0;
+            const int mid = fn / 2;
+            for (int off = 0; off + 4 <= kTrkBytes; off += 4) {
+                uint32_t h0, hm, hl;
+                memcpy(&h0, &g_trk_buf[0][off], 4);
+                bool changed = false;
+                for (int f = 1; f < fn; ++f) {
+                    uint32_t v;
+                    memcpy(&v, &g_trk_buf[f][off], 4);
+                    if (v != h0) { changed = true; break; }
+                }
+                if (!changed) continue;
+                ++changed_total;
+                if (printed >= 48) continue;
+                memcpy(&hm, &g_trk_buf[mid][off], 4);
+                memcpy(&hl, &g_trk_buf[fn - 1][off], 4);
+                float f0, fm2, fl;
+                memcpy(&f0, &h0, 4); memcpy(&fm2, &hm, 4); memcpy(&fl, &hl, 4);
+                LOG_INFO("    off=0x%03X  %08X %08X %08X  as float "
+                         "%.6g -> %.6g -> %.6g",
+                         off, h0, hm, hl, (double)f0, (double)fm2, (double)fl);
+                ++printed;
+            }
+            if (changed_total > printed)
+                LOG_INFO("    ...and %d more changed offset(s) not shown",
+                         changed_total - printed);
+            if (changed_total == 0)
+                LOG_INFO("    no offset changed across %d frames (instance "
+                         "is static after spawn, or already recycled)", fn);
+        }
+        g_trk_ready = 0;
+        g_trk_proj  = 0;
+    }
+
     // Build 54: who casts rays, and what ray. THE ONE TO READ: a caller whose
     // count matches the number of rounds fired is the shot trace, exactly the
     // discriminator that found the per-shot aim reader. Per-frame world
@@ -731,6 +1052,30 @@ void set_shot_offset(float yaw_rad, float pitch_rad) {
 }
 
 void set_shot_alternate(bool on) { g_shot_alternate = on ? 1u : 0u; }
+
+void set_ctrl_ray(const float dir[3], bool ok) {
+    if (ok && dir) {
+        g_cr_dir[0] = dir[0];
+        g_cr_dir[1] = dir[1];
+        g_cr_dir[2] = dir[2];
+        g_cr_ok = 1;
+    } else {
+        g_cr_ok = 0;
+    }
+}
+
+void set_bullet_ctrl(bool on) {
+    const uint32_t was = g_cr_armed;
+    g_cr_armed = on ? 1u : 0u;
+    if (on && !was)
+        LOG_INFO("aimtrace: CONTROLLER-RAY BULLETS ARMED. Every round is "
+                 "relocated per frame onto the controller ray captured at "
+                 "its spawn; the engine keeps drop and drag. Guards: "
+                 "forward-hemisphere check at spawn, +0x50 liveness check "
+                 "before every write, 48-frame window.");
+    if (!on && was)
+        LOG_INFO("aimtrace: controller-ray bullets disarmed.");
+}
 
 void set_bullet_yaw(float deg) {
     if (deg == 0.0f) {

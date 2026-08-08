@@ -75,6 +75,19 @@ void drain();
 // history rather than starting from zero.
 void set_logging(bool on);
 
+// Build 62: THE CONTROLLER RAY. VRMirror publishes the right controller's
+// aim direction in ENGINE WORLD coordinates once per frame (the same
+// head-local-to-game-basis mapping the hand markers and the build 47 write
+// verified in the headset). ok=false means "not tracked this frame"; the
+// last good ray is NOT held, a spawn with no fresh ray flies unmodified.
+void set_ctrl_ray(const float dir[3], bool ok);
+
+// cfg bullet_ctrl: 1 = every player round is relocated, frame by frame,
+// onto the controller ray captured at its spawn. The engine keeps drop and
+// drag (its own per-frame step length and deviation are preserved); only
+// the LINE the round travels is replaced. 0 = never touch the round.
+void set_bullet_ctrl(bool on);
+
 // Build 51: THE DISCRIMINATING TEST. Adds a constant offset, in radians, to
 // the aim angle THE SHOT READER SEES, and to nothing else: the camera, the
 // look-input integrator and every other reader keep getting the true value,

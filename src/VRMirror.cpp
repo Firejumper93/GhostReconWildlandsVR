@@ -310,6 +310,8 @@ std::atomic<bool>  g_in_track[2] = {};   // per hand: located this frame
 // Read-only with respect to the engine; draws into our canvas only.
 constexpr int kWpm = wp::kWatch;   // slot index = colour index, fixed
 bool  g_wpm_enable = true;              // cfg wp_markers, 0 hides them
+bool  g_wskel_enable = false;           // cfg wskel, build 64: WHITE marker
+                                        // rides the weapon-skeleton pick
 bool  g_wpm_on[kWpm] = {};
 float g_wpm_tx[kWpm][2] = {};           // [slot][eye] tangent from centre
 float g_wpm_ty[kWpm][2] = {};
@@ -561,6 +563,18 @@ void load_config() {
         // Build 45: weapon-candidate markers. 0 hides them (hot-reload).
         if (sscanf_s(line, " wp_markers = %f", &v) == 1)
             g_wpm_enable = v > 0.0f;
+        // Build 64: weapon-skeleton identifier. Arms the wskel census in
+        // CameraProbe and rides the WHITE marker slot on the picked
+        // instance. Read-only; defaults off.
+        if (sscanf_s(line, " wskel = %f", &v) == 1) {
+            g_wskel_enable = v > 0.0f;
+            camera::set_wskel(v > 0.0f);
+        }
+        // Build 65: the weapon-skeleton write test. 1 arms per-frame
+        // +0.30 m height writes on the DRAWN gun's skeleton origin
+        // (auto-capped; re-toggle to reset). Needs wskel=1 for the pick.
+        if (sscanf_s(line, " wskel_write = %f", &v) == 1)
+            camera::set_wskel_write(v > 0.0f);
         // Build 47: the placement write test. Defaults keep it OFF.
         if (sscanf_s(line, " wp_write_slot = %f", &v) == 1) {
             int s = (int)v;
@@ -611,6 +625,9 @@ void load_config() {
             if (v >  90.0f) v =  90.0f;
             aimtrace::set_bullet_yaw(v);
         }
+        // Build 62: bullets follow the controller ray. 0 off, 1 on.
+        if (sscanf_s(line, " bullet_ctrl = %f", &v) == 1)
+            aimtrace::set_bullet_ctrl(v > 0.0f);
         // Build 55: rotate the engine's own aim quaternion. Degrees, 0 off.
         if (sscanf_s(line, " aim_quat_deg = %f", &v) == 1) {
             if (v < -90.0f) v = -90.0f;
@@ -1138,13 +1155,21 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
         // carries, which is acceptable for a "which colour is on the gun"
         // read. Same optics gate as the hands (hazard 25).
         for (int i = 0; i < kWpm; ++i) g_wpm_on[i] = false;
-        if (g_wpm_enable && headpose::read_fov(0.7853982f) >= 0.65f) {
+        if ((g_wpm_enable || g_wskel_enable) &&
+            headpose::read_fov(0.7853982f) >= 0.65f) {
             float R[9], C[3];
             if (camera::base_frame(R, C)) {
                 const float half_ipd = 0.5f * headpose::read_ipd(0.063f);
                 for (int i = 0; i < kWpm; ++i) {
                     float wpos[3];
-                    if (!wp::marker(i, wpos)) continue;
+                    // Build 64: while wskel is armed the WHITE slot carries
+                    // the weapon-skeleton pick; the wp handles keep the
+                    // other five slots (and all six when it is off).
+                    if (i == kWpm - 1 && g_wskel_enable) {
+                        if (!camera::wskel_marker(wpos)) continue;
+                    } else if (!g_wpm_enable || !wp::marker(i, wpos)) {
+                        continue;
+                    }
                     const float rw[3] = {wpos[0] - C[0], wpos[1] - C[1],
                                          wpos[2] - C[2]};
                     const float lx = rw[0] * R[0] + rw[1] * R[1] + rw[2] * R[2];
@@ -1206,6 +1231,47 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
             }
             wp::set_write(g_wpw_handle, g_wpw_slot, g_wpw_mode, g_wpw_up,
                           cw, cok);
+        }
+
+        // BUILD 62: publish the right controller's aim DIRECTION in engine
+        // world space for the bullet relocation. Same route as the build 47
+        // position write just above and the same reason it is trustworthy:
+        // head and controller poses come from one xrLocateSpace pass, the
+        // head-local step is the hand-marker math verified in the headset,
+        // and the world step is the camera's own basis. The aim pose's
+        // forward is -Z; rotate-by-q is rotate-inverse-by-conjugate, so no
+        // new quaternion helper is needed.
+        {
+            float dw[3] = {};
+            bool  dok   = false;
+            float Rw[9], Cw[3];
+            if (g_head_pos_ok &&
+                g_in_track[1].load(std::memory_order_relaxed) &&
+                camera::base_frame(Rw, Cw)) {
+                const Quat c{g_in_ori[1][0].load(std::memory_order_relaxed),
+                             g_in_ori[1][1].load(std::memory_order_relaxed),
+                             g_in_ori[1][2].load(std::memory_order_relaxed),
+                             g_in_ori[1][3].load(std::memory_order_relaxed)};
+                if (c.x != 0.0f || c.y != 0.0f || c.z != 0.0f || c.w != 0.0f) {
+                    const float fwd_ref_in[3] = {0.0f, 0.0f, -1.0f};
+                    const Quat cconj{-c.x, -c.y, -c.z, c.w};
+                    float fr[3];
+                    quat_rotate_inv(cconj, fwd_ref_in, fr);  // ctrl fwd, ref space
+                    float lv[3];
+                    quat_rotate_inv(q, fr, lv);   // head-local: +x r, +y u, -z fwd
+                    const float lx = lv[0], lf = -lv[2], lu = lv[1];
+                    dw[0] = lx * Rw[0] + lf * Rw[3] + lu * Rw[6];
+                    dw[1] = lx * Rw[1] + lf * Rw[4] + lu * Rw[7];
+                    dw[2] = lx * Rw[2] + lf * Rw[5] + lu * Rw[8];
+                    const float m = sqrtf(dw[0] * dw[0] + dw[1] * dw[1] +
+                                          dw[2] * dw[2]);
+                    if (m > 0.5f) {   // basis rows are unit, so ~1 expected
+                        dw[0] /= m; dw[1] /= m; dw[2] /= m;
+                        dok = true;
+                    }
+                }
+            }
+            aimtrace::set_ctrl_ray(dw, dok);
         }
     }
 

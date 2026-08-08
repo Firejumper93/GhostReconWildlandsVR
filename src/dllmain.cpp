@@ -92,7 +92,47 @@ DWORD WINAPI init_thread(LPVOID) {
         WideCharToMultiByte(CP_UTF8, 0, p, -1, n, sizeof(n), nullptr, nullptr);
         LOG_INFO("forwarding to  : %s", n);
     } else {
-        LOG_WARN("dxgi_real.dll not loaded yet (normal: forwards resolve lazily)");
+        // Not loaded YET is normal, because forwarded exports resolve lazily.
+        // Not PRESENT ON DISK is fatal and silent: every export of this proxy
+        // forwards to dxgi_real.<name>, so the first DXGI call the game makes
+        // dies inside the loader with no exception we can catch, moments after
+        // this thread has finished logging a healthy-looking startup.
+        //
+        // That is exactly how it presented in a tester's report (2026-08-06):
+        // all 11 hooks attached cleanly, the log simply stopped, and the game
+        // crashed "right after setup". He had extracted the zip into the game
+        // folder without running install.bat, which is the only thing that
+        // creates dxgi_real.dll. The old wording here called it normal and
+        // sent him hunting Ubisoft overlays and anti-cheat for hours.
+        wchar_t self_path[MAX_PATH] = {};
+        GetModuleFileNameW(g_self, self_path, MAX_PATH);
+        std::wstring realpath = self_path;
+        const size_t cut = realpath.find_last_of(L'\\');
+        realpath = (cut == std::wstring::npos)
+                       ? std::wstring(L"dxgi_real.dll")
+                       : realpath.substr(0, cut + 1) + L"dxgi_real.dll";
+        if (GetFileAttributesW(realpath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            char n[MAX_PATH * 2] = {};
+            WideCharToMultiByte(CP_UTF8, 0, realpath.c_str(), -1, n,
+                                (int)sizeof(n), nullptr, nullptr);
+            LOG_ERROR("");
+            LOG_ERROR("################ FATAL: dxgi_real.dll IS MISSING ################");
+            LOG_ERROR("  expected at: %s", n);
+            LOG_ERROR("  Every export of this proxy forwards to that file. The");
+            LOG_ERROR("  game WILL crash the moment it makes its first graphics");
+            LOG_ERROR("  call, which is usually seconds from now, and the crash");
+            LOG_ERROR("  happens inside Windows' loader so nothing else is logged.");
+            LOG_ERROR("  FIX: run install.bat from the release zip. It copies your");
+            LOG_ERROR("  own C:\\Windows\\System32\\dxgi.dll to dxgi_real.dll.");
+            LOG_ERROR("  Copying the mod files in by hand is NOT enough on its own.");
+            LOG_ERROR("  If the game is under Program Files, run it as administrator");
+            LOG_ERROR("  or the copy will be refused.");
+            LOG_ERROR("################################################################");
+            LOG_ERROR("");
+        } else {
+            LOG_INFO("dxgi_real.dll present on disk, not yet loaded (normal: "
+                     "forwarded exports resolve lazily)");
+        }
     }
 
     // Build 26: RENDERDOC CAPTURE MODE, cfg-gated, off by default.

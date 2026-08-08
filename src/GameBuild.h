@@ -114,6 +114,15 @@ struct Build {
     // Ansel IAT slots.
     uintptr_t ansel_setconfig;
     uintptr_t ansel_updatecam;
+
+    // Build 58: TtCastRay (HK_TIMER literals "CastRay" 0x03C742E0 and
+    // "TtCastRay" 0x03C742E8 name it from inside), the raycast body the
+    // hknpWorld::castRay wrapper reaches through a runtime-built virtual
+    // table. Three call sites reach it DIRECTLY through this thunk,
+    // bypassing the wrapper, which is why the build 57 shot window saw
+    // only ambient traffic: the wrapper hook was blind to them.
+    uintptr_t raycast2_thunk;
+    uintptr_t raycast2_impl;
 };
 
 // The table for the binary this process actually loaded, detected once from

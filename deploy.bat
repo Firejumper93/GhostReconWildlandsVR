@@ -56,7 +56,10 @@ REM Everything in docs/RE-notes.md is pinned to this exact build. Steam is set
 REM to auto-update and Ubisoft Connect auto-patches, so the exe CAN change under
 REM us. If it does, every RVA, signature and offset we have derived is suspect
 REM and we must know BEFORE we spend a night debugging against a moved target.
-set "PINNED=258606539695a0a4f188a651b58a7a04a30a7992ff7f6d1b8af5c23de941126f"
+REM 2026-08-07: repinned to the "Last Rites" update exe (Steam and Ubisoft
+REM Connect ship the identical binary, TimeDateStamp 6A692948). Previous pin
+REM 2586065396... is archived as binaries\GRW.exe.steam-2017pin.
+set "PINNED=56791ff5a6c213a77eebedaeaee3026d63b70806071358ce96abd3ed7947ade7"
 certutil -hashfile "%GAME%\GRW.exe" SHA256 | findstr /i /c:"%PINNED%" >nul
 if errorlevel 1 goto err_exe_changed
 echo     GRW.exe matches the pinned build.

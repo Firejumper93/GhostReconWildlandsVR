@@ -306,6 +306,34 @@ std::atomic<uint64_t> g_hik_rdx_last{0};
 constexpr uint32_t kRingSize = 128;   // power of two
 std::atomic<uint64_t> g_skel_ring[kRingSize] = {};
 std::atomic<uint32_t> g_skel_ring_w{0};
+
+// Build 65: the weapon-skeleton WRITE test (cfg wskel_write, default off).
+// While armed and the pick is a DRAWN gun (dhand < 0.4 m, so holstered
+// gear is never written), the drain publishes the target instance + its
+// rig; the kSkelPostProbe recorder adds +0.30 m of height to the
+// instance origin (+0x120) and its copy (+0x250) pre-update, on the
+// engine's own thread. If the update recomputes the origin from
+// animation the gun floats a constant 30 cm; if it does not, the gun
+// rises visibly frame over frame. Either outcome answers authority.
+// Guards: rig identity re-check in the writer (pool-recycle lesson from
+// the bullet work), SEH, hard write cap, cleared on any disarm.
+constexpr uint64_t    kWskelWriteCap = 7200;   // ~100 s at 72 Hz
+std::atomic<bool>     g_wskel_write_on{false};
+std::atomic<uint64_t> g_wskel_tgt{0};
+std::atomic<uint64_t> g_wskel_tgt_rig{0};
+std::atomic<uint64_t> g_wskel_writes{0};
+
+// POD-only SEH writer, called from the recorder (rule 8: no logging, no
+// allocation). A recycled instance fails the rig compare and is skipped.
+static void wskel_write_apply(uint64_t tgt, uint64_t rig) {
+    __try {
+        if (!rig || *(uint64_t*)(tgt + 0x220) != rig) return;
+        *(float*)(tgt + 0x128) += 0.30f;   // +0x120 origin, z lane
+        *(float*)(tgt + 0x258) += 0.30f;   // +0x250 copy, z lane
+        g_wskel_writes.fetch_add(1, std::memory_order_relaxed);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
 std::atomic<uint64_t> g_hik_ring[kRingSize] = {};
 std::atomic<uint32_t> g_hik_ring_w{0};
 std::atomic<uint64_t> g_hik_rdx_ring[kRingSize] = {};
@@ -1149,6 +1177,12 @@ extern "C" void grwxr_probe_record(uint64_t index, const void* saved_raw,
         g_skel_rdx_last.store(a->rdx, std::memory_order_relaxed);
         g_skel_ring[g_skel_ring_w.fetch_add(1, std::memory_order_relaxed) &
                     (kRingSize - 1)].store(a->rcx, std::memory_order_relaxed);
+        // Build 65: the write test, pre-update on the engine's thread.
+        const uint64_t wt = g_wskel_tgt.load(std::memory_order_relaxed);
+        if (wt && a->rcx == wt &&
+            g_wskel_writes.load(std::memory_order_relaxed) < kWskelWriteCap)
+            wskel_write_apply(
+                wt, g_wskel_tgt_rig.load(std::memory_order_relaxed));
     } else if (index == kHikReaderProbe) {
         capture_unique(g_hik_rcx, a->rcx);
         g_hik_rdx_last.store(a->rdx, std::memory_order_relaxed);
@@ -1472,6 +1506,17 @@ void dump_matrices() {
     LOG_INFO("=== end matrices ===");
 }
 
+// Build 64: weapon-skeleton identifier (session 29 route 1). The ADS
+// pin-steal (15e.2, 2026-08-02 log correlation) proved the drawn weapon is
+// its own SkeletonPostUpdate instance, and the rigid census shows small
+// non-humanoid rig classes live near the player (18/20 bones, no Head
+// hash). The 1 Hz pass below picks the small-rig instance nearest the
+// player's right hand and publishes it; wskel_marker() re-reads its world
+// position per frame so the WHITE marker rides the gun without a
+// one-second trail. Read-only everywhere.
+std::atomic<bool>     g_wskel_on{false};
+std::atomic<uint64_t> g_wskel_cand{0};
+
 // Build 5 cadence, one call per second from the init thread. Prints a pending
 // snapshot as soon as the recorder fills one, and every 20 seconds re-arms the
 // snapshot and dumps the matrices. Independent of the survey throttle below so
@@ -1513,6 +1558,103 @@ void snap_drain() {
     // barrel (2026-08-02 log: pin changes at the same timestamp as fov
     // 0.2549 and 0.5236). The incumbent simply holds until the fov returns
     // to the world band.
+    // Build 64: weapon-skeleton census + candidate pick, 1 Hz while armed
+    // (cfg wskel). Candidate = ring skeleton whose rig is small (2..64
+    // bones) and has no Head hash, nearest the player's right-hand bone.
+    // The drawn weapon rides the hand; holstered gear hangs further away,
+    // and the census lines show it either way.
+    // 64.1: this block sits ABOVE the pin section because the pin's entity
+    // path ends its drain tick with an early return, which silenced the
+    // census the moment the player entity went live (03:04:02 in the first
+    // build 64 run). The hand bone it reads comes from the PREVIOUS tick's
+    // pin, which is one second stale at worst and irrelevant at 1 Hz.
+    if (g_wskel_on.load(std::memory_order_relaxed) &&
+        g_calls[kSkelPostProbe].load(std::memory_order_relaxed)) {
+        float hand[3];
+        bool  hand_ok = false;
+        const uint64_t body = (uint64_t)headpose::player_obj();
+        if (body) {
+            uint64_t brig = 0;
+            if (read_block(body + 0x220, &brig, sizeof(brig)) &&
+                brig > 0x10000 && !(brig & 7)) {
+                const int nR = rig_find_node(brig, 0x75F94D30u);  // RightHand
+                hand_ok = nR >= 0 &&
+                          read_bone_world(body, (unsigned int)nR, hand);
+            }
+        }
+        uint64_t best = 0, best_rig = 0;
+        float    best_d = 1e9f;
+        uint16_t best_bones = 0;
+        int      cands = 0;
+        for (uint32_t i = 0; i < kRingSize; ++i) {
+            const uint64_t p = g_skel_ring[i].load(std::memory_order_relaxed);
+            if (!p || p == body) continue;
+            uint64_t rig = 0;
+            if (!read_block(p + 0x220, &rig, sizeof(rig)) ||
+                rig < 0x10000 || (rig & 7)) continue;
+            uint16_t bones = 0;
+            if (!read_block(rig + 0x8A, &bones, sizeof(bones))) continue;
+            if (bones < 2 || bones > 64) continue;         // humanoids are 100+
+            if (rig_has_hash(rig, 0x07C159A2u)) continue;  // has a Head: a body
+            float o[3];
+            if (!read_block(p + 0x120, o, sizeof(o)) ||
+                !isfinite(o[0]) || !isfinite(o[1]) || !isfinite(o[2]))
+                continue;
+            const float ref[3] = {hand_ok ? hand[0] : g_base_pos[0],
+                                  hand_ok ? hand[1] : g_base_pos[1],
+                                  hand_ok ? hand[2] : g_base_pos[2]};
+            const float dx = o[0] - ref[0], dy = o[1] - ref[1],
+                        dz = o[2] - ref[2];
+            const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (d > 6.0f) continue;                        // census radius
+            ++cands;
+            if ((ticks % 5) == 1 && cands <= 8)
+                LOG_INFO("wskel: cand 0x%012llX rig=0x%012llX bones=%u "
+                         "d%s=%.2fm pos=(%.2f %.2f %.2f)",
+                         (unsigned long long)p, (unsigned long long)rig,
+                         bones, hand_ok ? "hand" : "cam", d,
+                         o[0], o[1], o[2]);
+            if (d < best_d) {
+                best_d = d; best = p; best_rig = rig; best_bones = bones;
+            }
+        }
+        if (best && best_d < 1.0f) {
+            g_wskel_cand.store(best, std::memory_order_relaxed);
+            LOG_INFO("wskel: PICK 0x%012llX rig=0x%012llX bones=%u d%s=%.2fm "
+                     "(WHITE marker rides it)",
+                     (unsigned long long)best, (unsigned long long)best_rig,
+                     best_bones, hand_ok ? "hand" : "cam", best_d);
+        } else {
+            g_wskel_cand.store(0, std::memory_order_relaxed);
+            LOG_INFO("wskel: no pick (cands=%d best=%.2fm hand=%s)",
+                     cands, best ? best_d : -1.0f, hand_ok ? "ok" : "ABSENT");
+        }
+
+        // Build 65: publish or clear the write target. Rig first, target
+        // second (the writer reads target then rig; the identity compare
+        // makes the race benign). Drawn-gun-only gate: 0.4 m of the hand.
+        if (g_wskel_write_on.load(std::memory_order_relaxed)) {
+            const uint64_t w =
+                g_wskel_writes.load(std::memory_order_relaxed);
+            if (best && best_d < 0.4f && hand_ok && w < kWskelWriteCap) {
+                g_wskel_tgt_rig.store(best_rig, std::memory_order_relaxed);
+                g_wskel_tgt.store(best, std::memory_order_relaxed);
+                LOG_INFO("wskelw: ARMED on 0x%012llX writes=%llu",
+                         (unsigned long long)best, (unsigned long long)w);
+            } else {
+                g_wskel_tgt.store(0, std::memory_order_relaxed);
+                LOG_INFO("wskelw: not armed (%s, writes=%llu)",
+                         w >= kWskelWriteCap ? "CAP reached, toggle to reset"
+                         : !best             ? "no pick"
+                         : best_d >= 0.4f    ? "pick not in hand"
+                                             : "hand absent",
+                         (unsigned long long)w);
+            }
+        } else {
+            g_wskel_tgt.store(0, std::memory_order_relaxed);
+        }
+    }
+
     if (g_calls[kSkelPostProbe].load(std::memory_order_relaxed)) {
         const float pin_fov = headpose::read_fov(1.0f);
         // 15e.3: continuity state, drain thread only. Holds the last pinned
@@ -2666,6 +2808,38 @@ bool base_frame(float rot[9], float pos[3]) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+// Build 64: see CameraProbe.h. Selection happens at 1 Hz on the drain
+// thread; this per-frame read only refreshes the picked instance's world
+// position so the marker tracks the gun smoothly. SEH on the read: a
+// recycled instance turns the marker off until the next drain tick
+// re-validates the pick.
+void set_wskel(bool on) {
+    g_wskel_on.store(on, std::memory_order_relaxed);
+    if (!on) {
+        g_wskel_cand.store(0, std::memory_order_relaxed);
+        g_wskel_tgt.store(0, std::memory_order_relaxed);
+    }
+}
+
+// Build 65: a rising edge resets the write cap so the cfg toggle is the
+// re-arm; off clears the target immediately (the drain would too, one
+// second later).
+void set_wskel_write(bool on) {
+    const bool was = g_wskel_write_on.exchange(on, std::memory_order_relaxed);
+    if (on && !was) g_wskel_writes.store(0, std::memory_order_relaxed);
+    if (!on) g_wskel_tgt.store(0, std::memory_order_relaxed);
+}
+
+bool wskel_marker(float out[3]) {
+    const uint64_t p = g_wskel_cand.load(std::memory_order_relaxed);
+    if (!p) return false;
+    float o[3];
+    if (!read_block(p + 0x120, o, sizeof(o))) return false;
+    if (!isfinite(o[0]) || !isfinite(o[1]) || !isfinite(o[2])) return false;
+    out[0] = o[0]; out[1] = o[1]; out[2] = o[2];
+    return true;
 }
 
 void drain() {

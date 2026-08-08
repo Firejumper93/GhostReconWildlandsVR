@@ -41,6 +41,7 @@ constexpr Build kSteam = {
     0x124DE4CC,
     0x030AC6A0, 0x13E5EA30,
     0x162AD098, 0x162AD0A0,
+    0x030C9990, 0x13EA3550,       // TtCastRay thunk + impl (build 58)
 };
 
 constexpr Build kStore = {
@@ -67,9 +68,44 @@ constexpr Build kStore = {
     0x13E464AC,
     0x030AC4F0, 0x152E3E70,
     0x16F0F098, 0x16F0F0A0,
+    0, 0,                         // TtCastRay NOT derived here
 };
 
-const Build* kKnown[] = {&kSteam, &kStore};
+// The 2026-08 "Last Rites" update. Steam and Ubisoft Connect ship the SAME
+// exe (sha 56791ff5..., byte-identical), so one row covers both stores.
+// Derived 2026-08-07 with tools/store_port.py old-Steam -> new exe: every
+// non-zero row hit exactly once with the Steam control OK (output archived
+// at binaries/store_port-2026aug-output.txt). Zero rows are honest misses
+// (bodies recompiled: wfire and its two in-body shot sites, getpitch stub,
+// head-hide setter, bone gather consumer); their consumers refuse to arm.
+constexpr Build kUpdate2026 = {
+    "2026-08-update", 0x6A692948, 0x18502000,
+    {{0x013786F0, 0x0DB26FA0},    // proj[0] anchor
+     {0x013788D0, 0x0DB27220},    // proj[1]
+     {0x013789A0, 0x0DB27300},    // proj[2] gameplay
+     {0x01378CB0, 0x0DB27650},    // proj[3] skew path
+     {0x01376B90, 0x0DB24880},    // proj[4]
+     {0x01376C70, 0x0DB24BF0},    // proj[5]
+     {0x01390570, 0x0DB6FF30},    // on_calc_mvp
+     {0x0137B280, 0x0DB2BEC0},    // selector
+     {0x0189B430, 0x0F085A50},    // SkeletonPostUpdate
+     {0x018F4180, 0x0F1B82F0},    // HIK datablock reader
+     {0x02759D40, 0x13435390}},   // cPlayerComponent::OnInit callee
+    0x004487D0, 0x004477F0,       // setyaw, setpitch stubs
+    0x00447400, 0,                // getyaw stub; getpitch MISS (fp-max 0 hits)
+    0, 0,                         // per-shot sites live inside wfire: MISS
+    0, 0,                         // wfire body recompiled: MISS
+    0x03100590, 0x161AEDE0,       // hknpWorld::castRay thunk + impl
+    0x029F6FB0, 0x14619440,       // GetAimOrientation thunk + impl
+    0x029D7760, 0x145BB050,       // ballistic projectile spawn thunk + impl
+    0, 0, 0,                      // head-hide family: setter body MISS
+    0x146691CC,                   // no-blur match
+    0x030FC350, 0x161A55E0,       // weapon setterA thunk + impl
+    0x1820C098, 0x1820C0A0,       // ansel IAT slots
+    0x03119640, 0x161E6D60,       // TtCastRay thunk + impl
+};
+
+const Build* kKnown[] = {&kSteam, &kStore, &kUpdate2026};
 
 // Read once from the loaded module's own headers. No file I/O: the values
 // come from the same mapped image every RVA is applied to.
@@ -113,13 +149,14 @@ void log_identity() {
     }
     LOG_ERROR("build pin: UNKNOWN GRW.exe binary (TimeDateStamp %08X, "
               "SizeOfImage %08X, header read %s). Known: Steam %08X/%08X, "
-              "Ubisoft-Epic %08X/%08X. Nothing that depends on analysed "
-              "addresses will install; the game runs unmodified. This "
-              "usually means a game update or a store build we have not "
-              "analysed yet: please report this log.",
+              "Ubisoft-Epic %08X/%08X, 2026-08-update %08X/%08X. Nothing "
+              "that depends on analysed addresses will install; the game "
+              "runs unmodified. This usually means a game update or a store "
+              "build we have not analysed yet: please report this log.",
               ts, soi, have ? "ok" : "FAILED",
               kSteam.pe_timestamp, kSteam.pe_size_of_image,
-              kStore.pe_timestamp, kStore.pe_size_of_image);
+              kStore.pe_timestamp, kStore.pe_size_of_image,
+              kUpdate2026.pe_timestamp, kUpdate2026.pe_size_of_image);
 }
 
 }  // namespace gamebuild

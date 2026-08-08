@@ -55,6 +55,20 @@ TARGETS = [
     ("bone gather consumer", None,      0x0DDD12D0),
     ("head-hide slot fn",   None,       0x124E15A0),
     ("head-hide setter",    0x029DC7D0, 0x12582AC0),
+    # Aim family (GameBuild.cpp Steam row, extension owed by the 2026-08-06
+    # update triage): fingerprint rows, thunks by the mechanical E9 scan.
+    ("wfire",               0x029AB510, 0x124B8360),
+    ("hknp castRay",        0x030B08E0, 0x13E68070),
+    ("GetAimOrientation",   0x029A8E80, 0x124B0770),
+    ("proj spawn",          0x02986B20, 0x12458BD0),
+    ("TtCastRay",           0x030C9990, 0x13EA3550),
+    # Mid-function anchors: the getter stubs (int3-slot dispatch stubs) and
+    # the per-shot aim read sites (return addresses inside wfire). AimTrace
+    # re-verifies the E8 in front of each site at runtime before trusting.
+    ("getyaw stub",         None,       0x006764B0),
+    ("getpitch stub",       None,       0x00677600),
+    ("shot yaw site",       None,       0x124B855D),
+    ("shot pitch site",     None,       0x124B85A1),
 ]
 
 # Curated AOBs from src/ and docs/RE-notes.md, all verified unique in Steam.

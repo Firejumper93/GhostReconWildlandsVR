@@ -5,6 +5,53 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
+## v0.7.0-alpha, "The Update Update" (the 2026-08 port, 2026-08-08, PACKAGED RELEASE)
+
+Ubisoft shipped a ~31 GB title update ("Last Rites", August 2026) that replaced
+`GRW.exe`. On an executable it does not recognize this mod installs nothing, by
+design, so post-update the game simply ran flat. This release is the port: every
+engine address re-derived and re-verified against the new executable.
+
+### Added
+
+- **Full support for the August 2026 game update.** A third complete address table,
+  behind the same fail-closed build-identity check as the other two. **Verified in
+  the headset (2026-08-08): full stereo on the updated game**, camera hooks 11 of 11,
+  head aim and the no-blur patch re-derived and installed.
+- **Steam and Ubisoft Connect now ship the byte-identical executable** (confirmed by
+  hash), so one verified table covers both stores from here on.
+- The new executable enables **ASLR** (randomized load addresses); the one code path
+  that still assumed a fixed load address was fixed. Everything else already
+  resolved addresses relative to the live image base.
+- **The installer now finds your game by itself.** `install.bat` checks the folder
+  it is run from, then every Steam library on every drive (read from Steam's own
+  library list), then Ubisoft Connect's per-game install records. Pasting a path is
+  the last resort, not the first question. `uninstall.bat` detects the same way.
+
+### Temporarily lost to the update (fail-closed, restoration planned)
+
+- **Head hiding in first person does NOT work on the updated game** (confirmed in
+  the headset). The engine function behind it was recompiled by the update and no
+  longer matches its signature; per project rules the feature refuses to install
+  rather than guess. First person itself still works; you will see hair or helmet
+  from inside until this is re-derived by hand. Top restoration priority.
+- Two developer-only research instruments (the per-shot direction override family
+  and one aim-getter census) are disarmed on the new build for the same reason. No
+  user-facing impact; they were shipped off by default.
+- Not yet re-verified on the new build (expected working, honest asterisk): the
+  head-bone first-person anchor and the weapon-identification research readings.
+  The update changed weapon handling (reloads, two-primary loadout), so the
+  internal structures those features read are due a runtime re-check.
+
+### Notes for the new game version
+
+- The update adds **FSR upscaling: keep it OFF** with the mod. It sits inside the
+  render path the mod manages and is untested there.
+- The update's new native immersion toggles (reduced highlight glow, throwable
+  sightline preview off, hidden-UI sounds) work fine and are recommended for VR.
+- If a future patch changes the executable again, the mod will name the unknown
+  binary in its log and install nothing; that is the intended behavior.
+
 ## v0.6.1-alpha (builds 47-57, 2026-08-06, PACKAGED RELEASE)
 
 The headline is the camera. If you tried an earlier alpha and the view flipped over

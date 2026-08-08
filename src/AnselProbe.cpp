@@ -227,11 +227,10 @@ void dump_camera() {
 bool install() {
     HMODULE base = GetModuleHandleW(nullptr);
     if (!base) return false;
-    if ((uintptr_t)base != 0x140000000ull) {
-        LOG_WARN("ansel: module base is 0x%p, not the expected 0x140000000.", (void*)base);
-        LOG_WARN("ansel: IAT RVAs may be wrong. Skipping to avoid a bad write.");
-        return false;
-    }
+    if ((uintptr_t)base != 0x140000000ull)
+        LOG_INFO("ansel: module base is 0x%p (ASLR). IAT slots resolve as "
+                 "base + RVA; the anselsdk64 ownership check below still "
+                 "verifies each slot before any write.", (void*)base);
 
     const gamebuild::Build* gb = gamebuild::get();
     if (!gb) {

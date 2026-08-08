@@ -20,8 +20,13 @@
 > no weapon manipulation. See "Controller support, honestly" below and read it
 > before you decide whether this build is worth your time.
 >
-> **STEAM BUILD CONFIRMED, UBISOFT LAUNCHER UNTESTED, for now.** The Epic Games and Ubisoft Connect copies of
-
+> **WORKS WITH THE AUGUST 2026 "LAST RITES" TITLE UPDATE, as of v0.7.0.** The update
+> replaced the game executable; this release carries a full verified address table
+> for it, and full stereo on the updated game is confirmed in the headset. Steam and
+> Ubisoft Connect now ship the IDENTICAL executable, so both stores are covered by
+> the same table. One known casualty until it is re-derived: **head hiding in first
+> person is temporarily NOT working on the updated game** (you will see hair or
+> helmet from inside). Details in "The 2026-08 game update" below.
 
 A native OpenXR VR mod for Tom Clancy's Ghost Recon Wildlands (AnvilNext 2.0, DirectX 11).
 Head-tracked stereoscopic 3D rendered by the game's own engine, injected through a
@@ -32,7 +37,8 @@ was achieved on 2026-07-29, the fullscreen view on 2026-07-30, 4K internal rende
 controller-pointing aim and anchored first person on 2026-08-01/02, head-bone
 first person, head hiding, and continuous 1:1 head aim on 2026-08-03, and Touch
 controllers as an emulated gamepad, controller-pointing hip-fire aim with a reticle,
-and removal of the first-person close-range body blur on 2026-08-03/04. This is a development snapshot,
+and removal of the first-person close-range body blur on 2026-08-03/04. The port to
+the August 2026 "Last Rites" game update was headset-verified on 2026-08-08. This is a development snapshot,
 not a finished mod. Expect rough edges. Performance numbers here come from one test
 system; different hardware, headsets, and settings may perform noticeably worse. The
 mod is being actively optimized and improved, so expect frequent changes.
@@ -46,6 +52,51 @@ delete the old `dxgi.dll` and install this one.
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, and the
 [Roadmap](#roadmap) below for what is coming and how close it is.
+
+## The 2026-08 game update ("Last Rites"): honest status
+
+Ubisoft shipped a ~31 GB title update in August 2026 that replaced `GRW.exe`. The mod
+locates engine code inside that executable, so a new executable means every address
+must be re-derived and re-verified. That work is what v0.7.0 is. The current state,
+feature by feature:
+
+**Verified working on the updated game (in the headset, 2026-08-08):**
+
+- Build identification: the mod recognizes the new executable and logs it as the
+  "2026-08-update binary". Steam and Ubisoft Connect now ship the byte-identical
+  executable, so one table covers both stores.
+- Full stereoscopic rendering, head tracking, the fullscreen view, and 4K internal
+  rendering: all camera and projection hooks re-derived and confirmed live.
+- Head aim, the Touch emulated gamepad, and the no-blur patch: re-derived and
+  installed (their hooks report success in the log).
+- The new executable enables ASLR (randomized load addresses); the mod handles it.
+
+**Known NOT working on the updated game, to be restored in a coming release:**
+
+- **Head hiding in first person.** The engine function that hides the head could not
+  be matched in the new executable (it was recompiled, not just moved), and this mod
+  never guesses addresses: rather than risk your game, the feature disables itself.
+  First person still works; you will see hair or helmet geometry from inside until
+  this is re-derived. It is the top restoration priority.
+
+**Not yet re-verified on the updated game (worked before, expected to work, but the
+update's gameplay changes touch them and they have not been re-confirmed in the
+headset yet):**
+
+- The head-bone first-person anchor (eye height tracking crouch and prone).
+- The hand markers and the research instruments around weapon identification. The
+  update changed weapon handling (reloads, a two-primary loadout), so the internal
+  weapon bookkeeping the research side reads is due a re-check.
+
+If any of these misbehave for you on the new game version, that is why; please
+report it with your `GRWVR\grwxr-<pid>.log`. Nothing silently guesses: every feature
+that could not be re-verified either disabled itself or is listed here.
+
+**Recommended settings for the new game version:** the update added FSR upscaling;
+**keep FSR off** while using the mod (it sits inside the render path the mod
+manages, untested and likely to blur the eyes). The update's new native immersion
+toggles (reduced highlight glow, throwable sightline preview off, hidden-UI sounds)
+work fine and are recommended for VR.
 
 ## What works
 
@@ -76,7 +127,8 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, and the
 - **Your character's head is hidden in first person**, using the engine's own
   head-visibility mechanism, so you no longer see hair or helmet geometry from inside.
   Hiding is instant on the toggle (the first toggle of a session engages after your
-  first aim).
+  first aim). **Temporarily NOT working on the 2026-08 game update** (see the update
+  section above); it disables itself there rather than guess at a moved address.
 - **The first-person close-range body blur is REMOVED.** Your chest, arms and weapon
   no longer smear when the camera sits at the character's head. This was the top
   complaint from earlier builds.
@@ -153,6 +205,9 @@ are designed; neither ships here.
 
 ## Known limitations (honest list)
 
+- **Head hiding is temporarily out on the 2026-08 game update** (the current game
+  version). You will see hair or helmet from inside in first person until the
+  moved engine function is re-derived. See "The 2026-08 game update" above.
 - **No real motion controls.** Touch is emulated as a gamepad; the motion-tracked
   parts are head aim and the hand-position markers. There is no visible gun in your
   hands and no hand interactions. Controller-driven aim was retired as a default
@@ -187,31 +242,30 @@ evidence comes in.
 | Aerial vehicle interior camera | ~20% | Ground-vehicle first person already works in practice; helicopter and plane interiors need their camera behavior characterized first |
 | VR arms and hands (IK) | ~15% | The GPU skinning data format was recovered from the game's own shipped shaders; which render path draws the player is the remaining unknown. The engine's own IK system is confirmed present, which is the long-term route |
 
-Shipped since the last release (v0.6.0): experimental Epic/Ubisoft Connect support,
-hand markers, the head-aim default (controller-aim retirement), the Touch
-startup-race fix (controllers no longer die when the headset comes up late or no
-gamepad is plugged in), recenter-on-first-person-toggle, and the weapon-handle
-identification instrument.
+Shipped since the last release (v0.6.1): the port to the August 2026 "Last Rites"
+game update (new full address table, ASLR handling, headset-verified stereo), and
+an installer that finds your game by itself (Steam libraries and Ubisoft Connect
+are auto-detected; no more pasting paths).
 
 A public **beta** is planned once the top items land.
 
 ## Which version of the game do I need?
 
-**Steam is verified. Epic and Ubisoft Connect are supported experimentally as of
-v0.6.0.**
+**The current, updated game (August 2026 "Last Rites" patch) is verified, on Steam,
+in the headset.** Since that update, Steam and Ubisoft Connect ship the byte-identical
+executable, so Ubisoft Connect installs are covered by the very same verified
+address table (headset confirmation from a Ubisoft Connect user is still welcome).
 
 The mod finds the engine's camera and projection code at specific addresses inside
-`GRW.exe`, and the store releases ship a **different build** of that executable. As of
-v0.6.0 the mod carries a full address table for BOTH known builds and identifies which
-one it is running inside from the executable's own headers, so Epic and Ubisoft
-Connect installs get the same feature set as Steam. Honest status: every store
-address was derived and machine-verified offline against a real store executable, and
-each one is re-verified in place before anything is patched, but at release time no
-store-build user had yet confirmed it end to end in a headset. Treat it as
-experimental and please report your log either way.
+`GRW.exe`, so every distinct build of that executable needs its own verified address
+table. This release carries THREE: the pre-update Steam build (2023-09-14), the
+pre-update Epic / Ubisoft Connect store build (2023-09-08, machine-verified offline,
+never headset-confirmed by a store user), and the current 2026-08 update build that
+both stores now ship (headset-verified). The mod identifies which one it is running
+inside from the executable's own headers.
 
 If the mod meets a `GRW.exe` it does not recognize (a future game patch, or a build
-we have not analysed), it says so in its log, names both builds it knows, and
+we have not analysed), it says so in its log, names the builds it knows, and
 **installs nothing**: your game runs completely unmodified. The symptom of that state
 is a small flat window in the headset that does not respond to head movement, with
 controllers possibly still working. Check `GRWVR\grwxr-<pid>.log` for the
@@ -219,9 +273,9 @@ controllers possibly still working. Check `GRWVR\grwxr-<pid>.log` for the
 
 ## Requirements
 
-- Ghost Recon Wildlands. **Steam edition, verified** (2023-09-14 build), or **Epic /
-  Ubisoft Connect, experimental** (2023-09-08 build; supported since v0.6.0, awaiting
-  first tester confirmation; see above).
+- Ghost Recon Wildlands, current version (the August 2026 "Last Rites" update),
+  Steam or Ubisoft Connect (identical executable since that update; see above).
+  The two pre-update builds remain supported by their own address tables.
 - A PC VR headset with an OpenXR runtime. Tested only on Meta Quest 3 over Link cable
   with the Meta Quest Link runtime.
 - **Asynchronous Spacewarp must be disabled** (Oculus Debug Tool, set ASW to Disabled).

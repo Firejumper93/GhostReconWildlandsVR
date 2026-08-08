@@ -80,6 +80,11 @@ EXTERN grwxr_wfire_orig   : QWORD    ; the real function, from the E9 thunk
 EXTERN grwxr_ray_record : PROC
 EXTERN grwxr_ray_orig   : QWORD
 
+; Build 58, TtCastRay: the raycast body the wrapper reaches virtually, with
+; its own thunk and three direct callers. Shares build 54's recorder so the
+; caller census and the shot window cover both entries in one table.
+EXTERN grwxr_ray2_orig  : QWORD
+
 ; Build 55, GetAimOrientation. The ONE stub here that can modify a result.
 EXTERN grwxr_aimq_post : PROC
 EXTERN grwxr_aimq_orig : QWORD
@@ -458,6 +463,43 @@ grwxr_ray_entry PROC
 grwxr_ray_entry ENDP
 
 ; ---------------------------------------------------------------------------
+; Build 58: TtCastRay (thunk 0x030C9990 -> 0x13EA3550), the raycast body
+; behind the wrapper's virtual call. rdx is the ray input here too (the
+; wrapper passes its own rdx through unchanged). Identical pass-through
+; shape to grwxr_ray_entry; only the saved original differs.
+; ---------------------------------------------------------------------------
+grwxr_ray2_entry PROC
+    sub     rsp, 0B8h
+
+    mov     [rsp+40h], rcx
+    mov     [rsp+48h], rdx
+    mov     [rsp+50h], r8
+    mov     [rsp+58h], r9
+    movups  [rsp+60h], xmm0
+    movups  [rsp+70h], xmm1
+    movups  [rsp+80h], xmm2
+    movups  [rsp+90h], xmm3
+
+    ; grwxr_ray_record(return_address, ray_input)
+    mov     rcx, [rsp+0B8h]
+    mov     rdx, [rsp+48h]
+    call    grwxr_ray_record
+
+    movups  xmm3, [rsp+90h]
+    movups  xmm2, [rsp+80h]
+    movups  xmm1, [rsp+70h]
+    movups  xmm0, [rsp+60h]
+    mov     r9,  [rsp+58h]
+    mov     r8,  [rsp+50h]
+    mov     rdx, [rsp+48h]
+    mov     rcx, [rsp+40h]
+
+    mov     r11, [grwxr_ray2_orig]
+    add     rsp, 0B8h
+    jmp     r11
+grwxr_ray2_entry ENDP
+
+; ---------------------------------------------------------------------------
 ; Build 55: GetAimOrientation (thunk 0x029A8E80 -> 0x124B0770).
 ;   float4 GetAimOrientation(out /*rcx*/, aimSubObj /*rdx*/, int* mode /*r8*/)
 ; Verified body: parent = rdx-0x48; when *mode == -1 and the dirty byte
@@ -537,7 +579,8 @@ grwxr_spawn_entry PROC
     mov     [rsp+68h], rax
 
     mov     rcx, [rsp+40h]
-    call    grwxr_spawn_post        ; put the engine's own value back
+    mov     rdx, [rsp+68h]          ; build 59: the spawn's result, so post can
+    call    grwxr_spawn_post        ; validate it as the projectile instance
 
     mov     rax, [rsp+68h]
     add     rsp, 0B8h

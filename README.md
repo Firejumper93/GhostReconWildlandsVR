@@ -336,18 +336,23 @@ The sections below are for building from source.
 
 `build.bat` selects the toolchain in this order, using the first that exists:
 
-1. `C:\Program Files\Microsoft Visual Studio\18\Community` (the environment the
-   project's build machine uses, and what every release **through v0.7.0** was
-   compiled with),
+1. `C:\Program Files\Microsoft Visual Studio\18\Community` (the project's primary
+   build machine; **every release through v0.7.0 was compiled with this**),
 2. `C:\Program Files\Microsoft Visual Studio\2022\Community` (fallback).
 
-**This matters right now:** releases **v0.8.0, v0.8.1 and v0.8.2 were compiled
-with Visual Studio 2022**, on a different machine than earlier releases. A
-startup crash reported on some runtimes (Virtual Desktop, Steam Link) in those
-builds is under investigation as a possible toolchain difference. The
+**This matters right now.** The releases split cleanly by compiler:
+
+| Releases | Machine | Compiler |
+|---|---|---|
+| through **v0.7.0** (worked on VD / Steam Link) | primary build machine | Visual Studio at `\18\` |
+| **v0.8.0, v0.8.1, v0.8.2** (startup crash on VD / Steam Link) | second machine | **Visual Studio 2022 Community, MSVC 14.39.33519** |
+
+A startup crash in the v0.8.x builds (black screen, then the game closes) on
+Virtual Desktop and Steam Link is under investigation as a probable toolchain
+difference: the code paths involved are byte-identical to v0.7.0. The
 `v0.7.0-vs2022-crashfix` pre-release pairs v0.7.0's known-good source with the
-VS 2022 compiler to test exactly that; see issue #2. Each release records the
-compiler it was built with in its notes.
+VS 2022 compiler to confirm it (see issue #2). Each release records the compiler
+it was built with in its notes.
 
 ## Installing
 

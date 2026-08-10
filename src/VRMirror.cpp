@@ -416,6 +416,12 @@ static float g_cfg_wgun_pos        = 0.0f;   // build 81, position rides ctrl
 static float g_cfg_wgun_pos_scale  = 1.0f;
 static float g_cfg_wgun_pos_clamp  = 1.0f;
 static float g_cfg_wgun_pos_smooth = 0.35f;
+// Issue #2: on a machine with two GPUs (a CPU iGPU plus a discrete card) the
+// game can bind to a different adapter than the headset runtime uses, and
+// cross-adapter frame sharing hangs after one frame. Default ON, and ON when
+// the key is absent, so users who UPDATE (and keep their old cfg without this
+// key) still get the protection. adapter_check=0 forces past it.
+static bool g_cfg_adapter_check = true;
 
 // Build 10m: the ipd_scale the run started with (cfg value, or 1.0 with no
 // cfg). Numpad * resets to this rather than a hardcoded 1.0, so reset means
@@ -600,6 +606,8 @@ void load_config() {
             camera::set_wskel_write((int)v);
         if (sscanf_s(line, " wgun = %f", &v) == 1)
             g_cfg_wgun = v;
+        if (sscanf_s(line, " adapter_check = %f", &v) == 1)
+            g_cfg_adapter_check = v > 0.5f;
         if (sscanf_s(line, " wbaxis = %f", &v) == 1)
             g_cfg_wbaxis = v;
         if (sscanf_s(line, " wgun_smooth = %f", &v) == 1)
@@ -2066,16 +2074,77 @@ bool init(const d3d11::State& st) {
     }
 
     // The runtime dictates which adapter. If the game's device is on a different
-    // one we must know, because sharing textures across adapters will not work.
+    // one, sharing textures across adapters silently fails and the compositor
+    // hangs after the first frame. That is issue #2: a desktop whose CPU has
+    // integrated graphics (Ryzen 7000/9000, Intel iGPU) plus a discrete card,
+    // where Windows bound the game to the iGPU while the runtime used the dGPU.
+    // We read both LUIDs, and on a mismatch STAND DOWN to flat rendering with a
+    // loud, actionable log instead of freezing the game.
+    LUID want_luid = {};
+    bool have_want = false;
     PFN_xrGetD3D11GraphicsRequirementsKHR pfn = nullptr;
     xrGetInstanceProcAddr(g_instance, "xrGetD3D11GraphicsRequirementsKHR",
                           (PFN_xrVoidFunction*)&pfn);
     if (pfn) {
         XrGraphicsRequirementsD3D11KHR req{XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR};
         if (XR_SUCCEEDED(pfn(g_instance, g_system, &req))) {
+            want_luid = req.adapterLuid;
+            have_want = (want_luid.HighPart != 0 || want_luid.LowPart != 0);
             LOG_INFO("VR: runtime wants adapter LUID %08lX:%08lX",
                      (unsigned long)req.adapterLuid.HighPart,
                      (unsigned long)req.adapterLuid.LowPart);
+        }
+    }
+
+    // Read the GAME device's own adapter LUID via DXGI and compare.
+    if (have_want && g_cfg_adapter_check) {
+        LUID game_luid = {};
+        bool have_game = false;
+        IDXGIDevice* dxdev = nullptr;
+        if (SUCCEEDED(st.device->QueryInterface(__uuidof(IDXGIDevice),
+                                                (void**)&dxdev)) && dxdev) {
+            IDXGIAdapter* ad = nullptr;
+            if (SUCCEEDED(dxdev->GetAdapter(&ad)) && ad) {
+                DXGI_ADAPTER_DESC d{};
+                if (SUCCEEDED(ad->GetDesc(&d))) {
+                    game_luid = d.AdapterLuid;
+                    have_game = true;
+                    char name[160] = {};
+                    WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name,
+                                        (int)sizeof(name), nullptr, nullptr);
+                    LOG_INFO("VR: game device is on adapter LUID %08lX:%08lX (%s)",
+                             (unsigned long)game_luid.HighPart,
+                             (unsigned long)game_luid.LowPart, name);
+                }
+                ad->Release();
+            }
+            dxdev->Release();
+        }
+        if (have_game &&
+            (game_luid.HighPart != want_luid.HighPart ||
+             game_luid.LowPart  != want_luid.LowPart)) {
+            LOG_ERROR("");
+            LOG_ERROR("############ FATAL: GPU ADAPTER MISMATCH ############");
+            LOG_ERROR("  The headset runtime is using one GPU, but the GAME is");
+            LOG_ERROR("  rendering on a DIFFERENT GPU. Frames cannot be shared");
+            LOG_ERROR("  across GPUs, so VR would freeze after the first frame.");
+            LOG_ERROR("  VR is STOOD DOWN; the game keeps running on the flat");
+            LOG_ERROR("  monitor so it does not hang. This is common on desktops");
+            LOG_ERROR("  whose CPU has integrated graphics (Ryzen 7000/9000,");
+            LOG_ERROR("  Intel iGPU) next to a discrete card.");
+            LOG_ERROR("  FIX (do ONE, then relaunch):");
+            LOG_ERROR("   1. Plug your MONITOR into the discrete GPU's ports,");
+            LOG_ERROR("      not the motherboard's video output.");
+            LOG_ERROR("   2. Windows Settings > System > Display > Graphics: add");
+            LOG_ERROR("      GRW.exe, set it to High performance (your dGPU).");
+            LOG_ERROR("   3. NVIDIA Control Panel / AMD Software: set GRW.exe's");
+            LOG_ERROR("      preferred GPU to the discrete card.");
+            LOG_ERROR("   4. Or disable the integrated GPU in Device Manager/BIOS.");
+            LOG_ERROR("  Override (NOT recommended): adapter_check=0 in grwxr.cfg.");
+            LOG_ERROR("####################################################");
+            LOG_ERROR("");
+            g_failed.store(true);
+            return false;
         }
     }
 

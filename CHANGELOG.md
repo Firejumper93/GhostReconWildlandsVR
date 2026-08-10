@@ -5,6 +5,25 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
+## v0.8.3-alpha, "The Weapon" (2026-08-10, GPU-mismatch startup-crash fix)
+
+Targets the startup crash on v0.8.0-v0.8.2 (black screen, then the game closes).
+Tester logs narrowed it: the **same** v0.8.2 build ran 15,554 frames on Virtual
+Desktop for one tester and froze at frame 1 for another, so it was never the build,
+the compiler, or the runtime. The crashing PC had **two GPUs** (a discrete card
+plus the CPU's integrated graphics, e.g. Ryzen 7000/9000 or Intel), and Windows ran
+the game on the integrated GPU while the headset used the discrete one. Frames
+cannot cross GPUs, so the compositor hung after one frame.
+
+- `init()` now reads the game device's adapter LUID (via DXGI) and compares it to
+  the runtime's required adapter. On a mismatch it **stands down to flat rendering
+  with a loud, actionable log** (force `GRW.exe` onto the discrete GPU) instead of
+  freezing the game. `adapter_check` cfg (default 1, and on when the key is absent,
+  so updaters are protected too); `adapter_check=0` overrides.
+- The earlier toolchain lead was a red herring: the Epic tester's success proves the
+  VS 2022 builds are fine. The `v0.7.0-vs2022-crashfix` test release is retired to
+  a prerelease.
+
 ## v0.8.2-alpha, "The Weapon" (2026-08-10, startup-crash fix)
 
 Targets the startup crash reported on v0.8.0/v0.8.1 (black screen, then the game

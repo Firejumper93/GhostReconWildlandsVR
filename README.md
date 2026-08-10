@@ -308,7 +308,9 @@ controllers possibly still working. Check `GRWVR\grwxr-<pid>.log` for the
 - **Asynchronous Spacewarp must be disabled** (Oculus Debug Tool, set ASW to Disabled).
   The mod manages the stale eye itself; ASW compounds artifacts on top of it.
 - A GPU with headroom: the test system is an RTX 5060 Ti 16 GB with a Ryzen 7 9700X.
-- To build: Visual Studio 2022 or newer with the C++ workload (MSVC x64, `ml64`).
+- To build: MSVC x64 with the Visual Studio C++ workload (provides `cl` and
+  `ml64`). See **Building** below for the exact toolchain each release used and
+  how `build.bat` selects one.
 
 ## Quick install (no build needed)
 
@@ -329,6 +331,23 @@ The sections below are for building from source.
 2. If your Visual Studio is not at the default path, edit `VCVARS` at the top of
    `build.bat`.
 3. Run `build.bat`. Output: `build\dxgi.dll` (the script prints its SHA256).
+
+### Build toolchain (which Visual Studio is used)
+
+`build.bat` selects the toolchain in this order, using the first that exists:
+
+1. `C:\Program Files\Microsoft Visual Studio\18\Community` (the environment the
+   project's build machine uses, and what every release **through v0.7.0** was
+   compiled with),
+2. `C:\Program Files\Microsoft Visual Studio\2022\Community` (fallback).
+
+**This matters right now:** releases **v0.8.0, v0.8.1 and v0.8.2 were compiled
+with Visual Studio 2022**, on a different machine than earlier releases. A
+startup crash reported on some runtimes (Virtual Desktop, Steam Link) in those
+builds is under investigation as a possible toolchain difference. The
+`v0.7.0-vs2022-crashfix` pre-release pairs v0.7.0's known-good source with the
+VS 2022 compiler to test exactly that; see issue #2. Each release records the
+compiler it was built with in its notes.
 
 ## Installing
 

@@ -387,7 +387,7 @@ bool init(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     // NEVER let ImGui write its own ini. It would land beside the game exe,
-    // and the default project rule is that we place nothing in the install
+    // and the project rules' default rule is that we place nothing in the install
     // except the proxy and the GRWVR folder.
     io.IniFilename  = nullptr;
     io.LogFilename  = nullptr;

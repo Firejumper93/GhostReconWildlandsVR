@@ -1,7 +1,6 @@
 #include "VRMirror.h"
 #include "AimTrace.h"
 #include "CameraProbe.h"
-#include "GunModel.h"
 #include "HeadPose.h"
 #include "Log.h"
 #include "WeaponProbe.h"
@@ -347,27 +346,6 @@ int   g_aq_axis = 2;
 bool  g_dot_on = false;       // this frame: draw it
 float g_dot_tx = 0.0f;        // tangent offsets from view center
 float g_dot_ty = 0.0f;
-// OVERLAY GUN (milestone 1, docs/PLAN-controller-gun.md). Our OWN blocky gun
-// mesh drawn locked to the right controller, composited on top of the flat
-// blitted eye image like a VR viewmodel. VISUAL ONLY (skeleton rule 3): it
-// moves pixels, never bullets. The MVP is built each present from the SAME
-// head-pose path the hand markers use (matched by construction, self-checked
-// once), so it inherits their tracking quality. cfg overlay_gun, default off.
-bool  g_gun_enable   = false;             // cfg overlay_gun
-float g_gun_grip[3]  = {0.0f, 0.0f, 0.0f};// cfg grip offset, model metres (right,up,fwd)
-float g_gun_mvp[2][16] = {};              // per-eye model*view*proj, row-vector
-bool  g_gun_draw[2]  = {false, false};    // this present: eye has a valid MVP
-ID3D11Buffer*             g_gun_vb  = nullptr;
-ID3D11Buffer*             g_gun_ib  = nullptr;
-ID3D11Buffer*             g_gun_cb  = nullptr;
-ID3D11InputLayout*        g_gun_il  = nullptr;
-ID3D11VertexShader*       g_gun_vs  = nullptr;
-ID3D11PixelShader*        g_gun_ps  = nullptr;
-ID3D11RasterizerState*    g_gun_rs  = nullptr;
-ID3D11DepthStencilState*  g_gun_dss = nullptr;
-ID3D11Texture2D*          g_gun_depth_tex[2] = {nullptr, nullptr};
-ID3D11DepthStencilView*   g_gun_dsv[2]       = {nullptr, nullptr};
-UINT                      g_gun_index_count  = 0;
 ID3D11SamplerState*       g_blit_samp = nullptr;
 ID3D11RasterizerState*    g_blit_rs   = nullptr;
 ID3D11DepthStencilState*  g_blit_dss  = nullptr;
@@ -605,26 +583,6 @@ void load_config() {
             g_aim_on_start.store(v >= 0.5f ? 1 : 0, std::memory_order_relaxed);
         if (sscanf_s(line, " hand_markers = %f", &v) == 1)
             g_hand_enable = v > 0.0f;
-        // Overlay gun (milestone 1): draw our own blocky gun locked to the right
-        // controller. Visual only. 0 hides it. grip_* nudge the gun in the hand,
-        // model metres (right, up, forward), all hot-reloadable.
-        if (sscanf_s(line, " overlay_gun = %f", &v) == 1)
-            g_gun_enable = v > 0.0f;
-        if (sscanf_s(line, " gun_grip_right = %f", &v) == 1) {
-            if (v < -0.5f) v = -0.5f;
-            if (v >  0.5f) v =  0.5f;
-            g_gun_grip[0] = v;
-        }
-        if (sscanf_s(line, " gun_grip_up = %f", &v) == 1) {
-            if (v < -0.5f) v = -0.5f;
-            if (v >  0.5f) v =  0.5f;
-            g_gun_grip[1] = v;
-        }
-        if (sscanf_s(line, " gun_grip_fwd = %f", &v) == 1) {
-            if (v < -0.5f) v = -0.5f;
-            if (v >  0.5f) v =  0.5f;
-            g_gun_grip[2] = v;
-        }
         // Build 45: weapon-candidate markers. 0 hides them (hot-reload).
         if (sscanf_s(line, " wp_markers = %f", &v) == 1)
             g_wpm_enable = v > 0.0f;
@@ -838,138 +796,6 @@ void quat_rotate_inv(const Quat& q, const float v[3], float out[3]) {
 
 bool g_have_ref = false;
 Quat g_ref_inv{0.0f, 0.0f, 0.0f, 1.0f};   // conjugate of the yaw-only reference
-
-// OVERLAY GUN: build the per-eye MVP for the controller-held mesh. Row-vector
-// convention throughout (clip = (x,y,z,1) * M), matching quat_to_rows and the
-// engine. The whole chain reuses the head-pose marker route: model -> reference
-// (controller pose + grip) -> head-local (quat_rotate_inv(q, .-head)) -> per-eye
-// x-shift -> off-axis projection built from the SAME canvas tangents the blit
-// uses (g_sx/g_sy/g_cx/g_cy), so a mesh vertex lands exactly where a hand marker
-// at the same point would. Verified once against the marker formula (fail-closed).
-void mat_mul4(const float A[16], const float B[16], float O[16]) {
-    for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 4; ++j) {
-            float s = 0.0f;
-            for (int k = 0; k < 4; ++k) s += A[i * 4 + k] * B[k * 4 + j];
-            O[i * 4 + j] = s;
-        }
-}
-
-void build_gun_mvps(const Quat& q) {
-    g_gun_draw[0] = g_gun_draw[1] = false;
-    if (!g_gun_enable || !g_head_pos_ok) return;
-    if (!g_in_track[1].load(std::memory_order_relaxed)) return;
-    if (!g_sc_w || !g_sc_h) return;
-    if (headpose::read_fov(0.7853982f) < 0.65f) return;   // hazard 25: not in optics
-
-    const Quat c{g_in_ori[1][0].load(std::memory_order_relaxed),
-                 g_in_ori[1][1].load(std::memory_order_relaxed),
-                 g_in_ori[1][2].load(std::memory_order_relaxed),
-                 g_in_ori[1][3].load(std::memory_order_relaxed)};
-    const float pR[3] = {g_in_pos[1][0].load(std::memory_order_relaxed),
-                         g_in_pos[1][1].load(std::memory_order_relaxed),
-                         g_in_pos[1][2].load(std::memory_order_relaxed)};
-    const float half_ipd = 0.5f * headpose::read_ipd(0.063f);
-
-    // Model -> reference: refpos = (v + grip) * Rc + pR  (row-vector).
-    float Rc[9];
-    quat_to_rows(c, Rc);
-    float gripw[3] = {
-        g_gun_grip[0] * Rc[0] + g_gun_grip[1] * Rc[3] + g_gun_grip[2] * Rc[6],
-        g_gun_grip[0] * Rc[1] + g_gun_grip[1] * Rc[4] + g_gun_grip[2] * Rc[7],
-        g_gun_grip[0] * Rc[2] + g_gun_grip[1] * Rc[5] + g_gun_grip[2] * Rc[8]};
-    const float Mref[16] = {
-        Rc[0], Rc[1], Rc[2], 0.0f,
-        Rc[3], Rc[4], Rc[5], 0.0f,
-        Rc[6], Rc[7], Rc[8], 0.0f,
-        gripw[0] + pR[0], gripw[1] + pR[1], gripw[2] + pR[2], 1.0f};
-
-    // Reference -> head-local: rotate by conj(q), translate by -head. quat_rotate_inv
-    // (used by the markers) applies conj(q); as a row-vector matrix that is
-    // quat_to_rows(conj(q)).
-    const Quat cq{-q.x, -q.y, -q.z, q.w};
-    float Rh[9];
-    quat_to_rows(cq, Rh);
-    const float* H = g_head_pos;
-    const float headRh[3] = {
-        H[0] * Rh[0] + H[1] * Rh[3] + H[2] * Rh[6],
-        H[0] * Rh[1] + H[1] * Rh[4] + H[2] * Rh[7],
-        H[0] * Rh[2] + H[1] * Rh[5] + H[2] * Rh[8]};
-
-    const float n = 0.02f, F = 8.0f;
-    const float pa = F / (F - n), pb = -n * F / (F - n);
-
-    for (int eye = 0; eye < 2; ++eye) {
-        const float eyeshift = (eye == 0) ? -half_ipd : half_ipd;
-        // head-local + x-shift, folded: v_view = (v_ref - head) * Rh, then x -= eyeshift.
-        const float VS[16] = {
-            Rh[0], Rh[1], Rh[2], 0.0f,
-            Rh[3], Rh[4], Rh[5], 0.0f,
-            Rh[6], Rh[7], Rh[8], 0.0f,
-            -headRh[0] - eyeshift, -headRh[1], -headRh[2], 1.0f};
-        // Off-axis projection matching the canvas: NDC.x = A*(x/fwd)+Bx,
-        // NDC.y = D*(y/fwd)+By, fwd = -z_view, canvas maps (tx,ty) via g_sx/cx.
-        const float A  = 2.0f * g_sx[eye] / (float)g_sc_w;
-        const float Bx = 2.0f * g_cx[eye] / (float)g_sc_w - 1.0f;
-        const float D  = 2.0f * g_sy[eye] / (float)g_sc_h;
-        const float By = 1.0f - 2.0f * g_cy[eye] / (float)g_sc_h;
-        const float P[16] = {
-            A,    0.0f, 0.0f, 0.0f,
-            0.0f, D,    0.0f, 0.0f,
-            -Bx,  -By,  -pa,  -1.0f,
-            0.0f, 0.0f, pb,   0.0f};
-        float tmp[16];
-        mat_mul4(Mref, VS, tmp);
-        mat_mul4(tmp, P, g_gun_mvp[eye]);
-        g_gun_draw[eye] = true;
-    }
-
-    // One-time self-check: the model origin projected by the matrix must land
-    // within a couple of pixels of where the verified marker formula puts it.
-    // If not, a convention error slipped in: disable the gun (fail-closed) so a
-    // bad matrix can never draw garbage or disturb the stereo path.
-    static bool s_checked = false;
-    if (!s_checked) {
-        s_checked = true;
-        const float O[3] = {Mref[12], Mref[13], Mref[14]};   // model origin in reference space
-        const float rel[3] = {O[0] - H[0], O[1] - H[1], O[2] - H[2]};
-        float lv[3];
-        quat_rotate_inv(q, rel, lv);
-        const float fwd = -lv[2];
-        if (fwd > 0.08f) {
-            const float eyeshift = -half_ipd;   // eye 0
-            const float tx = (lv[0] - eyeshift) / fwd;
-            const float ty = lv[1] / fwd;
-            const float px_m = g_cx[0] + tx * g_sx[0];
-            const float py_m = g_cy[0] - ty * g_sy[0];
-            // The MVP already contains Mref, so the MODEL origin (0,0,0) is what
-            // maps to O_ref: its clip is simply the MVP translation row (row 3).
-            // (The earlier check multiplied O_ref through the full MVP, applying
-            // Mref twice, which is why it wrongly failed.)
-            const float* M = g_gun_mvp[0];
-            const float cw  = M[15];
-            const float cxx = M[12];
-            const float cyy = M[13];
-            if (cw > 1e-4f) {
-                const float ndx = cxx / cw, ndy = cyy / cw;
-                const float px_M = (ndx * 0.5f + 0.5f) * (float)g_sc_w;
-                const float py_M = (0.5f - ndy * 0.5f) * (float)g_sc_h;
-                const float ex = fabsf(px_M - px_m), ey = fabsf(py_M - py_m);
-                if (ex > 2.0f || ey > 2.0f) {
-                    g_gun_enable = false;
-                    g_gun_draw[0] = g_gun_draw[1] = false;
-                    note("VR: overlay_gun self-check FAILED (marker px %.1f,%.1f vs "
-                         "matrix px %.1f,%.1f); gun disabled, stereo unaffected.",
-                         px_m, py_m, px_M, py_M);
-                } else {
-                    note("VR: overlay_gun self-check ok (%.2f,%.2f px error). "
-                         "The blocky gun is drawn locked to the right controller; "
-                         "overlay_gun=0 in grwxr.cfg hides it.", ex, ey);
-                }
-            }
-        }
-    }
-}
 
 // --- Build 19: VR HEAD AIM ------------------------------------------------
 //
@@ -1379,10 +1205,6 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
                 g_hand_on[h] = any;
             }
         }
-
-        // OVERLAY GUN: build both eyes' MVP from this same head pose. Kept next
-        // to the hand markers because it shares their exact head-local route.
-        build_gun_mvps(q);
 
         // BUILD 45: weapon-candidate markers. Unlike the hand markers these
         // are placed from ENGINE world positions, so the conversion uses the
@@ -1941,186 +1763,6 @@ bool create_blit_resources(const d3d11::State& st) {
     return ok;
 }
 
-// OVERLAY GUN: one-time device resources (mesh buffers, shaders, states). Any
-// failure disables the gun only, never the blit (same degrade-not-break rule as
-// the markers). The per-eye depth buffers are created later in create_canvases
-// (they need the canvas size). Called once from init, beside create_blit_resources.
-void create_gun_resources(const d3d11::State& st) {
-    std::vector<gun::Vertex> verts;
-    std::vector<uint16_t>    idx;
-    gun::build_mesh(verts, idx);
-    if (verts.empty() || idx.empty()) return;
-    g_gun_index_count = (UINT)idx.size();
-
-    {
-        D3D11_BUFFER_DESC bd{};
-        bd.Usage     = D3D11_USAGE_IMMUTABLE;
-        bd.ByteWidth = (UINT)(verts.size() * sizeof(gun::Vertex));
-        bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-        D3D11_SUBRESOURCE_DATA sd{};
-        sd.pSysMem = verts.data();
-        if (FAILED(st.device->CreateBuffer(&bd, &sd, &g_gun_vb))) return;
-    }
-    {
-        D3D11_BUFFER_DESC bd{};
-        bd.Usage     = D3D11_USAGE_IMMUTABLE;
-        bd.ByteWidth = (UINT)(idx.size() * sizeof(uint16_t));
-        bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
-        D3D11_SUBRESOURCE_DATA sd{};
-        sd.pSysMem = idx.data();
-        if (FAILED(st.device->CreateBuffer(&bd, &sd, &g_gun_ib))) return;
-    }
-    {
-        D3D11_BUFFER_DESC bd{};
-        bd.Usage          = D3D11_USAGE_DYNAMIC;
-        bd.ByteWidth      = 64;                       // one float4x4 MVP
-        bd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
-        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        if (FAILED(st.device->CreateBuffer(&bd, nullptr, &g_gun_cb))) return;
-    }
-
-    wchar_t sys[MAX_PATH];
-    const UINT sn = GetSystemDirectoryW(sys, MAX_PATH);
-    if (!sn || sn >= MAX_PATH) return;
-    HMODULE h = LoadLibraryW((std::wstring(sys) + L"\\d3dcompiler_47.dll").c_str());
-    if (!h) return;
-    auto compile = (PFN_D3DCompile)GetProcAddress(h, "D3DCompile");
-    if (!compile) return;
-
-    static const char kGunSrc[] =
-        "#pragma pack_matrix(row_major)\n"
-        "cbuffer Cb : register(b0) { float4x4 mvp; };\n"
-        "struct VIn  { float3 pos:POSITION; float3 nrm:NORMAL; float3 col:COLOR; };\n"
-        "struct VOut { float4 pos:SV_Position; float3 nrm:TEXCOORD0; float3 col:TEXCOORD1; };\n"
-        "VOut gun_vs(VIn i) {\n"
-        "    VOut o;\n"
-        "    o.pos = mul(float4(i.pos, 1.0), mvp);\n"
-        "    o.nrm = i.nrm; o.col = i.col; return o;\n"
-        "}\n"
-        "float4 gun_ps(VOut i) : SV_Target {\n"
-        "    float3 L = normalize(float3(0.35, 0.65, 0.5));\n"
-        "    float  d = saturate(dot(normalize(i.nrm), L)) * 0.75 + 0.25;\n"
-        "    return float4(i.col * d, 1.0);\n"
-        "}\n";
-
-    ID3DBlob* vsb = nullptr; ID3DBlob* psb = nullptr; ID3DBlob* err = nullptr;
-    if (FAILED(compile(kGunSrc, sizeof(kGunSrc) - 1, "grwxr_gun", nullptr, nullptr,
-                       "gun_vs", "vs_4_0", 0, 0, &vsb, &err))) {
-        LOG_WARN("VR: overlay gun VS compile failed: %s",
-                 err ? (const char*)err->GetBufferPointer() : "?");
-        if (err) err->Release();
-        return;
-    }
-    if (err) { err->Release(); err = nullptr; }
-    if (FAILED(compile(kGunSrc, sizeof(kGunSrc) - 1, "grwxr_gun", nullptr, nullptr,
-                       "gun_ps", "ps_4_0", 0, 0, &psb, &err))) {
-        LOG_WARN("VR: overlay gun PS compile failed: %s",
-                 err ? (const char*)err->GetBufferPointer() : "?");
-        if (err) err->Release();
-        vsb->Release();
-        return;
-    }
-    if (err) err->Release();
-
-    bool ok =
-        SUCCEEDED(st.device->CreateVertexShader(vsb->GetBufferPointer(),
-                                                vsb->GetBufferSize(), nullptr, &g_gun_vs)) &&
-        SUCCEEDED(st.device->CreatePixelShader(psb->GetBufferPointer(),
-                                               psb->GetBufferSize(), nullptr, &g_gun_ps));
-    if (ok) {
-        const D3D11_INPUT_ELEMENT_DESC il[3] = {
-            {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0},
-            {"NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
-            {"COLOR",    0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
-        };
-        ok = SUCCEEDED(st.device->CreateInputLayout(il, 3, vsb->GetBufferPointer(),
-                                                    vsb->GetBufferSize(), &g_gun_il));
-    }
-    vsb->Release();
-    psb->Release();
-
-    if (ok) {
-        D3D11_RASTERIZER_DESC rd{};
-        rd.FillMode        = D3D11_FILL_SOLID;
-        rd.CullMode        = D3D11_CULL_NONE;   // M1: no winding constraint
-        rd.DepthClipEnable = TRUE;
-        ok = SUCCEEDED(st.device->CreateRasterizerState(&rd, &g_gun_rs));
-    }
-    if (ok) {
-        D3D11_DEPTH_STENCIL_DESC dd{};
-        dd.DepthEnable    = TRUE;
-        dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-        dd.DepthFunc      = D3D11_COMPARISON_LESS;
-        ok = SUCCEEDED(st.device->CreateDepthStencilState(&dd, &g_gun_dss));
-    }
-    LOG_INFO("VR: overlay gun resources %s (%u indices). It draws our OWN blocky "
-             "gun locked to the right controller, on top of the eye image; "
-             "visual only, does not affect bullets. overlay_gun=1 in grwxr.cfg.",
-             ok ? "armed" : "PARTIAL (gun disabled)", g_gun_index_count);
-}
-
-// OVERLAY GUN: per-eye private depth buffer (self-occlusion only). Created in
-// create_canvases once the canvas size is known. Failure disables the gun.
-void create_gun_depth(const d3d11::State& st) {
-    for (int eye = 0; eye < 2; ++eye) {
-        D3D11_TEXTURE2D_DESC td{};
-        td.Width            = g_sc_w;
-        td.Height           = g_sc_h;
-        td.MipLevels        = 1;
-        td.ArraySize        = 1;
-        td.Format           = DXGI_FORMAT_D32_FLOAT;
-        td.SampleDesc.Count = 1;
-        td.Usage            = D3D11_USAGE_DEFAULT;
-        td.BindFlags        = D3D11_BIND_DEPTH_STENCIL;
-        if (FAILED(st.device->CreateTexture2D(&td, nullptr, &g_gun_depth_tex[eye])) ||
-            FAILED(st.device->CreateDepthStencilView(g_gun_depth_tex[eye], nullptr,
-                                                     &g_gun_dsv[eye]))) {
-            if (g_gun_dsv[eye])       { g_gun_dsv[eye]->Release();       g_gun_dsv[eye]       = nullptr; }
-            if (g_gun_depth_tex[eye]) { g_gun_depth_tex[eye]->Release(); g_gun_depth_tex[eye] = nullptr; }
-        }
-    }
-}
-
-// OVERLAY GUN: draw the mesh for this eye onto the acquired canvas image, then
-// restore the blit state the rest of blit_into and the desktop mirror expect.
-// Render thread, no logging (rule 8).
-void draw_gun(int eye, ID3D11DeviceContext* ctx, uint32_t idx) {
-    if (!g_gun_enable || !g_gun_draw[eye]) return;
-    if (!g_gun_vs || !g_gun_ps || !g_gun_il || !g_gun_vb || !g_gun_ib ||
-        !g_gun_cb || !g_gun_rs || !g_gun_dss || !g_gun_dsv[eye]) return;
-    if (idx >= g_rtv[eye].size() || !g_rtv[eye][idx]) return;
-
-    D3D11_MAPPED_SUBRESOURCE ms{};
-    if (FAILED(ctx->Map(g_gun_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) return;
-    memcpy(ms.pData, g_gun_mvp[eye], 64);
-    ctx->Unmap(g_gun_cb, 0);
-
-    ctx->ClearDepthStencilView(g_gun_dsv[eye], D3D11_CLEAR_DEPTH, 1.0f, 0);
-    UINT stride = sizeof(gun::Vertex), off = 0;
-    ctx->IASetInputLayout(g_gun_il);
-    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ctx->IASetVertexBuffers(0, 1, &g_gun_vb, &stride, &off);
-    ctx->IASetIndexBuffer(g_gun_ib, DXGI_FORMAT_R16_UINT, 0);
-    ctx->VSSetShader(g_gun_vs, nullptr, 0);
-    ctx->VSSetConstantBuffers(0, 1, &g_gun_cb);
-    ctx->PSSetShader(g_gun_ps, nullptr, 0);
-    ctx->RSSetState(g_gun_rs);
-    ctx->OMSetDepthStencilState(g_gun_dss, 0);
-    D3D11_VIEWPORT fv{0.0f, 0.0f, (float)g_sc_w, (float)g_sc_h, 0.0f, 1.0f};
-    ctx->RSSetViewports(1, &fv);
-    ctx->OMSetRenderTargets(1, &g_rtv[eye][idx], g_gun_dsv[eye]);
-    ctx->DrawIndexed(g_gun_index_count, 0, 0);
-
-    // Restore the blit state (null DSV, blit VS/PS/RS/DSS, null input layout) so
-    // the pixel probe, any later overlay draw, and the desktop mirror see the
-    // state they expect. ctx_restore at present-end returns everything to the game.
-    ctx->OMSetRenderTargets(1, &g_rtv[eye][idx], nullptr);
-    ctx->IASetInputLayout(nullptr);
-    ctx->VSSetShader(g_blit_vs, nullptr, 0);
-    ctx->PSSetShader(g_blit_ps, nullptr, 0);
-    ctx->RSSetState(g_blit_rs);
-    ctx->OMSetDepthStencilState(g_blit_dss, 0);
-}
 
 // BUILD 11a: acquire one image of the eye's canvas, clear it black, DRAW the
 // eye's captured frame (g_last mips) at the angular size of `fovy`, release.
@@ -2217,10 +1859,6 @@ bool blit_into(int eye, ID3D11DeviceContext* ctx, float fovy) {
             ctx->Draw(3, 0);
             ctx->PSSetShader(g_blit_ps, nullptr, 0);
         }
-
-        // OVERLAY GUN: the mesh draw rides the same acquired image, last among
-        // the overlay draws so only the blit-state tail needs restoring.
-        draw_gun(eye, ctx, idx);
 
         // 11a.2 one-shot probe: read one pixel of the blit source and one of
         // the canvas after the draw. Runs once per run, a few seconds in (so
@@ -2345,7 +1983,6 @@ bool create_canvases(const d3d11::State& st, const XrView views[2]) {
         g_dst_x[eye] = dx;
         g_dst_y[eye] = dy;
     }
-    create_gun_depth(st);   // overlay gun: per-eye private depth, now that sizes are known
     g_canvas_ready = true;
     // 11a.2: a blit without working RTVs submits nothing (black headset).
     // Fall back to the fixed copy, which needs no RTV, and say so.
@@ -2620,7 +2257,6 @@ bool init(const d3d11::State& st) {
     // once here (rule 8, hazard 20). Failure is loud and leaves the 10L
     // fixed-copy path in charge.
     g_blit_ok = create_blit_resources(st);
-    create_gun_resources(st);   // overlay gun device resources (degrade-not-break)
 
     // BUILD 10i: the per-eye last-frame copies, same size/format as the
     // swapchain images. BUILD 11a: when the blit is armed these are also its
@@ -3434,19 +3070,6 @@ void shutdown() {
     if (g_blit_samp) { g_blit_samp->Release(); g_blit_samp = nullptr; }
     if (g_blit_ps)   { g_blit_ps->Release();   g_blit_ps   = nullptr; }
     if (g_blit_vs)   { g_blit_vs->Release();   g_blit_vs   = nullptr; }
-    // overlay gun
-    for (int eye = 0; eye < 2; ++eye) {
-        if (g_gun_dsv[eye])       { g_gun_dsv[eye]->Release();       g_gun_dsv[eye]       = nullptr; }
-        if (g_gun_depth_tex[eye]) { g_gun_depth_tex[eye]->Release(); g_gun_depth_tex[eye] = nullptr; }
-    }
-    if (g_gun_dss) { g_gun_dss->Release(); g_gun_dss = nullptr; }
-    if (g_gun_rs)  { g_gun_rs->Release();  g_gun_rs  = nullptr; }
-    if (g_gun_il)  { g_gun_il->Release();  g_gun_il  = nullptr; }
-    if (g_gun_ps)  { g_gun_ps->Release();  g_gun_ps  = nullptr; }
-    if (g_gun_vs)  { g_gun_vs->Release();  g_gun_vs  = nullptr; }
-    if (g_gun_cb)  { g_gun_cb->Release();  g_gun_cb  = nullptr; }
-    if (g_gun_ib)  { g_gun_ib->Release();  g_gun_ib  = nullptr; }
-    if (g_gun_vb)  { g_gun_vb->Release();  g_gun_vb  = nullptr; }
     for (int eye = 0; eye < 2; ++eye) {
         for (auto* r : g_rtv[eye]) {
             if (r) r->Release();

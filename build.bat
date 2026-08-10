@@ -8,10 +8,13 @@ REM Output: build\dxgi.dll
 
 setlocal enabledelayedexpansion
 
+REM Toolchain: the game rig has VS 18, the dev machine has VS 2022. Try in
+REM that order so the rig's behavior is unchanged.
 set VCVARS=C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat
+if not exist "%VCVARS%" set VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat
 if not exist "%VCVARS%" (
-    echo ERROR: vcvars64.bat not found at:
-    echo   %VCVARS%
+    echo ERROR: vcvars64.bat not found. Looked for VS 18 and VS 2022 Community at:
+    echo   C:\Program Files\Microsoft Visual Studio\{18,2022}\Community\VC\Auxiliary\Build\vcvars64.bat
     exit /b 1
 )
 call "%VCVARS%" >nul
@@ -48,7 +51,7 @@ cl /nologo /std:c++20 /EHsc /O2 /W4 /MT /DNDEBUG /LD /I tools\xr_probe\extern\in
    src\dllmain.cpp src\Log.cpp src\D3D11Hook.cpp src\Crash.cpp src\VRMirror.cpp src\AnselProbe.cpp ^
    src\Sig.cpp src\ThunkHook.cpp src\CameraProbe.cpp src\HeadPose.cpp src\FactoryHook.cpp src\XInputMerge.cpp ^
    src\RenderDocCapture.cpp src\PaletteProbe.cpp src\DrawHook.cpp src\WeaponProbe.cpp src\GameBuild.cpp ^
-   src\AimTrace.cpp src\GunModel.cpp src\WeaponDraw.cpp src\Menu.cpp ^
+   src\AimTrace.cpp src\WeaponDraw.cpp src\Menu.cpp ^
    build\ProbeStub.obj build\imgui\*.obj ^
    /link /DLL /LIBPATH:tools\xr_probe\extern\lib openxr_loader.lib /OUT:build\dxgi.dll
 

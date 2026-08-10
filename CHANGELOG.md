@@ -5,6 +5,28 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
+## v0.8.1-alpha, "The Weapon" (2026-08-10, diagnostic patch)
+
+Chasing a startup crash reported on v0.8.0 (black screen for a couple of seconds,
+then the game closes) on both Virtual Desktop and Steam Link. Both worked in earlier
+releases, so it is a regression. v0.8.0 was also the first build compiled on a
+different PC with a different compiler and shipped without a headset test, so the
+build itself is a suspect alongside the mod's new code.
+
+- **Removed the overlay-gun placeholder** (`overlay_gun`) entirely: `GunModel.{h,cpp}`,
+  all VRMirror draw/resource/config/cleanup paths, the cfg keys, and its build step.
+  This also removes one of the things v0.8.0 newly did at launch.
+- **New `safe_mode` config** (default 0): `safe_mode = 1` skips this release's new
+  motion-controlled-weapon engine hooks (PublishAttachments, SetWorldTransform),
+  making the startup path behave like v0.7.0. A one-edit way to get running and a
+  clean signal about where the crash lives.
+- Guidance added to `INSTALL.txt`: a four-step ladder (run it, `safe_mode`, report,
+  fall back to v0.7.0) so a reporter's result names the cause.
+
+If `safe_mode = 1` still crashes, the cause is the build/toolchain, not the mod's new
+code, and a version compiled on the original PC is needed. v0.7.0 remains the
+known-good fallback for Virtual Desktop and Steam Link.
+
 ## v0.8.0-alpha, "The Weapon" (2026-08-10, PACKAGED RELEASE)
 
 **The weapon follows your right controller, in position and rotation, one to one.**

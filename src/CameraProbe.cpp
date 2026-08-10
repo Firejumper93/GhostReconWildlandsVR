@@ -1787,6 +1787,29 @@ extern "C" void grwxr_probe_record(uint64_t index, const void* saved_raw,
     }
 }
 
+// cfg safe_mode: a bisection switch for the v0.8.0 Virtual Desktop
+// regression (issue #2). When set, the two engine hooks this release
+// ADDED (PublishAttachments and SetWorldTransform, both installed at
+// startup even while gated inert by wgun/wnode) are NOT installed at all,
+// so the running mod behaves like v0.7.0 for the frame loop. This lets a
+// tester decide, without a rebuild, whether the freeze is the new hooks or
+// the new toolchain. The cfg is not parsed this early (VRMirror reads it
+// once the device exists), so read the one key directly. Default off, so
+// this is a no-op for everyone until they set it.
+bool safe_mode_requested() {
+    const std::wstring path = log::data_dir() + L"\\grwxr.cfg";
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return false;
+    char line[256];
+    bool on = false;
+    while (fgets(line, sizeof(line), f)) {
+        float v = 0.0f;
+        if (sscanf_s(line, " safe_mode = %f", &v) == 1) on = v > 0.0f;
+    }
+    fclose(f);
+    return on;
+}
+
 bool install() {
     auto img = sig::main_image();
     if (!img) {
@@ -1942,7 +1965,14 @@ bool install() {
     // nothing, and ThunkHook verifies the E9 really targets the impl before a
     // byte is written. The stub itself stays inert until the census publishes
     // a player skeleton, which it only does while cfg wgun is 1.
-    if (gb->publish_thunk && gb->publish_impl) {
+    const bool safe = safe_mode_requested();
+    if (safe) {
+        LOG_WARN("camera: SAFE MODE (safe_mode=1 in grwxr.cfg). The v0.8.0 "
+                 "weapon hooks (PublishAttachments, SetWorldTransform) will "
+                 "NOT be installed. This is the Virtual Desktop regression "
+                 "bisection switch (issue #2); the weapon feature is off.");
+    }
+    if (!safe && gb->publish_thunk && gb->publish_impl) {
         grwxr_wgun_impl = (uint64_t)(img->base + gb->publish_impl);
         if (g_wgun_hook.install(img->base + gb->publish_thunk,
                                 img->base + gb->publish_impl,
@@ -1953,7 +1983,7 @@ bool install() {
                      "offset by wgun_dz just before the engine places the "
                      "weapon from it.");
         }
-    } else {
+    } else if (!safe) {
         LOG_INFO("wgun: PublishAttachments not derived for this binary. The "
                  "gun-root write is OFF, everything else runs (rule 7).");
     }
@@ -1961,7 +1991,7 @@ bool install() {
     // Build 68: TransformNode::SetWorldTransform, the substitution point.
     // Fail-closed like every other consumer, and inert until the census
     // publishes a weapon node, which it only does while cfg wnode > 0.
-    if (gb->setworld_thunk && gb->setworld_impl) {
+    if (!safe && gb->setworld_thunk && gb->setworld_impl) {
         grwxr_wnode_impl = (uint64_t)(img->base + gb->setworld_impl);
         if (g_wnode_hook.install(img->base + gb->setworld_thunk,
                                  img->base + gb->setworld_impl,
@@ -1972,7 +2002,7 @@ bool install() {
                      "(1 = lift by wnode_dz, 2 = barrel follows the "
                      "controller ray).");
         }
-    } else {
+    } else if (!safe) {
         LOG_INFO("wnode: SetWorldTransform not derived for this binary. The "
                  "weapon placement override is OFF (rule 7).");
     }

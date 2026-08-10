@@ -23,14 +23,17 @@
 > Kopfknochen der Spielfigur hängt (Kopf ausgeblendet, Nahbereichs-Unschärfe
 > entfernt).
 >
-> **ES GIBT KEINE ECHTEN MOTION CONTROLS. Deine Touch-Controller werden als
-> EMULIERTES GAMEPAD gelesen.** Sticks, Tasten, Trigger und Griffe werden in
-> gewöhnliche Gamepad-Eingaben übersetzt. Das ist keine Bewegungssteuerung und
-> fühlt sich nicht wie ein natives VR-Spiel an. Das einzige bewegungsverfolgte
-> Element darüber hinaus ist die Zielrichtung aus dem Blickwinkel des rechten
-> Controllers, und selbst die folgt eher nach, als dass sie mitgeht. Es gibt keine
-> Waffe in deinen Händen, keine Hände, keine Gesten und keine Waffenhandhabung.
-> Lies vorher den Abschnitt "Controller-Unterstützung, ehrlich betrachtet".
+> **MOTION CONTROLS FUNKTIONIEREN IN DER ENTWICKLUNG, SIND ABER IN DIESEM DOWNLOAD
+> NOCH NICHT ENTHALTEN.** In der aktuellen Version werden deine Touch-Controller
+> als EMULIERTES GAMEPAD gelesen: Sticks, Tasten, Trigger und Griffe werden zu
+> gewöhnlichen Gamepad-Eingaben, dazu kommt kopfverfolgtes Zielen. Das ist
+> zuverlässig und wirklich angenehm, aber es ist keine Bewegungssteuerung.
+>
+> **Seit dem 10.08.2026 folgt die Waffe dem Controller**, in Position und
+> Ausrichtung, im Headset bestätigt. Du kannst die Waffe richten, und sie geht
+> dorthin, wohin deine Hand geht. **Die Kugeln folgen ihr noch nicht**: sie fliegen
+> weiterhin dorthin, wohin du schaust. Lies den Abschnitt "Motion Controls: der
+> genaue Stand" weiter unten, dort steht klar, was geht, was nicht, und was fehlt.
 >
 > **FUNKTIONIERT MIT DEM TITEL-UPDATE "LAST RITES" (AUGUST 2026), ab v0.7.0.** Das
 > Update hat die Programmdatei des Spiels ersetzt. Diese Version bringt eine
@@ -64,8 +67,14 @@ können deutlich schlechter laufen.
   rendert mit 3840x2160, auch von einem gewöhnlichen 1080p-Desktop aus. Die
   Renderauflösung ist ein Konfigurationsschlüssel und damit zugleich der Regler
   für Qualität gegen Bildrate.
+- **DIE WAFFE FOLGT DEINEM CONTROLLER**, in Position und Ausrichtung, eins zu eins
+  (10.08.2026, in Entwicklung, noch nicht im aktuellen Download). Es ist die Waffe
+  des Spiels selbst, bewegt über den Knochen, an dem die Engine sie befestigt. Die
+  Kugeln folgen ihr noch nicht.
 - **Touch-Controller als EMULIERTES GAMEPAD, ein echtes Gamepad wird nicht
   benötigt.** Das ist Gamepad-Emulation, NICHT Bewegungssteuerung.
+- **Handmarkierungen**: zwei farbige Punkte dort, wo deine Controller wirklich
+  sind, mit echter Stereotiefe.
 - **Echte Ego-Perspektive, verankert am Kopfknochen.** Die Augenhöhe folgt
   automatisch Stehen, Ducken und Liegen, und die Kamera bleibt beim Bewegen am Kopf.
 - **Der Kopf deiner Figur wird in der Ego-Perspektive ausgeblendet** (auf dem
@@ -82,46 +91,90 @@ können deutlich schlechter laufen.
   `GRWVR\grwxr.cfg` und werden etwa eine Sekunde nach dem Speichern übernommen.
 - Stabile 72 fps auf dem Testsystem über längere Open-World-Sitzungen
 
-## Controller-Unterstützung, ehrlich betrachtet
+## Motion Controls: der genaue Stand
 
-**Das Wichtigste zuerst: es gibt in diesem Mod keine echten Motion Controls.** Die
-Touch-Controller werden als *emuliertes Gamepad* gelesen. Das funktioniert
-zuverlässig und ist bequem, aber es ist keine Bewegungssteuerung und sollte auch
-nicht so genannt werden.
+Dieser Abschnitt ist bewusst in beide Richtungen deutlich, denn Motion Controls
+sind das, was die meisten am meisten interessiert, und zugleich das, was sich am
+leichtesten schönreden lässt.
 
-Zwei bewegungsverfolgte Dinge liegen darüber: **Kopfzielen** (Kugeln folgen deinem
-Blick, inzwischen Standard) und **Handmarkierungen** (zwei farbige Punkte dort, wo
-deine Controller tatsächlich sind, mit echter Stereotiefe). Das
-controllergesteuerte Zielen aus v0.5.0 ist **als Standard zurückgezogen**: in
-dieser Engine IST die Zielrichtung die Kamera, ein vom Controller gesteuertes Ziel
-verdreht also zwangsläufig deine Sicht und kämpft gegen das Kopfzielen.
+### Was jetzt funktioniert, im Headset bestätigt (10.08.2026)
 
-**Es gibt keine Waffe in deinen Händen.** Die Figur hält das Gewehr weiterhin
-dort, wo die Third-Person-Animation es hinlegt. Das ist die größte Lücke und der
-aktuelle Entwicklungsschwerpunkt.
+**Die Waffe folgt deinem Controller, eins zu eins, in Position und Ausrichtung.**
+Du richtest die Hand, und die Waffe zeigt dorthin. Du bewegst die Hand, und die
+Waffe geht mit. Du kannst sie heben, senken und vor dem Körper schwenken. Das ist
+kein schwebendes Overlay und kein Zusatzmodell: es ist die Waffe des Spiels
+selbst, platziert von den Systemen des Spiels, der nur gesagt wird, wohin sie soll.
 
-**Hüftfeuer ist ungenau, und das ist das echte Spiel.** Wildlands legt beim
-Hüftfeuer einen weiten Streukegel an. Genaues Zielen hilft nicht, weil das Spiel
-den Schuss innerhalb dieses Kegels auswürfelt. Das liest sich wie "der Mod ist
-kaputt", ist es aber nicht: über die Visierung ist es exakt, und genau daran
-erkennt man, dass die Streuung normales Spielverhalten ist. Die Streuung unter
-VR-Zielen auszuhebeln ist geplant, steckt aber NICHT in dieser Version.
+Dahin zu kommen hieß, viererlei einzeln im Headset zu bestätigen: dass die Waffe
+überhaupt bewegt werden kann, welcher Knochen der Spielfigur sie tatsächlich
+trägt, welche Achse dieses Knochens der Lauf ist, und dann den Lauf direkt auf den
+Strahl des Controllers zu setzen, statt ihn relativ zur bisherigen Zielrichtung zu
+verschieben. Zwei dieser vier Punkte waren zuvor angenommen worden, und beide
+Annahmen waren falsch. Das ist der wesentliche Grund, warum es so lange gedauert hat.
 
-**Zielen über die Visierung (ADS) passt zum Kopfzielen.** Das Spiel zeichnet sein
-Visierbild in der Bildmitte, und dorthin zielt beim Kopfzielen auch die Kugel.
+### Was noch nicht funktioniert, ohne Beschönigung
 
-**Es gibt keine Hände, keine Gesten und keine Waffenhandhabung.** Kein Greifen,
-kein Nachladen per Geste, kein Magazinwechsel, kein beidhändiger Griff. Nachladen,
-Waffenwechsel und Fahrzeugeinstieg sind ganz normale Tastendrücke.
+**Die Kugeln folgen der Waffe nicht.** Sie fliegen weiterhin dorthin, wohin du
+schaust. Du kannst also auf das eine zielen und das andere treffen, was
+offensichtlich nicht der Endzustand ist. Das ist das letzte große Stück zwischen
+diesem Stand und echtem bewegungsgesteuertem Schießen.
 
-**Das Fadenkreuz ist ein flacher Punkt im Unendlichen.** Es zeigt die
-Schussrichtung, sitzt aber nicht auf Zielentfernung.
+Nicht aus Mangel an Versuchen: drei verschiedene Mechanismen wurden scharf
+geschaltet, es wurde nachgewiesen, dass sie tatsächlich ausgeführt werden, und es
+wurde gezeigt, dass sie nichts daran ändern, wo die Treffer landen. Das sind
+brauchbare Ergebnisse, keine Fehlschläge: jeder davon schließt eine Möglichkeit
+mit Beleg aus, statt sie im Verdacht zu lassen. Die Suche ist inzwischen auf einen
+starken Kandidaten eingegrenzt.
+
+**Die Hüftfeuer-Streuung ist unangetastet**, ein korrekt gerichteter Lauf streut
+also trotzdem. **Die Arme deiner Figur folgen der Waffe nicht**, die Waffe kann
+also losgelöst vom Körper wirken. **Es gibt weiterhin keine Hände, keine Gesten
+und keine Waffenhandhabung**: kein Greifen, kein Nachladen per Geste, kein
+Magazinwechsel, kein beidhändiger Griff. Nachladen, Waffenwechsel und
+Fahrzeugeinstieg sind ganz normale Tastendrücke.
+
+### Was in der Version steckt, die du heute herunterladen kannst
+
+Die aktuelle Version ist **Gamepad-Emulation plus kopfverfolgtes Zielen**. Sticks,
+Trigger, Griffe und Tasten werden zu gewöhnlichen Gamepad-Eingaben, ein echtes
+Gamepad wird also nicht gebraucht, und dein Kopf zielt und schaut 1:1. Dazu werden
+zwei Handmarkierungen dort gezeichnet, wo deine Controller sind, mit echter
+Stereotiefe.
+
+Diese Kombination ist zuverlässig und angenehm, und viele spielen sie gern. Sie
+ist keine Bewegungssteuerung, und diese Seite wird sie auch nicht so nennen. Das
+Waffen-Tracking von oben kommt mit der nächsten Version.
+
+**Zielen über die Visierung (ADS) bleibt beim Kopfzielen stimmig**, denn das Spiel
+zeichnet sein Visierbild in der Bildmitte, und genau dorthin fliegt die Kugel.
+
+### Warum das so lange dauert
+
+Wildlands ist eine geschlossene AAA-Engine von 2017: kein Quellcode, kein SDK,
+keine Mod-Schnittstelle, dazu ein Kopierschutz. Und es ist ein Third-Person-Spiel,
+es gibt also kein Ego-Rig, von dem man sich etwas leihen könnte. Nirgends ist
+dokumentiert, wie diese Engine eine Waffe platziert, einen Schuss ausrichtet oder
+ein Skelett stellt. Jede Adresse, die der Mod benutzt, wurde aus der
+ausgelieferten Programmdatei herausgearbeitet, und jede wird im Headset bestätigt,
+bevor ihr vertraut wird, denn eine plausibel aussehende falsche Antwort kostet
+Tage, bis man sie widerlegt hat.
+
+Deshalb scheitert der Mod lieber sicher, als zu raten: was sich auf deiner
+Spielversion nicht verifizieren lässt, schaltet sich selbst ab und schreibt das
+ins Log, statt an eine Adresse zu schreiben, bei der es sich nicht sicher ist.
+
+Fortschritt kommt daher in einzelnen bestätigten Schritten statt gleichmäßig. Der
+Vorteil: was hier als funktionierend steht, funktioniert wirklich und wurde durch
+ein Headset dabei beobachtet, nicht aus einem Log erschlossen.
 
 ## Bekannte Einschränkungen
 
 - **Das Ausblenden des Kopfes fehlt auf dem Update von 08/2026 vorübergehend.**
-- **Keine echten Motion Controls** (siehe oben). Keine sichtbare Waffe in den
-  Händen, keine Handinteraktionen.
+- **Die Kugeln folgen der Waffe nicht.** Die Waffe folgt in Entwicklungsversionen
+  dem Controller, die Schüsse gehen weiterhin dorthin, wohin du schaust.
+- **Im aktuellen Download sind die Touch-Controller ein emuliertes Gamepad.** Das
+  Waffen-Tracking kommt mit der nächsten Version.
+- Keine Hände, keine Gesten, keine Waffenhandhabung. Die Arme folgen der Waffe nicht.
 - Die Kamera hängt sich nach Respawn oder Schnellreise gelegentlich an den
   falschen Körper. Ego-Perspektive aus- und wieder einschalten behebt das.
 - Fahrzeuge in der Ego-Perspektive sind unfertig. Bodenfahrzeuge sind spielbar,

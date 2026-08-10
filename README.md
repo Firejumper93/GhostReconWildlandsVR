@@ -13,14 +13,17 @@
 > fullscreen 4K view, and a real first-person camera anchored to your character's
 > head bone (head hidden, close-range body blur removed).
 >
-> **THERE ARE NO REAL MOTION CONTROLS. Your Touch controllers are read as an
-> EMULATED GAMEPAD.** Sticks, buttons, triggers and grips are translated into
-> ordinary gamepad input, which is not motion control and does not feel like a
-> native VR shooter. The only motion-tracked thing on top of that is aim
-> DIRECTION from the right controller's pointing angle, and even that chases
-> rather than tracks. There is no gun in your hands, no hands, no gestures, and
-> no weapon manipulation. See "Controller support, honestly" below and read it
-> before you decide whether this build is worth your time.
+> **MOTION CONTROLS ARE WORKING IN DEVELOPMENT, BUT THEY ARE NOT IN THIS
+> DOWNLOAD YET.** In the current release your Touch controllers are read as an
+> EMULATED GAMEPAD: sticks, buttons, triggers and grips become ordinary gamepad
+> input, with head-tracked aiming on top. That is reliable and it is genuinely
+> comfortable, and it is not motion control.
+>
+> **On 2026-08-10 the weapon began following the controller**, in both position
+> and rotation, confirmed in the headset. You can point the gun, and it goes
+> where your hand goes. **Bullets do not follow it yet**: they still go where
+> you are looking. Read "Motion controls: exactly where this is" below, which
+> says plainly what works, what does not, and what is left.
 >
 > **WORKS WITH THE AUGUST 2026 "LAST RITES" TITLE UPDATE, as of v0.7.0.** The update
 > replaced the game executable; this release carries a full verified address table
@@ -40,8 +43,9 @@ controller-pointing aim and anchored first person on 2026-08-01/02, head-bone
 first person, head hiding, and continuous 1:1 head aim on 2026-08-03, and Touch
 controllers as an emulated gamepad, controller-pointing hip-fire aim with a reticle,
 and removal of the first-person close-range body blur on 2026-08-03/04. The port to
-the August 2026 "Last Rites" game update was headset-verified on 2026-08-08. This is a development snapshot,
-not a finished mod. Expect rough edges. Performance numbers here come from one test
+the August 2026 "Last Rites" game update was headset-verified on 2026-08-08, and on
+2026-08-10 the weapon itself began tracking the controller in position and rotation.
+This is a development snapshot, not a finished mod. Expect rough edges. Performance numbers here come from one test
 system; different hardware, headsets, and settings may perform noticeably worse. The
 mod is being actively optimized and improved, so expect frequent changes.
 
@@ -118,9 +122,12 @@ work fine and are recommended for VR.
   needed.** Sticks, triggers, grips, A/B/X/Y and menu are translated into ordinary
   gamepad input. This is gamepad emulation, NOT motion control: it is reliable and
   convenient, and it is not what "VR motion controllers" normally means.
-- **Aim direction from the right controller's pointing angle**, with a dot reticle
-  and real caveats. This is the only motion-tracked input beyond head tracking.
-  See "Controller support, honestly".
+- **THE WEAPON FOLLOWS YOUR CONTROLLER**, position and rotation, one to one
+  (2026-08-10, in development, not in the current download). The gun is the game's
+  own weapon, placed by writing the bone the engine mounts it on. Bullets do not
+  follow it yet. See "Motion controls: exactly where this is".
+- **Hand markers**: two coloured dots drawn where your controllers actually are,
+  with real stereo depth.
 - **True first person, anchored to your head bone.** A toggle moves the viewpoint onto
   the player character's actual animated head bone: eye height tracks standing, crouch
   and prone automatically, the camera stays glued to the head while moving, and the
@@ -150,71 +157,89 @@ work fine and are recommended for VR.
 - A cropped, non-alternating desktop mirror suitable for recording
 - Stable at 72 fps on the test system through extended open-world play
 
-## Controller support, honestly
+## Motion controls: exactly where this is
 
-**Start here: there are no real motion controls in this mod.** Your Touch
-controllers are read as an *emulated gamepad*: the mod translates sticks, buttons,
-triggers and grips into the ordinary gamepad input the game already understands.
-That is convenient and it works reliably, but it is not motion control, and it
-should not be described as such.
+This section is deliberately blunt in both directions, because motion controls are
+the thing people care about most and the easiest thing to overstate.
 
-Two motion-tracked things are layered on top of that as of v0.6.0: **head aim**
-(bullets follow your gaze, now the default) and **hand markers** (two colored dots
-drawn where your controllers actually are, with real stereo depth; verified to track
-well). Controller-DRIVEN aim, the v0.5.0 default, is **retired as a default**: in
-this engine the gameplay aim direction IS the camera, so steering aim from the
-controller inevitably turns your view and fights head-look. It remains available as
-a deprecated experiment (`aim_source = 1`). What follows is what it actually is
-today, not what it is aiming to become.
+### What now works, confirmed in the headset (2026-08-10)
 
-**There is no gun in your hands.** The character still holds the rifle wherever
-the third-person animation puts it. This is the single biggest gap and it is the
-current development focus: the engine's object-placement system has been mapped,
-four candidate weapon handles are identified, and this release includes a visual
-instrument (`wp_markers`) for confirming which one is the gun.
+**The weapon follows your controller, one to one, in position and rotation.** Point
+your hand and the gun points there. Move your hand and the gun moves with it. You
+can raise it, lower it, swing it across your body. It is not a floating overlay or
+a cosmetic model: it is the game's own weapon, placed by the game's own systems,
+being told where to go.
 
-**Why controller aim was retired as the default.** The mod cannot set the game's
-aim direction without also turning the camera, because they are the same thing in
-this engine. Every scheme tried (continuous steering, injection during engine aim
-updates) either turned your view against your head or produced a laggy chase. The
-honest resolution: your head aims and looks (which IS 1:1), the controller is a
-gamepad plus tracked hand markers, and the route to a gun that follows your hand is
-overriding the SHOT direction rather than the aim, which is active research.
+Getting there meant finding, and confirming in the headset one at a time: that the
+weapon can be moved at all, which of the character's bones actually carries it,
+which axis of that bone is the barrel, and then setting that barrel onto the
+controller's ray directly rather than nudging it relative to where the game was
+already aiming. Two of those four had previously been assumed, and both assumptions
+turned out to be wrong, which is most of why this took as long as it did.
 
-**Hip fire is inaccurate, and that part is the real game.** Wildlands applies a wide
-hip-fire spread cone. Pointing precisely does not help, because the game rolls the
-shot inside that cone. It reads as "the mod is broken" and it is not: aiming down
-sights is exact, which is how we know spread is vanilla behavior rather than
-something the mod causes. Defeating hip-fire spread under VR aim is designed and
-queued, but it is NOT in this release.
+### What does not work yet, plainly
 
-**Aiming down sights is consistent with head aim.** The game draws its sight
-picture at view center, which under head aim is exactly where your bullets go, so
-the sight picture and the impacts agree. Optics are head-anchored, not
-gun-anchored.
+**Bullets do not follow the gun.** They still go where you are looking. You can aim
+the weapon at one thing and shoot another, which is obviously not the finished
+article, and it is the single remaining piece between this and real motion-controlled
+shooting.
 
-**There are no hands, no gestures, and no weapon manipulation.** No grabbing, no
-gesture reloads, no physical mag changes, no two-handed grip. Reload, swap, vehicle
-entry and everything else are ordinary button presses.
+This is not for want of trying. Three separate mechanisms have been armed, verified
+to actually execute, and shown to make no difference to where rounds land. Those are
+useful results, not failures: each one removes a possibility with evidence rather
+than leaving it suspected. The search is now narrowed to one strong candidate.
 
-**The reticle is a flat dot at infinity.** It shows the ray direction. It does not
-sit at target depth, so it will not converge on close targets the way a real red dot
-does.
+**Hip-fire spread is untouched**, so even a correctly pointed barrel scatters.
+**Your character's arms do not follow the weapon**, so the gun can look detached
+from the body. **There are still no hands, no gestures and no weapon manipulation**:
+no grabbing, no gesture reloads, no physical mag changes, no two-handed grip. Reload,
+swap and vehicle entry are ordinary button presses.
 
-Where this is going: the weapon model riding your controller (so you physically
-raise the gun to your eye), and ADS-grade accuracy under VR aim at all times. Both
-are designed; neither ships here.
+### What is in the release you can download today
+
+The current release is **gamepad emulation plus head-tracked aiming**. Sticks,
+triggers, grips and face buttons are translated into ordinary gamepad input, so no
+physical controller is needed, and your head aims and looks at 1:1. Two hand-position
+markers are drawn where your controllers are, with real stereo depth.
+
+That combination is reliable and comfortable, and a lot of people play it happily.
+It is not motion control, and this README will not call it that. The weapon tracking
+above lands in the next release.
+
+**Aiming down sights stays consistent** under head aim, because the game draws its
+sight picture at view centre and that is exactly where your bullets go. Optics are
+head-anchored rather than gun-anchored.
+
+### Why this takes the time it takes
+
+Wildlands is a closed 2017 AAA engine with no source, no SDK, no mod API and an
+anti-tamper layer, and it is a third-person game with no first-person rig to borrow
+from. Nothing about how it places a weapon, aims a shot or poses a skeleton is
+documented anywhere. Every address the mod uses was recovered by reading the shipped
+executable, and every one is confirmed in a headset before it is trusted, because a
+plausible-looking wrong answer costs days to disprove.
+
+That is also why the mod fails safe rather than guessing: if something cannot be
+verified on your game version, it disables itself and says so in the log instead of
+writing to an address it is not sure about.
+
+Progress therefore arrives in discrete confirmed steps rather than continuously. The
+upside is that what is listed as working here is genuinely working, and has been
+watched working through a headset rather than inferred from a log.
 
 ## Known limitations (honest list)
 
 - **Head hiding is temporarily out on the 2026-08 game update** (the current game
   version). You will see hair or helmet from inside in first person until the
   moved engine function is re-derived. See "The 2026-08 game update" above.
-- **No real motion controls.** Touch is emulated as a gamepad; the motion-tracked
-  parts are head aim and the hand-position markers. There is no visible gun in your
-  hands and no hand interactions. Controller-driven aim was retired as a default
-  because it fights head-look (the game's aim is the camera). Read "Controller
-  support, honestly" above; it is the honest account, not a teaser.
+- **Bullets do not follow the weapon.** The gun tracks your controller in development
+  builds; the rounds still go where you are looking. This is the last major piece.
+- **In the current download, Touch is emulated as a gamepad.** The motion-tracked
+  parts you can play with today are head aim and the hand-position markers. The
+  weapon tracking lands in the next release.
+- **No hands, gestures or weapon manipulation.** No grabbing, gesture reloads,
+  physical mag changes or two-handed grip.
+- **Your character's arms do not follow the weapon**, so the gun can look detached.
 - The camera can occasionally attach to the wrong body after a respawn or fast travel.
   Toggling first person off and on while facing your character re-acquires it.
 - Vehicles in first person are unfinished. Ground vehicles are playable and fun in
@@ -237,19 +262,25 @@ evidence comes in.
 
 | Feature | Progress | Where it stands |
 |---|---|---|
-| The gun visibly rides your controller (physical sighting) | ~50% | The engine's object-placement API is fully mapped, four candidate weapon handles are found, and this release ships a visual instrument that identifies the right one at a glance; the remaining work is the transform-override write and the shot-direction override |
-| Hip-fire accuracy at ADS grade under VR aim | ~70% | The exact engine flag is located and verified unique in both supported builds; one write route decision remains before it ships |
-| Epic / Ubisoft Connect support | ~85% | Shipped experimentally in v0.6.0: the store binary's full address table was derived offline and sits behind a build-identity check; it awaits its first confirmation from a store-build tester |
+| The weapon rides your controller | **~90%** | **Position and rotation both confirmed in the headset, 2026-08-10.** The gun is the game's own weapon, moved by writing the bone the engine mounts it on, at the moment the engine reads that bone. Remaining: a grip offset so it sits in your fist rather than beside it, and travel-scale tuning |
+| Bullets go where the weapon points | ~40% | The last major piece. Three candidate mechanisms have been armed, verified to execute, and shown not to affect where rounds land, which eliminates them with evidence. One strong candidate remains and is the next thing worked on |
+| Hip-fire accuracy at ADS grade under VR aim | ~70% | The exact engine flag is located and verified unique in every supported build; one write-route decision remains before it ships |
+| Physical sighting (raise the gun, use the sights, no ADS mode) | ~35% | Follows directly from the two rows above. The gun already points where you point it; sights need the bullets fixed first, then an eye-aligned reticle |
 | Performance pass for dense towns | ~30% | The engine's shadow-quality lever is located and writable live; a measurement run will decide what ships |
-| Aerial vehicle interior camera | ~20% | Ground-vehicle first person already works in practice; helicopter and plane interiors need their camera behavior characterized first |
-| VR arms and hands (IK) | ~15% | The GPU skinning data format was recovered from the game's own shipped shaders; which render path draws the player is the remaining unknown. The engine's own IK system is confirmed present, which is the long-term route |
+| Aerial vehicle interior camera | ~20% | Ground-vehicle first person already works in practice; helicopter and plane interiors need their camera behaviour characterised first |
+| VR arms and hands (IK) | ~15% | The GPU skinning data format was recovered from the game's own shipped shaders. The engine's own IK system is confirmed present, which is the long-term route. Note the weapon does NOT depend on this: it is moved directly, so arms are a separate, harder problem |
+
+Percentages are progress toward shipping, not promises or dates, and they move as
+evidence comes in. A row only goes up when something has been watched working in a
+headset.
 
 Shipped since the last release (v0.6.1): the port to the August 2026 "Last Rites"
 game update (new full address table, ASLR handling, headset-verified stereo), and
 an installer that finds your game by itself (Steam libraries and Ubisoft Connect
 are auto-detected; no more pasting paths).
 
-A public **beta** is planned once the top items land.
+**Next release** carries the controller-tracked weapon. A public **beta** follows
+once bullets track with it.
 
 ## Which version of the game do I need?
 

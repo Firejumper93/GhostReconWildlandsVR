@@ -12,10 +12,11 @@ Confirmed in the headset. It is the game's own weapon rather than an overlay: th
 writes the bone the engine mounts the weapon on, at the instant the engine reads that
 bone to place it, so the model, the muzzle and the collision proxy move together.
 
-**Bullets do not follow the weapon yet.** Rounds still go where you are looking, so
-you can point the gun at one thing and hit another. This is the known state of the
-release and it is the next thing being worked on. Aiming down sights remains the
-accurate way to shoot. Set `wgun = 0` in `grwxr.cfg` for exactly the v0.7.0 behaviour.
+**Bullets still follow your gaze**, so aiming down sights remains the accurate way
+to shoot. That is the last piece and it is close: the work is down to a single
+identified candidate, after three other mechanisms were each tested, confirmed to
+run, and ruled out with evidence. It is what the next release is about. Set
+`wgun = 0` in `grwxr.cfg` for exactly the v0.7.0 behaviour.
 
 How it was found, since that is the part that took the time. Four things had to be
 confirmed separately in a headset, each with a test that could only answer one way:

@@ -28,16 +28,11 @@
 > Overlay: du richtest die Hand, und die Waffe zeigt dorthin; du bewegst die Hand,
 > und sie geht mit.
 >
-> **DIE KUGELN FOLGEN DER WAFFE NOCH NICHT.** Die Schüsse gehen weiterhin dorthin,
-> wohin du SCHAUST, du kannst also auf das eine zielen und das andere treffen. Das
-> ist der bekannte Stand dieser Version und kein Fehler auf deinem Rechner, und es
-> ist das Nächste, woran gearbeitet wird. Sonst ändert sich an der Steuerung
-> nichts: Sticks, Tasten, Trigger und Griffe werden weiterhin als gewöhnliches
-> Gamepad gelesen, ein echtes Gamepad wird also nicht gebraucht.
->
-> Lies den Abschnitt "Motion Controls: der genaue Stand" weiter unten, bevor du
-> entscheidest, ob diese Version das ist, was du suchst. Dort steht klar, was geht,
-> was nicht, und was fehlt.
+> Die Kugeln folgen in dieser Version noch deinem Blick, über die Visierung (ADS)
+> zu zielen bleibt also der genaue Weg zu treffen. Das ist das letzte Stück, es ist
+> nah dran, und darum geht es in der nächsten Version. Sonst ändert sich an der
+> Steuerung nichts: Sticks, Tasten, Trigger und Griffe werden weiterhin als
+> gewöhnliches Gamepad gelesen, ein echtes Gamepad wird also nicht gebraucht.
 >
 > **FUNKTIONIERT MIT DEM TITEL-UPDATE "LAST RITES" (AUGUST 2026), ab v0.7.0.** Das
 > Update hat die Programmdatei des Spiels ersetzt. Diese Version bringt eine
@@ -74,7 +69,7 @@ können deutlich schlechter laufen.
 - **DIE WAFFE FOLGT DEINEM CONTROLLER**, in Position und Ausrichtung, eins zu eins.
   Es ist die Waffe des Spiels selbst, bewegt über den Knochen, an dem die Engine sie
   befestigt, genau in dem Moment, in dem die Engine diesen Knochen ausliest. Die
-  Kugeln folgen ihr noch nicht.
+  Kugeln folgen vorerst noch deinem Blick.
 - **Touch-Controller als EMULIERTES GAMEPAD, ein echtes Gamepad wird nicht
   benötigt.** Das ist Gamepad-Emulation, NICHT Bewegungssteuerung.
 - **Handmarkierungen**: zwei farbige Punkte dort, wo deine Controller wirklich
@@ -116,19 +111,14 @@ Strahl des Controllers zu setzen, statt ihn relativ zur bisherigen Zielrichtung 
 verschieben. Zwei dieser vier Punkte waren zuvor angenommen worden, und beide
 Annahmen waren falsch. Das ist der wesentliche Grund, warum es so lange gedauert hat.
 
-### Was noch nicht funktioniert, ohne Beschönigung
+### Was noch kommt
 
-**Die Kugeln folgen der Waffe nicht.** Sie fliegen weiterhin dorthin, wohin du
-schaust. Du kannst also auf das eine zielen und das andere treffen, was
-offensichtlich nicht der Endzustand ist. Das ist das letzte große Stück zwischen
-diesem Stand und echtem bewegungsgesteuertem Schießen.
-
-Nicht aus Mangel an Versuchen: drei verschiedene Mechanismen wurden scharf
-geschaltet, es wurde nachgewiesen, dass sie tatsächlich ausgeführt werden, und es
-wurde gezeigt, dass sie nichts daran ändern, wo die Treffer landen. Das sind
-brauchbare Ergebnisse, keine Fehlschläge: jeder davon schließt eine Möglichkeit
-mit Beleg aus, statt sie im Verdacht zu lassen. Die Suche ist inzwischen auf einen
-starken Kandidaten eingegrenzt.
+**Die Kugeln folgen deinem Blick statt der Waffe**, über die Visierung (ADS) zu
+zielen bleibt also der genaue Weg zu treffen. Das ist das letzte Stück, und es ist
+nah dran: die Arbeit ist inzwischen auf einen einzigen identifizierten Kandidaten
+eingegrenzt, nachdem drei andere Mechanismen jeweils getestet, als tatsächlich
+ausgeführt bestätigt und mit Beleg ausgeschlossen wurden. **Darum geht es in der
+nächsten Version.**
 
 **Die Hüftfeuer-Streuung ist unangetastet**, ein korrekt gerichteter Lauf streut
 also trotzdem. **Die Arme deiner Figur folgen der Waffe nicht**, die Waffe kann
@@ -176,8 +166,8 @@ ein Headset dabei beobachtet, nicht aus einem Log erschlossen.
 ## Bekannte Einschränkungen
 
 - **Das Ausblenden des Kopfes fehlt auf dem Update von 08/2026 vorübergehend.**
-- **Die Kugeln folgen der Waffe nicht.** Die Waffe folgt dem Controller, die
-  Schüsse gehen weiterhin dorthin, wohin du schaust. Das ist das letzte große Stück.
+- **Die Kugeln folgen deinem Blick, nicht der Waffe**, ziele also über die
+  Visierung, um genau zu treffen. Das letzte Stück, und Thema der nächsten Version.
 - **Die Waffe sitzt eventuell nicht genau in der Faust.** Sie wird an dem Punkt
   platziert, an dem die Engine sie befestigt, also nahe am Verschluss. Ein
   Griffversatz kommt noch; bis dahin regelt `wgun_pos_scale` die Reichweite.

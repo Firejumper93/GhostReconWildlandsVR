@@ -342,6 +342,14 @@ und in den Kommentaren der Konfigurationsdatei selbst.
   in keiner Verbindung zu Ubisoft, wird von Ubisoft weder unterstützt noch
   gebilligt, und verbreitet keine Inhalte von Ubisoft.
 
+## Das Projekt unterstützen
+
+Einige haben gefragt, ob sie spenden können; dafür gibt es jetzt eine Seite:
+[buymeacoffee.com/firejumper93](https://buymeacoffee.com/firejumper93). Völlig
+freiwillig und niemals erforderlich: der Mod ist kostenlos, nichts ist hinter
+Spenden verborgen, und eine Spende ändert nichts an dem, was man bekommt. Sie
+hilft lediglich bei Werkzeugen und langen Nächten, und sie wird geschätzt.
+
 ## Lizenz
 
 MIT, siehe [LICENSE](LICENSE). Teile abgeleitet von anvilengine2vr,

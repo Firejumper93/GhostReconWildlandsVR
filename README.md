@@ -486,6 +486,14 @@ continuously fed.
   affiliated with, endorsed by, or supported by Ubisoft, and distributes none of
   their work.
 
+## Supporting the project
+
+A few people have asked whether they could donate, so there is now a page for that:
+[buymeacoffee.com/firejumper93](https://buymeacoffee.com/firejumper93). Entirely
+optional and never required: the mod is free, nothing is gated behind donations,
+and donating changes nothing about what you get. It just helps with tools and late
+nights, and it is appreciated.
+
 ## License
 
 MIT, see [LICENSE](LICENSE). Portions derived from anvilengine2vr, Copyright (c)

@@ -5,6 +5,23 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
+## v0.8.2-alpha, "The Weapon" (2026-08-10, startup-crash fix)
+
+Targets the startup crash reported on v0.8.0/v0.8.1 (black screen, then the game
+closes) on both Virtual Desktop and Steam Link. Tester logs settled the cause:
+
+- **Ruled out the motion-controlled weapon.** A run with `safe_mode = 1` (weapon
+  hooks confirmed not installed) still froze at frame 1, identically.
+- **The remaining unconditional hook on the render path was the D3D11 draw
+  detours** (`DrawHook`, installed by the palette/weapon-draw research probes).
+  The VR mirror never needed them and their per-draw cost was never measured.
+
+Change: `pal::install` now reads a `draw_probes` cfg key (default 0) and installs
+nothing unless a developer opts in. The shipping mod no longer reroutes the game's
+own draw calls. If the crash persists with `draw_probes = 0`, the cause is in the
+core VR path or the build/toolchain and needs a rebuild on the original machine;
+v0.7.0 remains the known-good fallback.
+
 ## v0.8.1-alpha, "The Weapon" (2026-08-10, diagnostic patch)
 
 Chasing a startup crash reported on v0.8.0 (black screen for a couple of seconds,

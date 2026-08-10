@@ -1,5 +1,7 @@
 # Ghost Recon Wildlands VR (GRW-XR)
 
+**English** | [Deutsch](README.de.md)
+
 > [!WARNING]
 > **SINGLEPLAYER ONLY. Solo campaign, never co-op, never PvP, never matchmaking.**
 > The game ships Easy Anti-Cheat for multiplayer and this mod must never run in
@@ -451,8 +453,10 @@ continuously fed.
   whose notes on Quest runtime double-vision behavior corroborated that diagnosis.
 - **[Khronos OpenXR SDK](https://github.com/KhronosGroup/OpenXR-SDK)** (Apache 2.0):
   the OpenXR loader and headers.
-- **Claude Code (Anthropic)**: development contributor; the reverse engineering,
-  code, and diagnostics in this repository were built in collaboration with it.
+- **SolKutTeR and [vrforum.de](https://vrforum.de)**, for the
+  [thread about this mod](https://vrforum.de/threads/ghost-recon-wildlands-grw-xr.14507/)
+  and for bringing German-speaking players to it. That thread is the reason this
+  README now exists in German ([README.de.md](README.de.md)).
 - Tom Clancy's Ghost Recon Wildlands is the property of Ubisoft. This project is not
   affiliated with, endorsed by, or supported by Ubisoft, and distributes none of
   their work.

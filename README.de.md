@@ -23,17 +23,21 @@
 > Kopfknochen der Spielfigur hängt (Kopf ausgeblendet, Nahbereichs-Unschärfe
 > entfernt).
 >
-> **MOTION CONTROLS FUNKTIONIEREN IN DER ENTWICKLUNG, SIND ABER IN DIESEM DOWNLOAD
-> NOCH NICHT ENTHALTEN.** In der aktuellen Version werden deine Touch-Controller
-> als EMULIERTES GAMEPAD gelesen: Sticks, Tasten, Trigger und Griffe werden zu
-> gewöhnlichen Gamepad-Eingaben, dazu kommt kopfverfolgtes Zielen. Das ist
-> zuverlässig und wirklich angenehm, aber es ist keine Bewegungssteuerung.
+> **DIE WAFFE FOLGT DEINEM CONTROLLER, seit v0.8.0.** Position und Ausrichtung,
+> eins zu eins, im Headset bestätigt. Es ist die Waffe des Spiels selbst und kein
+> Overlay: du richtest die Hand, und die Waffe zeigt dorthin; du bewegst die Hand,
+> und sie geht mit.
 >
-> **Seit dem 10.08.2026 folgt die Waffe dem Controller**, in Position und
-> Ausrichtung, im Headset bestätigt. Du kannst die Waffe richten, und sie geht
-> dorthin, wohin deine Hand geht. **Die Kugeln folgen ihr noch nicht**: sie fliegen
-> weiterhin dorthin, wohin du schaust. Lies den Abschnitt "Motion Controls: der
-> genaue Stand" weiter unten, dort steht klar, was geht, was nicht, und was fehlt.
+> **DIE KUGELN FOLGEN DER WAFFE NOCH NICHT.** Die Schüsse gehen weiterhin dorthin,
+> wohin du SCHAUST, du kannst also auf das eine zielen und das andere treffen. Das
+> ist der bekannte Stand dieser Version und kein Fehler auf deinem Rechner, und es
+> ist das Nächste, woran gearbeitet wird. Sonst ändert sich an der Steuerung
+> nichts: Sticks, Tasten, Trigger und Griffe werden weiterhin als gewöhnliches
+> Gamepad gelesen, ein echtes Gamepad wird also nicht gebraucht.
+>
+> Lies den Abschnitt "Motion Controls: der genaue Stand" weiter unten, bevor du
+> entscheidest, ob diese Version das ist, was du suchst. Dort steht klar, was geht,
+> was nicht, und was fehlt.
 >
 > **FUNKTIONIERT MIT DEM TITEL-UPDATE "LAST RITES" (AUGUST 2026), ab v0.7.0.** Das
 > Update hat die Programmdatei des Spiels ersetzt. Diese Version bringt eine
@@ -67,9 +71,9 @@ können deutlich schlechter laufen.
   rendert mit 3840x2160, auch von einem gewöhnlichen 1080p-Desktop aus. Die
   Renderauflösung ist ein Konfigurationsschlüssel und damit zugleich der Regler
   für Qualität gegen Bildrate.
-- **DIE WAFFE FOLGT DEINEM CONTROLLER**, in Position und Ausrichtung, eins zu eins
-  (10.08.2026, in Entwicklung, noch nicht im aktuellen Download). Es ist die Waffe
-  des Spiels selbst, bewegt über den Knochen, an dem die Engine sie befestigt. Die
+- **DIE WAFFE FOLGT DEINEM CONTROLLER**, in Position und Ausrichtung, eins zu eins.
+  Es ist die Waffe des Spiels selbst, bewegt über den Knochen, an dem die Engine sie
+  befestigt, genau in dem Moment, in dem die Engine diesen Knochen ausliest. Die
   Kugeln folgen ihr noch nicht.
 - **Touch-Controller als EMULIERTES GAMEPAD, ein echtes Gamepad wird nicht
   benötigt.** Das ist Gamepad-Emulation, NICHT Bewegungssteuerung.
@@ -133,20 +137,22 @@ und keine Waffenhandhabung**: kein Greifen, kein Nachladen per Geste, kein
 Magazinwechsel, kein beidhändiger Griff. Nachladen, Waffenwechsel und
 Fahrzeugeinstieg sind ganz normale Tastendrücke.
 
-### Was in der Version steckt, die du heute herunterladen kannst
+### Alles andere an der Steuerung
 
-Die aktuelle Version ist **Gamepad-Emulation plus kopfverfolgtes Zielen**. Sticks,
-Trigger, Griffe und Tasten werden zu gewöhnlichen Gamepad-Eingaben, ein echtes
-Gamepad wird also nicht gebraucht, und dein Kopf zielt und schaut 1:1. Dazu werden
-zwei Handmarkierungen dort gezeichnet, wo deine Controller sind, mit echter
-Stereotiefe.
+Abgesehen von der Waffe werden deine Touch-Controller weiterhin als **emuliertes
+Gamepad** gelesen: Sticks, Trigger, Griffe und Tasten werden zu gewöhnlichen
+Gamepad-Eingaben, ein echtes Gamepad wird also nicht gebraucht. Dein Kopf zielt und
+schaut 1:1, und zwei Handmarkierungen werden dort gezeichnet, wo deine Controller
+sind, mit echter Stereotiefe.
 
-Diese Kombination ist zuverlässig und angenehm, und viele spielen sie gern. Sie
-ist keine Bewegungssteuerung, und diese Seite wird sie auch nicht so nennen. Das
-Waffen-Tracking von oben kommt mit der nächsten Version.
+Dieser Teil ist Gamepad-Emulation und keine Bewegungssteuerung, und diese Seite
+wird ihn auch nicht anders nennen. Wer die Waffenfunktion abschaltet
+(`wgun = 0` in der Konfiguration), bekommt exakt das Verhalten von v0.7.0 zurück.
 
 **Zielen über die Visierung (ADS) bleibt beim Kopfzielen stimmig**, denn das Spiel
-zeichnet sein Visierbild in der Bildmitte, und genau dorthin fliegt die Kugel.
+zeichnet sein Visierbild in der Bildmitte, und genau dorthin fliegt die Kugel. Da
+die Kugeln deinem Blick folgen, bleibt ADS in dieser Version der genaue Weg zu
+treffen.
 
 ### Warum das so lange dauert
 
@@ -170,10 +176,11 @@ ein Headset dabei beobachtet, nicht aus einem Log erschlossen.
 ## Bekannte Einschränkungen
 
 - **Das Ausblenden des Kopfes fehlt auf dem Update von 08/2026 vorübergehend.**
-- **Die Kugeln folgen der Waffe nicht.** Die Waffe folgt in Entwicklungsversionen
-  dem Controller, die Schüsse gehen weiterhin dorthin, wohin du schaust.
-- **Im aktuellen Download sind die Touch-Controller ein emuliertes Gamepad.** Das
-  Waffen-Tracking kommt mit der nächsten Version.
+- **Die Kugeln folgen der Waffe nicht.** Die Waffe folgt dem Controller, die
+  Schüsse gehen weiterhin dorthin, wohin du schaust. Das ist das letzte große Stück.
+- **Die Waffe sitzt eventuell nicht genau in der Faust.** Sie wird an dem Punkt
+  platziert, an dem die Engine sie befestigt, also nahe am Verschluss. Ein
+  Griffversatz kommt noch; bis dahin regelt `wgun_pos_scale` die Reichweite.
 - Keine Hände, keine Gesten, keine Waffenhandhabung. Die Arme folgen der Waffe nicht.
 - Die Kamera hängt sich nach Respawn oder Schnellreise gelegentlich an den
   falschen Körper. Ego-Perspektive aus- und wieder einschalten behebt das.

@@ -13,17 +13,21 @@
 > fullscreen 4K view, and a real first-person camera anchored to your character's
 > head bone (head hidden, close-range body blur removed).
 >
-> **MOTION CONTROLS ARE WORKING IN DEVELOPMENT, BUT THEY ARE NOT IN THIS
-> DOWNLOAD YET.** In the current release your Touch controllers are read as an
-> EMULATED GAMEPAD: sticks, buttons, triggers and grips become ordinary gamepad
-> input, with head-tracked aiming on top. That is reliable and it is genuinely
-> comfortable, and it is not motion control.
+> **THE WEAPON FOLLOWS YOUR CONTROLLER, as of v0.8.0.** Position and rotation,
+> one to one, confirmed in the headset. It is the game's own weapon, not an
+> overlay: point your hand and the gun points there, move your hand and it goes
+> with you.
 >
-> **On 2026-08-10 the weapon began following the controller**, in both position
-> and rotation, confirmed in the headset. You can point the gun, and it goes
-> where your hand goes. **Bullets do not follow it yet**: they still go where
-> you are looking. Read "Motion controls: exactly where this is" below, which
-> says plainly what works, what does not, and what is left.
+> **BULLETS DO NOT FOLLOW THE WEAPON YET.** Rounds still go where you are
+> LOOKING, so you can aim the gun at one thing and hit another. That is the
+> known state of this release, not a fault on your machine, and it is the next
+> thing being worked on. Everything else about the controls is unchanged:
+> sticks, buttons, triggers and grips are still read as an ordinary gamepad, so
+> no physical controller is needed.
+>
+> Read "Motion controls: exactly where this is" below before you decide whether
+> this release is what you are after. It says plainly what works, what does
+> not, and what is left.
 >
 > **WORKS WITH THE AUGUST 2026 "LAST RITES" TITLE UPDATE, as of v0.7.0.** The update
 > replaced the game executable; this release carries a full verified address table
@@ -122,10 +126,10 @@ work fine and are recommended for VR.
   needed.** Sticks, triggers, grips, A/B/X/Y and menu are translated into ordinary
   gamepad input. This is gamepad emulation, NOT motion control: it is reliable and
   convenient, and it is not what "VR motion controllers" normally means.
-- **THE WEAPON FOLLOWS YOUR CONTROLLER**, position and rotation, one to one
-  (2026-08-10, in development, not in the current download). The gun is the game's
-  own weapon, placed by writing the bone the engine mounts it on. Bullets do not
-  follow it yet. See "Motion controls: exactly where this is".
+- **THE WEAPON FOLLOWS YOUR CONTROLLER**, position and rotation, one to one. The
+  gun is the game's own weapon, placed by writing the bone the engine mounts it
+  on, at the instant the engine reads that bone. Bullets do not follow it yet.
+  See "Motion controls: exactly where this is".
 - **Hand markers**: two coloured dots drawn where your controllers actually are,
   with real stereo depth.
 - **True first person, anchored to your head bone.** A toggle moves the viewpoint onto
@@ -195,20 +199,21 @@ from the body. **There are still no hands, no gestures and no weapon manipulatio
 no grabbing, no gesture reloads, no physical mag changes, no two-handed grip. Reload,
 swap and vehicle entry are ordinary button presses.
 
-### What is in the release you can download today
+### Everything else about the controls
 
-The current release is **gamepad emulation plus head-tracked aiming**. Sticks,
-triggers, grips and face buttons are translated into ordinary gamepad input, so no
-physical controller is needed, and your head aims and looks at 1:1. Two hand-position
+Beyond the weapon, your Touch controllers are still read as an **emulated gamepad**:
+sticks, triggers, grips and face buttons become ordinary gamepad input, so no
+physical controller is needed. Your head aims and looks at 1:1, and two hand-position
 markers are drawn where your controllers are, with real stereo depth.
 
-That combination is reliable and comfortable, and a lot of people play it happily.
-It is not motion control, and this README will not call it that. The weapon tracking
-above lands in the next release.
+That part is gamepad emulation rather than motion control, and this README will not
+call it anything else. Turning the weapon feature off (`wgun = 0` in the config)
+gives you exactly the v0.7.0 behaviour back.
 
 **Aiming down sights stays consistent** under head aim, because the game draws its
 sight picture at view centre and that is exactly where your bullets go. Optics are
-head-anchored rather than gun-anchored.
+head-anchored rather than gun-anchored. Since bullets follow your gaze, aiming down
+sights remains the accurate way to shoot in this release.
 
 ### Why this takes the time it takes
 
@@ -232,11 +237,11 @@ watched working through a headset rather than inferred from a log.
 - **Head hiding is temporarily out on the 2026-08 game update** (the current game
   version). You will see hair or helmet from inside in first person until the
   moved engine function is re-derived. See "The 2026-08 game update" above.
-- **Bullets do not follow the weapon.** The gun tracks your controller in development
-  builds; the rounds still go where you are looking. This is the last major piece.
-- **In the current download, Touch is emulated as a gamepad.** The motion-tracked
-  parts you can play with today are head aim and the hand-position markers. The
-  weapon tracking lands in the next release.
+- **Bullets do not follow the weapon.** The gun tracks your controller; the rounds
+  still go where you are looking. This is the last major piece and the current focus.
+- **The gun may not sit exactly in your fist.** It is placed at the point the engine
+  mounts it, which is near the receiver, so it can hang slightly off your hand. A
+  grip offset is coming; `wgun_pos_scale` tunes reach in the meantime.
 - **No hands, gestures or weapon manipulation.** No grabbing, gesture reloads,
   physical mag changes or two-handed grip.
 - **Your character's arms do not follow the weapon**, so the gun can look detached.
@@ -262,7 +267,7 @@ evidence comes in.
 
 | Feature | Progress | Where it stands |
 |---|---|---|
-| The weapon rides your controller | **~90%** | **Position and rotation both confirmed in the headset, 2026-08-10.** The gun is the game's own weapon, moved by writing the bone the engine mounts it on, at the moment the engine reads that bone. Remaining: a grip offset so it sits in your fist rather than beside it, and travel-scale tuning |
+| The weapon rides your controller | **~90%, shipped in v0.8.0** | **Position and rotation both confirmed in the headset.** The gun is the game's own weapon, moved by writing the bone the engine mounts it on, at the moment the engine reads that bone. Remaining: a grip offset so it sits in your fist rather than beside it, and travel-scale tuning |
 | Bullets go where the weapon points | ~40% | The last major piece. Three candidate mechanisms have been armed, verified to execute, and shown not to affect where rounds land, which eliminates them with evidence. One strong candidate remains and is the next thing worked on |
 | Hip-fire accuracy at ADS grade under VR aim | ~70% | The exact engine flag is located and verified unique in every supported build; one write-route decision remains before it ships |
 | Physical sighting (raise the gun, use the sights, no ADS mode) | ~35% | Follows directly from the two rows above. The gun already points where you point it; sights need the bullets fixed first, then an eye-aligned reticle |
@@ -274,13 +279,11 @@ Percentages are progress toward shipping, not promises or dates, and they move a
 evidence comes in. A row only goes up when something has been watched working in a
 headset.
 
-Shipped since the last release (v0.6.1): the port to the August 2026 "Last Rites"
-game update (new full address table, ASLR handling, headset-verified stereo), and
-an installer that finds your game by itself (Steam libraries and Ubisoft Connect
-are auto-detected; no more pasting paths).
+Shipped in v0.8.0: the controller-tracked weapon, plus a fix for a config value that
+could crash the game if it was mistyped.
 
-**Next release** carries the controller-tracked weapon. A public **beta** follows
-once bullets track with it.
+**This release (v0.8.0)** carries the controller-tracked weapon. A public **beta**
+follows once bullets track with it.
 
 ## Which version of the game do I need?
 

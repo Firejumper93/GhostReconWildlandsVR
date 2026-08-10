@@ -5,6 +5,48 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
+## v0.8.0-alpha, "The Weapon" (2026-08-10, PACKAGED RELEASE)
+
+**The weapon follows your right controller, in position and rotation, one to one.**
+Confirmed in the headset. It is the game's own weapon rather than an overlay: the mod
+writes the bone the engine mounts the weapon on, at the instant the engine reads that
+bone to place it, so the model, the muzzle and the collision proxy move together.
+
+**Bullets do not follow the weapon yet.** Rounds still go where you are looking, so
+you can point the gun at one thing and hit another. This is the known state of the
+release and it is the next thing being worked on. Aiming down sights remains the
+accurate way to shoot. Set `wgun = 0` in `grwxr.cfg` for exactly the v0.7.0 behaviour.
+
+How it was found, since that is the part that took the time. Four things had to be
+confirmed separately in a headset, each with a test that could only answer one way:
+that the weapon can be moved at all, which of the character's bones actually carries
+it, which axis of that bone is the barrel, and then that setting that barrel onto the
+controller's ray directly (rather than nudging it relative to the game's own aim)
+behaves. Two of the four had previously been assumed, and both assumptions were
+wrong: the mount is the gameplay gun-root bone rather than the visual one, and the
+barrel axis was not the one an automatic heuristic had scored highest.
+
+New config keys, all documented in `grwxr.cfg` and all hot-reloading:
+`wgun` (3 = the feature, 0 = off), `wskel` (required by it), `wgun_pos`,
+`wgun_pos_scale`, `wgun_pos_clamp`, `wgun_pos_smooth`, `wgun_smooth`,
+`wgun_maxstep_deg`.
+
+`wgun_pos_clamp` is a safety rail rather than a tuning knob: however wrong a
+controller pose ever is, the weapon cannot end up further than that distance from
+where the game itself placed it. Raise it if the gun strains against the limit; do
+not remove it.
+
+**Fixed: a mistyped config value could crash the game.** `aim_shot_site_yaw` and
+`aim_shot_site_pitch` take a hex address, not a 0/1 switch, and a value that was not
+a real address was dereferenced without being range-checked first. It now refuses the
+value, says so in the log, and leaves the game running, which is what the rest of the
+mod already did.
+
+Known limits in this release: the gun sits at the point the engine mounts it, near
+the receiver, so it can hang slightly off your fist; your character's arms do not
+follow the weapon; and hip-fire spread is untouched, so even a correctly pointed
+barrel scatters.
+
 ## v0.7.0-alpha, "The Update Update" (the 2026-08 port, 2026-08-08, PACKAGED RELEASE)
 
 Ubisoft shipped a ~31 GB title update ("Last Rites", August 2026) that replaced

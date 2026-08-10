@@ -61,6 +61,7 @@
 // VRMirror can stamp the projection layer with the fov of the submitted image.
 
 #include "CameraProbe.h"
+#include "AimTrace.h"
 
 #include "GameBuild.h"
 
@@ -124,6 +125,50 @@ volatile uint64_t grwxr_headhide_obj    = 0;
 // Build 34: direct setter calls made on the FP toggle edge (instant hide).
 volatile uint64_t grwxr_headhide_direct = 0;
 void  grwxr_headhide_entry();
+
+// Build 67: THE GUN-ROOT BONE WRITE. `[VERIFIED, headset, log grwxr-18692]`
+// the held weapon's origin tracks the PLAYER rig's Fake_gunroot bone to
+// 0..6 mm across 88 samples and 0.7 m of movement, so that bone is the mount.
+// The engine composes the weapon's placement from it inside
+// Skeleton::PublishAttachments, which is therefore the only window where a
+// write is both after the animation solver and before the consumer (the whole
+// chain is in docs/RE-notes.md). Offsetting one bone by a constant asks one
+// binary question: does the RENDERED gun move. cfg wgun / wgun_dz.
+uint64_t grwxr_wgun_skel   = 0;   // published only while armed
+uint64_t grwxr_wgun_impl   = 0;
+uint32_t grwxr_wgun_node   = 0;
+uint32_t grwxr_wgun_dz     = 0;   // float bits
+volatile uint64_t grwxr_wgun_calls  = 0;
+volatile uint64_t grwxr_wgun_writes = 0;
+void  grwxr_wgun_entry();
+
+// BUILD 80: the rotation. The lift was four instructions of assembly; setting
+// the barrel onto the controller ray is quaternion work, so the stub now calls
+// out to C for it, exactly as build 68's grwxr_wnode_prep does. Runs on the
+// engine's own thread inside PublishAttachments: no allocation, no lock, no
+// logging, rule 8 intact. Every gate has its own counter (the rule this
+// project wrote after one counter behind five early returns cost three runs).
+extern "C" void grwxr_wgun_apply(void* skel);
+uint32_t grwxr_wgun_rot = 0;             // 1 = rotate, 0 = the verified lift
+volatile uint64_t grwxr_wg_nopose = 0;   // [skel+0x238] unreadable or null
+volatile uint64_t grwxr_wg_nobuf  = 0;   // [pose+0x178] unreadable or null
+volatile uint64_t grwxr_wg_norec  = 0;   // bone record unreadable
+volatile uint64_t grwxr_wg_noray  = 0;   // no fresh controller ray
+volatile uint64_t grwxr_wg_badq   = 0;   // degenerate quaternion or axis
+volatile uint64_t grwxr_wg_rot    = 0;   // rotations actually written
+volatile uint64_t grwxr_wg_nopos  = 0;   // build 81: no controller position
+volatile uint64_t grwxr_wg_pos    = 0;   // build 81: positions written
+
+// Build 68: THE WEAPON PLACEMENT SUBSTITUTION. Research verdict (2026-08-09,
+// docs/RESEARCH-IK-MOTION-CONTROLS-2026-08.md): every closed-engine precedent
+// converges on being the LAST WRITER, and this is the only point with no
+// timing hazard at all, because we are inside the engine's own commit rather
+// than racing it. FRIK abandoned its renderer and animation-vfunc hooks for
+// exactly this reason; UEVR calls the same idea "Permanent Change".
+uint64_t grwxr_wnode_impl  = 0;
+volatile uint64_t grwxr_wnode_calls = 0;
+extern "C" const void* grwxr_wnode_prep(void* node, const float* m);
+void  grwxr_wnode_entry();
 }
 
 namespace grwxr {
@@ -319,17 +364,414 @@ std::atomic<uint32_t> g_skel_ring_w{0};
 // the bullet work), SEH, hard write cap, cleared on any disarm.
 constexpr uint64_t    kWskelWriteCap = 7200;   // ~100 s at 72 Hz
 std::atomic<bool>     g_wskel_write_on{false};
+std::atomic<int>      g_wskel_mode{1};
 std::atomic<uint64_t> g_wskel_tgt{0};
 std::atomic<uint64_t> g_wskel_tgt_rig{0};
 std::atomic<uint64_t> g_wskel_writes{0};
 
-// POD-only SEH writer, called from the recorder (rule 8: no logging, no
-// allocation). A recycled instance fails the rig compare and is skipped.
+// Build 66 (2026-08-09): MODE 2 writes the POSE ROOT instead of the instance
+// origin. Mode 1 is build 65's original target and is kept only so the old
+// negative can be reproduced on demand.
+//
+// Why the root: the 2026-08-09 wpose run proved the held weapon's bone buffer
+// is MODEL space (flags bit 26 clear on every tick), so world = rootQ * boneT
+// + rootT and the root is the one rigid transform carrying the whole rig. Its
+// rotation is live and tracks the player's aim, so it is the real animated
+// transform rather than a stale mirror.
+//
+// The catch this test exists to settle: rootT reads bit-identical to the
+// instance +0x120 that build 65 wrote 1680 times with no visual effect. So
+// either they are the same storage, or the root is regenerated from +0x120
+// every frame. ACCUMULATING +0.30 m separates those outcomes by eye:
+//   gun climbs away fast  = nothing overwrites us, the root IS the render
+//                           input, and 6DoF is then controller pose -> root
+//   gun sits ~0.30 m high = the engine rewrites the root each frame and our
+//                           write lands just before it, so we need the later
+//                           writer (the decomp agents are naming it)
+//   gun does not move     = the root is not read by the renderer either, and
+//                           the palette/draw path is the only remaining route
+// Bit 26 is re-checked at write time: if the engine ever hands us a
+// world-space buffer the root stops being the carrier and we must not write.
+// Build 68 state. The node is republished every census tick and never cached
+// across a weapon swap: FRIK and UEVR both report stale-handle bugs exactly
+// there (a weapon node stays non-null while invalid, and a swap invalidates
+// the object outright), so identity is re-derived, not remembered.
+std::atomic<uint64_t> g_wnode_target{0};
+std::atomic<int>      g_wnode_mode{0};
+std::atomic<float>    g_wnode_dz{0.30f};
+volatile uint64_t     g_wnode_hits = 0;
+alignas(16) float     g_wnode_mat[16] = {};
+
+// BUILD 70: THE SetWorldTransform CENSUS (cfg wnode_census).
+//
+// Build 68 derived the substitution target by a POINTER CHAIN GUESS,
+// [[weapon instance + 0x10] + 0x18]. The 2026-08-09 headset run refuted it
+// three ways at once: the tester reports that EVERY weapon he carries is
+// affected, not just the held one; the derived target flaps between two values
+// while the pick above it is stable and locked; and the pick's own distance to
+// the gun root reads 0.080 m rather than the 0.002 m the mount census measured.
+// A chain that yields a shared parent, is unstable for a stable input, and does
+// not land on the gun root is simply the wrong object.
+//
+// So identify it the way the mount census identified Fake_gunroot: from the
+// engine's own data. Record every node the engine places, with the position it
+// places it at, and let the one that sits ON the gun root at 2 substitutions
+// per frame name itself. Self-verifying, so a hit is real and a miss is real.
+//
+// Rule 8: this runs inside the hook, so it does no logging, no allocation, no
+// lock and no COM. It is a direct-mapped store with a short probe. Races
+// between the engine's job threads are benign here: the worst case is a lost
+// sample of a node we see 144 times a second.
+// BUILD 71: PROXIMITY GATE. The first census (build 70) used 512 ungated slots
+// and filled 509 of them, so it stopped recording early and its ranking was
+// "the nearest of whatever was placed first", not "the nearest". The engine
+// places tens of thousands of nodes a second across the whole world; almost
+// none of them are on the player. Gating on distance to the gun root BEFORE a
+// slot is consumed spends the whole table on things attached to him, which is
+// the only population the question is about. The reference is republished once
+// a second by the drain tick, so it is at worst one second stale, which against
+// a 1.5 m gate is irrelevant while standing still.
+constexpr uint32_t kCenSlots = 2048;
+struct CenEntry {
+    std::atomic<uint64_t> node;
+    std::atomic<uint32_t> hits;
+    float p[3];
+    float dmin;      // closest this node has EVER been placed to the gun root
+    uint32_t prev;   // hits at the previous drain tick, to spot a LIVE node
+};
+CenEntry g_cen[kCenSlots];
+std::atomic<int>      g_cen_on{0};
+
+// BUILD 72: the anchor, and why the gun root cannot be it.
+//
+// The build 71 census showed there is no single held-weapon node. The node that
+// sits ON the gun root is placed 333 times at attach and then never again,
+// while the weapon's PARTS (receiver, optic, grip, barrel, magazine) are each
+// their own object placed every frame at 7 to 21 cm from that bone. Moving the
+// gun therefore means moving a cluster, not an object, which needs a geometric
+// gate rather than an identity one.
+//
+// A geometric gate needs a per-frame centre. The gun root is a bone we can only
+// read on the 1 Hz drain tick, which is far too stale to gate a 35 cm radius
+// while the player moves. So the centre is the ANCHOR: the continuously placed
+// part nearest the gun root, identified once by the census and thereafter
+// tracked from the engine's own placement of it, which is fresh every frame.
+// Rotating about the grip rather than the bone is also the better pivot: it is
+// where the hand is.
+std::atomic<uint64_t> g_wanchor{0};
+std::atomic<float>    g_wanchor_pos[3];
+std::atomic<int>      g_wanchor_ok{0};
+std::atomic<float>    g_wnode_radius{0.35f};
+// BUILD 73: the pivot must be FRESH, not merely chosen. g_wanchor_ok is cleared
+// whenever the anchor changes and is set only by the hook actually seeing that
+// anchor placed, so we can never rotate a cluster about a point frozen where
+// the player used to be. That is what threw weapon parts to the character's
+// head and feet in the build 72 screenshot.
+std::atomic<uint32_t> g_wanchor_seen{0};
+
+// BUILD 74: WHICH AXIS IS THE BARREL, MEASURED RATHER THAN GUESSED.
+//
+// Mode 3 rotates from "where the game is aiming" onto "where the controller
+// points", and build 73 used the camera forward for the first of those. The
+// tester's report pins the flaw precisely: it works in ADS, where the camera
+// forward IS the barrel, and throws the receiver into his face in hip fire,
+// where the character holds the rifle canted and the two are unrelated.
+//
+// The correct source is the weapon's own forward, which means knowing which of
+// its basis rows is the barrel, and in which sign. That is exactly the kind of
+// engine convention this project does not guess at, so it is measured: score
+// all six signed candidates against the camera forward over a few seconds, and
+// latch the winner. The gun points broadly where the player looks often enough
+// that the barrel row wins decisively, and the score margin is logged so a
+// marginal win can be seen rather than trusted.
+std::atomic<float>    g_wanchor_basis[9];
+volatile float        g_axis_score[6] = {};
+std::atomic<int>      g_axis_idx{-1};       // 0..5, -1 = not yet calibrated
+std::atomic<uint32_t> g_axis_samples{0};
+
+// BUILD 73: one matrix buffer per call, round-robin. The gun is fourteen parts
+// and the engine places them from several job threads, so a single shared
+// buffer means one part's transform can be handed to another. Prior art for the
+// exact remedy: the 6DOF Master Reference section 8D, RDR2's redirect-the-copy,
+// which uses a round-robin bank for this reason. Thirty-two is far more than
+// the parts in flight at once, so a buffer cannot be recycled while the engine
+// is still reading it.
+constexpr uint32_t kMatRing = 32;
+alignas(16) float     g_wnode_ring[kMatRing][16];
+std::atomic<uint32_t> g_wnode_ring_i{0};
+
+// BUILD 73: ONE COUNTER PER GATE. This is the third time a single counter
+// behind several early returns has cost a headset run. Mode 2's subs=0 was read
+// as "the node never matches" when it was the controller-ray gate; build 72's
+// frozen subs has three candidate explanations (no anchor, stale pivot, or a
+// controller that was asleep at load) and the instrument cannot separate them.
+// A counter per reason turns every future "nothing happened" into a sentence.
+volatile uint64_t g_gate_noanchor = 0;   // no anchor elected
+volatile uint64_t g_gate_stale    = 0;   // anchor elected but not yet placed
+volatile uint64_t g_gate_outside  = 0;   // part outside the radius, correct
+volatile uint64_t g_gate_noview   = 0;   // the game's aim direction unavailable
+volatile uint64_t g_gate_noray    = 0;   // the controller ray unavailable
+std::atomic<uint32_t> g_cen_seen{0};      // in-radius placements observed
+std::atomic<uint32_t> g_cen_rejected{0};  // out-of-radius, never given a slot
+std::atomic<float>    g_cen_ref[3];
+std::atomic<int>      g_cen_ref_ok{0};
+std::atomic<float>    g_cen_radius{1.5f};
+
+inline void census_note(uint64_t n, const float* m) {
+    if (!g_cen_ref_ok.load(std::memory_order_relaxed)) return;
+    const float rx = g_cen_ref[0].load(std::memory_order_relaxed);
+    const float ry = g_cen_ref[1].load(std::memory_order_relaxed);
+    const float rz = g_cen_ref[2].load(std::memory_order_relaxed);
+    const float dx = m[12] - rx, dy = m[13] - ry, dz = m[14] - rz;
+    const float d2 = dx*dx + dy*dy + dz*dz;
+    const float rad = g_cen_radius.load(std::memory_order_relaxed);
+    if (!(d2 <= rad * rad)) {
+        g_cen_rejected.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const float d = sqrtf(d2);
+    g_cen_seen.fetch_add(1, std::memory_order_relaxed);
+
+    uint32_t i = (uint32_t)((n >> 4) ^ (n >> 21)) & (kCenSlots - 1);
+    for (int probe = 0; probe < 4; ++probe, i = (i + 1) & (kCenSlots - 1)) {
+        const uint64_t cur = g_cen[i].node.load(std::memory_order_relaxed);
+        if (cur == n) {
+            g_cen[i].hits.fetch_add(1, std::memory_order_relaxed);
+            g_cen[i].p[0] = m[12]; g_cen[i].p[1] = m[13]; g_cen[i].p[2] = m[14];
+            // Rank on the CLOSEST this node has ever been placed, not the last
+            // sample. A weapon node passes through its bind position during a
+            // draw animation, and a last-sample ranking taken mid-animation
+            // would push the right answer down the list.
+            if (d < g_cen[i].dmin) g_cen[i].dmin = d;
+            return;
+        }
+        if (cur == 0) {
+            uint64_t expect = 0;
+            if (g_cen[i].node.compare_exchange_strong(expect, n,
+                                                      std::memory_order_relaxed)) {
+                g_cen[i].hits.store(1, std::memory_order_relaxed);
+                g_cen[i].p[0] = m[12]; g_cen[i].p[1] = m[13]; g_cen[i].p[2] = m[14];
+                g_cen[i].dmin = d;
+            }
+            return;
+        }
+    }
+    // Four collisions: drop the sample. A node placed twice a frame will win a
+    // slot within the first few frames regardless.
+}
+
+// Build 68: called from grwxr_wnode_entry for EVERY TransformNode placement in
+// the game, so the first thing it does is the identity gate. Returns null for
+// everything that is not our weapon, and the stub then leaves the engine's own
+// argument completely untouched.
+//
+// Rule 8 holds: no logging, no lock, no allocation, no COM.
+//
+// Mode 1 offsets the translation row: the mechanism test. Unlike the bone
+// write it CANNOT be overwritten, so a negative here means the drawn mesh does
+// not follow this transform, rather than meaning we lost a race.
+// Mode 2 is the feature: keep the engine's position, so the gun stays in the
+// hand, and rebuild the rotation basis so the barrel follows the controller
+// ray. That needs no controller-position plumbing, which is why it ships now.
+// Build 72: the rotation that carries direction a onto direction b, both unit,
+// as a row-major 3x3. Convention-free by construction: we never have to know
+// which local axis of a weapon part is its barrel, because we rotate the part
+// by a world-space delta rather than rebuilding its basis from scratch. Build
+// 68's mode 2 did rebuild it, guessing the axis order, and that guess is what
+// put the rifle sideways in the tester's screenshot.
+//
+// If a == b the result is the identity, so pointing the controller where you
+// are already looking changes nothing. That makes the whole feature safe at
+// its own boundary rather than by a guard.
+inline void rot_between(const float a[3], const float b[3], float R[9]) {
+    const float c = a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    float k[3] = {a[1]*b[2] - a[2]*b[1],
+                  a[2]*b[0] - a[0]*b[2],
+                  a[0]*b[1] - a[1]*b[0]};
+    const float s = sqrtf(k[0]*k[0] + k[1]*k[1] + k[2]*k[2]);
+    if (s < 1e-6f) {   // parallel, or antiparallel which we decline to invent
+        R[0]=1; R[1]=0; R[2]=0; R[3]=0; R[4]=1; R[5]=0; R[6]=0; R[7]=0; R[8]=1;
+        return;
+    }
+    k[0] /= s; k[1] /= s; k[2] /= s;
+    const float ang = atan2f(s, c), C = cosf(ang), S = sinf(ang), t = 1.0f - C;
+    R[0] = t*k[0]*k[0] + C;        R[1] = t*k[0]*k[1] - S*k[2];  R[2] = t*k[0]*k[2] + S*k[1];
+    R[3] = t*k[0]*k[1] + S*k[2];   R[4] = t*k[1]*k[1] + C;       R[5] = t*k[1]*k[2] - S*k[0];
+    R[6] = t*k[0]*k[2] - S*k[1];   R[7] = t*k[1]*k[2] + S*k[0];  R[8] = t*k[2]*k[2] + C;
+}
+
+inline void rot_apply(const float R[9], const float v[3], float o[3]) {
+    o[0] = R[0]*v[0] + R[1]*v[1] + R[2]*v[2];
+    o[1] = R[3]*v[0] + R[4]*v[1] + R[5]*v[2];
+    o[2] = R[6]*v[0] + R[7]*v[1] + R[8]*v[2];
+}
+
+extern "C" const void* grwxr_wnode_prep(void* node, const float* m) {
+    // Build 70: the census sees EVERY placement, before any identity gate, so
+    // it can name the node we should have been targeting all along. It never
+    // modifies anything, so it is safe to run with wnode = 0.
+    if (m && node && g_cen_on.load(std::memory_order_relaxed))
+        census_note((uint64_t)node, m);
+
+    const int mode = g_wnode_mode.load(std::memory_order_relaxed);
+    if (mode <= 0 || !m) return nullptr;
+
+    // BUILD 72, MODE 3: the geometric gate. Any part the engine places within
+    // the radius of the anchor is part of the held weapon and gets the same
+    // rigid rotation about it. The pistol on the leg is far outside, so it is
+    // excluded without being identified, and so is everything else in the
+    // world. This is what replaces build 68's search for a single node that
+    // the census proved does not exist.
+    if (mode == 3) {
+        const uint64_t anchor = g_wanchor.load(std::memory_order_relaxed);
+        if (!anchor) { g_gate_noanchor = g_gate_noanchor + 1; return nullptr; }
+        __try {
+            // Track the anchor from the engine's own placement of it, and only
+            // then declare the pivot usable. Used one frame later at worst,
+            // which at 72 Hz is below perception.
+            if ((uint64_t)node == anchor) {
+                g_wanchor_pos[0].store(m[12], std::memory_order_relaxed);
+                g_wanchor_pos[1].store(m[13], std::memory_order_relaxed);
+                g_wanchor_pos[2].store(m[14], std::memory_order_relaxed);
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c)
+                        g_wanchor_basis[r*3+c].store(m[r*4+c],
+                                                     std::memory_order_relaxed);
+                g_wanchor_ok.store(1, std::memory_order_relaxed);
+                g_wanchor_seen.fetch_add(1, std::memory_order_relaxed);
+                // Score the six signed basis candidates against the camera
+                // forward. Whichever is the barrel wins over a few seconds.
+                float vf[3];
+                if (g_axis_idx.load(std::memory_order_relaxed) < 0 &&
+                    aimtrace::view_fwd(vf)) {
+                    for (int r = 0; r < 3; ++r) {
+                        const float dot = m[r*4+0]*vf[0] + m[r*4+1]*vf[1] +
+                                          m[r*4+2]*vf[2];
+                        g_axis_score[r]     = g_axis_score[r]     + dot;
+                        g_axis_score[r + 3] = g_axis_score[r + 3] - dot;
+                    }
+                    g_axis_samples.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (!g_wanchor_ok.load(std::memory_order_relaxed)) {
+                g_gate_stale = g_gate_stale + 1;
+                return nullptr;
+            }
+            const float ax = g_wanchor_pos[0].load(std::memory_order_relaxed);
+            const float ay = g_wanchor_pos[1].load(std::memory_order_relaxed);
+            const float az = g_wanchor_pos[2].load(std::memory_order_relaxed);
+            const float dx = m[12] - ax, dy = m[13] - ay, dz = m[14] - az;
+            const float rad = g_wnode_radius.load(std::memory_order_relaxed);
+            if (dx*dx + dy*dy + dz*dz > rad * rad) {
+                g_gate_outside = g_gate_outside + 1;
+                return nullptr;
+            }
+
+            float aim[3], ray[3];
+            if (!aimtrace::view_fwd(aim)) { g_gate_noview = g_gate_noview + 1; return nullptr; }
+            if (!aimtrace::ctrl_ray(ray)) { g_gate_noray  = g_gate_noray  + 1; return nullptr; }
+            // BUILD 74: once the barrel axis is known, rotate from the GUN's
+            // own forward rather than the camera's. Until then the camera
+            // forward is used, which is the build 73 behaviour and is correct
+            // in ADS, so the calibration period degrades to what already
+            // worked rather than to something new.
+            const int ai = g_axis_idx.load(std::memory_order_relaxed);
+            if (ai >= 0) {
+                const int r = ai % 3;
+                const float sgn = (ai < 3) ? 1.0f : -1.0f;
+                float g[3] = {
+                    sgn * g_wanchor_basis[r*3+0].load(std::memory_order_relaxed),
+                    sgn * g_wanchor_basis[r*3+1].load(std::memory_order_relaxed),
+                    sgn * g_wanchor_basis[r*3+2].load(std::memory_order_relaxed)};
+                const float gn = sqrtf(g[0]*g[0] + g[1]*g[1] + g[2]*g[2]);
+                if (gn > 1e-4f) {
+                    aim[0] = g[0] / gn; aim[1] = g[1] / gn; aim[2] = g[2] / gn;
+                }
+            }
+            float R[9];
+            rot_between(aim, ray, R);
+
+            // One buffer per call: the gun is many parts placed from several
+            // job threads, and a shared buffer hands one part another's matrix.
+            const uint32_t ri =
+                g_wnode_ring_i.fetch_add(1, std::memory_order_relaxed) & (kMatRing - 1);
+            float* const dst = g_wnode_ring[ri];
+            memcpy(dst, m, sizeof(g_wnode_ring[0]));
+            // Rotate the part rigidly about the anchor: its three basis rows
+            // are world directions, and its position is a world point.
+            for (int r = 0; r < 3; ++r) {
+                const float row[3] = {m[r*4+0], m[r*4+1], m[r*4+2]};
+                float out[3];
+                rot_apply(R, row, out);
+                dst[r*4+0] = out[0];
+                dst[r*4+1] = out[1];
+                dst[r*4+2] = out[2];
+            }
+            const float rel[3] = {dx, dy, dz};
+            float rot[3];
+            rot_apply(R, rel, rot);
+            dst[12] = ax + rot[0];
+            dst[13] = ay + rot[1];
+            dst[14] = az + rot[2];
+            g_wnode_hits = g_wnode_hits + 1;
+            return dst;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return nullptr;
+        }
+    }
+
+    const uint64_t want = g_wnode_target.load(std::memory_order_relaxed);
+    if (!want || (uint64_t)node != want) return nullptr;
+
+    __try {
+        memcpy(g_wnode_mat, m, sizeof(g_wnode_mat));
+        if (mode >= 2) {
+            // The gun points along the SAME ray the bullets ride, so the two
+            // cannot diverge: that divergence is exactly the defect class
+            // behind the tester's ADS complaint.
+            float d[3];
+            if (!aimtrace::ctrl_ray(d)) return nullptr;
+            const float dn = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+            if (!(dn > 1e-4f)) return nullptr;
+            d[0] /= dn; d[1] /= dn; d[2] /= dn;
+            // World up is z here. Re-derive a true up after the cross so the
+            // basis stays orthonormal even aiming straight up or down.
+            float up[3] = {0.0f, 0.0f, 1.0f};
+            if (fabsf(d[2]) > 0.999f) { up[0] = 1.0f; up[2] = 0.0f; }
+            float r[3] = {up[1]*d[2] - up[2]*d[1],
+                          up[2]*d[0] - up[0]*d[2],
+                          up[0]*d[1] - up[1]*d[0]};
+            const float rn = sqrtf(r[0]*r[0] + r[1]*r[1] + r[2]*r[2]);
+            if (!(rn > 1e-4f)) return nullptr;
+            r[0] /= rn; r[1] /= rn; r[2] /= rn;
+            const float u[3] = {d[1]*r[2] - d[2]*r[1],
+                                d[2]*r[0] - d[0]*r[2],
+                                d[0]*r[1] - d[1]*r[0]};
+            g_wnode_mat[0] = r[0]; g_wnode_mat[1] = r[1]; g_wnode_mat[2]  = r[2];
+            g_wnode_mat[4] = d[0]; g_wnode_mat[5] = d[1]; g_wnode_mat[6]  = d[2];
+            g_wnode_mat[8] = u[0]; g_wnode_mat[9] = u[1]; g_wnode_mat[10] = u[2];
+        } else {
+            g_wnode_mat[14] += g_wnode_dz.load(std::memory_order_relaxed);
+        }
+        g_wnode_hits = g_wnode_hits + 1;
+        return g_wnode_mat;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
 static void wskel_write_apply(uint64_t tgt, uint64_t rig) {
     __try {
         if (!rig || *(uint64_t*)(tgt + 0x220) != rig) return;
-        *(float*)(tgt + 0x128) += 0.30f;   // +0x120 origin, z lane
-        *(float*)(tgt + 0x258) += 0.30f;   // +0x250 copy, z lane
+        if (g_wskel_mode.load(std::memory_order_relaxed) >= 2) {
+            const uint64_t pose = *(uint64_t*)(tgt + 0x238);
+            if (pose < 0x10000 || (pose & 7)) return;
+            if (*(uint32_t*)(pose + 0x8C) & 0x04000000u) return;  // world space
+            *(float*)(pose + 0x08) += 0.30f;   // rootT z lane (game up axis)
+        } else {
+            *(float*)(tgt + 0x128) += 0.30f;   // +0x120 origin, z lane
+            *(float*)(tgt + 0x258) += 0.30f;   // +0x250 copy, z lane
+        }
         g_wskel_writes.fetch_add(1, std::memory_order_relaxed);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
@@ -631,6 +1073,87 @@ bool read_bone_world(uint64_t skel, unsigned int idx, float out[3]) {
     return isfinite(out[0]) && isfinite(out[1]) && isfinite(out[2]);
 }
 
+// BUILD 79: THE BARREL AXIS, MEASURED RATHER THAN SCORED.
+//
+// Rotating the gun-root bone onto the controller ray needs to know which axis
+// of that bone's own frame points down the barrel. Build 74 answered this by
+// scoring six signed basis rows against the CAMERA forward and returned a
+// confident wrong answer, because on a canted weapon the gun's right axis
+// correlates with gaze better than its barrel does.
+//
+// This measures instead. While the player aims, the gun points where the GAME
+// is aiming, and aimtrace publishes that direction in engine world space. So
+// the bone axis whose world direction tracks `view_fwd` IS the barrel, and the
+// numbers go in the log for a human to read rather than into a heuristic that
+// picks in the dark.
+//
+// Convention-free by construction: instead of packing a rotation matrix and
+// having to be right about row-vector versus column-vector order, it rotates
+// the three unit model axes by the bone's world quaternion. A dot product of a
+// rotated unit axis with a unit direction means the same thing under either
+// convention.
+//
+// Returns the three world-space axis directions in ax/ay/az. Read-only.
+bool read_bone_world_axes(uint64_t skel, unsigned int idx,
+                          float ax[3], float ay[3], float az[3]) {
+    if (!skel || idx == 0xFFFFu) return false;
+    uint64_t pose = 0, buf = 0;
+    if (!read_block(skel + 0x238, &pose, sizeof(pose))) return false;
+    if (pose < 0x10000 || (pose & 7)) return false;
+    if (!read_block(pose + 0x178, &buf, sizeof(buf))) return false;
+    if (buf < 0x10000 || (buf & 7)) return false;
+
+    float rec[8];   // { float4 T, float4 Q }
+    if (!read_block(buf + (uint64_t)idx * 0x20, rec, sizeof(rec))) return false;
+    const float* bq = rec + 4;
+    for (int i = 0; i < 4; ++i) if (!isfinite(bq[i])) return false;
+
+    float q[4] = {bq[0], bq[1], bq[2], bq[3]};   // xyzw
+
+    // Model space unless bit 26 says the buffer is already world space, in
+    // which case the bone quaternion IS the world one and the root must not be
+    // applied a second time. Same gate read_bone_world uses.
+    uint32_t flags = 0;
+    read_block(pose + 0x8C, &flags, sizeof(flags));
+    if (!(flags & 0x04000000u)) {
+        float rq[4];
+        if (!read_block(pose + 0x10, rq, sizeof(rq))) return false;
+        for (int i = 0; i < 4; ++i) if (!isfinite(rq[i])) return false;
+        const float rn = sqrtf(rq[0] * rq[0] + rq[1] * rq[1] +
+                               rq[2] * rq[2] + rq[3] * rq[3]);
+        if (!(rn > 1e-6f)) return false;
+        const float ax_ = rq[0] / rn, ay_ = rq[1] / rn,
+                    az_ = rq[2] / rn, aw_ = rq[3] / rn;
+        const float bx = q[0], by = q[1], bz = q[2], bw = q[3];
+        // Hamilton product worldQ = rootQ * boneQ (bone applied first).
+        q[3] = aw_ * bw - ax_ * bx - ay_ * by - az_ * bz;
+        q[0] = aw_ * bx + ax_ * bw + ay_ * bz - az_ * by;
+        q[1] = aw_ * by - ax_ * bz + ay_ * bw + az_ * bx;
+        q[2] = aw_ * bz + ax_ * by - ay_ * bx + az_ * bw;
+    }
+
+    const float n = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    if (!(n > 1e-6f)) return false;
+    const float qx = q[0] / n, qy = q[1] / n, qz = q[2] / n, qw = q[3] / n;
+
+    // v' = v + 2*qw*(q x v) + 2*(q x (q x v)), the same form read_bone_world
+    // uses, applied to each unit model axis in turn.
+    auto rot = [&](const float v[3], float out[3]) {
+        const float cx = qy * v[2] - qz * v[1];
+        const float cy = qz * v[0] - qx * v[2];
+        const float cz = qx * v[1] - qy * v[0];
+        const float dx = qy * cz - qz * cy;
+        const float dy = qz * cx - qx * cz;
+        const float dz = qx * cy - qy * cx;
+        out[0] = v[0] + 2.0f * (qw * cx + dx);
+        out[1] = v[1] + 2.0f * (qw * cy + dy);
+        out[2] = v[2] + 2.0f * (qw * cz + dz);
+    };
+    const float ex[3] = {1, 0, 0}, ey[3] = {0, 1, 0}, ez[3] = {0, 0, 1};
+    rot(ex, ax); rot(ey, ay); rot(ez, az);
+    return isfinite(ax[0]) && isfinite(ay[0]) && isfinite(az[0]);
+}
+
 // Build 17: THE AIM ARCHITECTURE EXPERIMENT.
 //
 // (The 16b effector-array sweep that lived here was removed per rule 6: two
@@ -696,11 +1219,39 @@ hook::ThunkHook g_setpitch_hook;
 constexpr const char* kHeadSlotFnSig  =
     "48 89 5C 24 08 57 48 83 EC 20 48 83 7A 20 00 48 89 D3 48 89 CF 74 ? "
     "49 89 D0 31 D2 E8";
-// The setter's own body, unique, no rel32/rip operands (RE-notes).
-constexpr const char* kHeadSetterSig  =
-    "48 83 EC 08 44 0F B6 DA 49 89 C9 38 51 68 74 ? 44 0F B7 51 4A";
+// The setter's own body signature is PER BUILD (GameBuild head_setter_sig):
+// the 2026-08 recompile re-registered it, so one constant cannot serve all
+// three binaries. Unique, no rel32/rip operands (RE-notes + campaign doc).
 
 hook::ThunkHook g_headhide_hook;
+hook::ThunkHook g_wgun_hook;
+hook::ThunkHook g_wnode_hook;
+
+
+// Build 67 state, all owned by the 1 Hz census tick.
+std::atomic<bool>  g_wgun_on{false};
+std::atomic<float> g_wgun_dz_cfg{0.30f};
+constexpr uint32_t kFakeGunRootHash = 0x826846F3u;   // Fake_gunroot, VERIFIED
+constexpr uint32_t kGunRootGameplay = 0x08B4DDD5u;   // FakeGunRoot_Gameplay
+std::atomic<uint32_t> g_wgun_hash{kFakeGunRootHash};
+
+// Build 79: the barrel-axis measurement, log only (cfg wbaxis).
+std::atomic<int> g_wbaxis{0};
+
+// Build 80: the rotation's filter, cfg wgun_smooth / wgun_maxstep_deg, and a
+// generation counter so a mode change restarts the filter from the live ray
+// instead of slewing out of a stale one.
+std::atomic<float> g_wgun_smooth{0.25f};
+std::atomic<float> g_wgun_maxstep{5.0f};
+std::atomic<uint32_t> g_wgun_gen{0};
+
+// Build 81: position, off by default so the verified rotation cannot regress
+// behind it. clamp is the hard cap in metres on how far the gun may sit from
+// the engine's own placement, which bounds every possible tracking failure.
+std::atomic<int>   g_wgun_pos{0};
+std::atomic<float> g_wgun_pos_scale{1.0f};
+std::atomic<float> g_wgun_pos_clamp{1.0f};
+std::atomic<float> g_wgun_pos_smooth{0.35f};
 
 // Build 35: NO CAMERA BLUR (RE-notes "NO CAMERA BLUR, decoded from the
 // community FP mod's cheat table", session 23). The community FP mod ships
@@ -1336,7 +1887,7 @@ bool install() {
     {
         bool hh_ok = true;
         size_t m = 0;
-        auto setter = sig::find_unique(*img, kHeadSetterSig, &m);
+        auto setter = sig::find_unique(*img, gb->head_setter_sig, &m);
         if (!setter || *setter != img->base + gb->head_setter_impl) {
             LOG_ERROR("hide: SetHidden signature %s (matches=%zu, expected "
                       "RVA 0x%08zX). Head hide OFF, everything else runs.",
@@ -1384,6 +1935,46 @@ bool install() {
                          "person is on (class table verified via slot fn).");
             }
         }
+    }
+
+    // Build 67: PublishAttachments, for the gun-root bone write. Fail-closed
+    // exactly like every other consumer: an un-derived row (0) installs
+    // nothing, and ThunkHook verifies the E9 really targets the impl before a
+    // byte is written. The stub itself stays inert until the census publishes
+    // a player skeleton, which it only does while cfg wgun is 1.
+    if (gb->publish_thunk && gb->publish_impl) {
+        grwxr_wgun_impl = (uint64_t)(img->base + gb->publish_impl);
+        if (g_wgun_hook.install(img->base + gb->publish_thunk,
+                                img->base + gb->publish_impl,
+                                (void*)&grwxr_wgun_entry,
+                                "PublishAttachments")) {
+            LOG_INFO("wgun: PublishAttachments hooked. Inert until cfg "
+                     "wgun=1 arms it; then the player's Fake_gunroot bone is "
+                     "offset by wgun_dz just before the engine places the "
+                     "weapon from it.");
+        }
+    } else {
+        LOG_INFO("wgun: PublishAttachments not derived for this binary. The "
+                 "gun-root write is OFF, everything else runs (rule 7).");
+    }
+
+    // Build 68: TransformNode::SetWorldTransform, the substitution point.
+    // Fail-closed like every other consumer, and inert until the census
+    // publishes a weapon node, which it only does while cfg wnode > 0.
+    if (gb->setworld_thunk && gb->setworld_impl) {
+        grwxr_wnode_impl = (uint64_t)(img->base + gb->setworld_impl);
+        if (g_wnode_hook.install(img->base + gb->setworld_thunk,
+                                 img->base + gb->setworld_impl,
+                                 (void*)&grwxr_wnode_entry,
+                                 "SetWorldTransform")) {
+            LOG_INFO("wnode: SetWorldTransform hooked. Inert until cfg "
+                     "wnode>0; then the HELD WEAPON's placement is ours "
+                     "(1 = lift by wnode_dz, 2 = barrel follows the "
+                     "controller ray).");
+        }
+    } else {
+        LOG_INFO("wnode: SetWorldTransform not derived for this binary. The "
+                 "weapon placement override is OFF (rule 7).");
     }
 
     // Build 35: the no-camera-blur byte. See the constants block for the
@@ -1517,6 +2108,14 @@ void dump_matrices() {
 std::atomic<bool>     g_wskel_on{false};
 std::atomic<uint64_t> g_wskel_cand{0};
 
+// BUILD 69: the weapon-pick lock. Touched only by the 1 Hz drain tick, so plain
+// scalars: no other thread reads them. See the lock block in the scan for why
+// a per-tick argmax was not enough.
+uint64_t g_wskel_lock      = 0;   // the weapon we are committed to
+uint64_t g_wskel_chal      = 0;   // the challenger currently accumulating wins
+int      g_wskel_chal_hits = 0;
+constexpr int kLockSwitchTicks = 3;   // consecutive clear wins before a switch
+
 // Build 5 cadence, one call per second from the init thread. Prints a pending
 // snapshot as soon as the recorder fills one, and every 20 seconds re-arms the
 // snapshot and dumps the matrices. Independent of the survey throttle below so
@@ -1572,6 +2171,17 @@ void snap_drain() {
         g_calls[kSkelPostProbe].load(std::memory_order_relaxed)) {
         float hand[3];
         bool  hand_ok = false;
+        // BUILD 69: the gun-root reference. The 2026-08-09 mount census
+        // measured the held weapon's origin at 0.002 m from the player rig's
+        // Fake_gunroot bone and 0.258 m from Prop_RightHand. Selecting on the
+        // hand is therefore selecting on a quantity that is 0.07 to 0.52 m for
+        // EVERY weapon the player carries, which is why the pick flapped
+        // between the held rifle and the holstered gear tick to tick, and why
+        // mode 2 threw the controller ray at a weapon on the player's back.
+        // Two millimetres against half a metre is not a better heuristic, it is
+        // an identity.
+        float groot[3];
+        bool  groot_ok = false;
         const uint64_t body = (uint64_t)headpose::player_obj();
         if (body) {
             uint64_t brig = 0;
@@ -1580,12 +2190,29 @@ void snap_drain() {
                 const int nR = rig_find_node(brig, 0x75F94D30u);  // RightHand
                 hand_ok = nR >= 0 &&
                           read_bone_world(body, (unsigned int)nR, hand);
+                const int nG = rig_find_node(brig, kFakeGunRootHash);
+                groot_ok = nG >= 0 &&
+                           read_bone_world(body, (unsigned int)nG, groot);
             }
         }
+        // The acquire gate is what the census measured, with room to spare; the
+        // hold gate is looser so a single noisy frame cannot drop the lock.
+        // Without the gun root we fall back to the old hand distance for the
+        // census display, but the substitution target is NOT published in that
+        // case (see below): writing the wrong weapon is worse than writing none.
+        const float kAcquireD = groot_ok ? 0.10f : 1.00f;
+        const float kHoldD    = groot_ok ? 0.25f : 1.00f;
         uint64_t best = 0, best_rig = 0;
         float    best_d = 1e9f;
         uint16_t best_bones = 0;
+        float    best_o[3] = {0.0f, 0.0f, 0.0f};   // the pick's instance origin
         int      cands = 0;
+        // Build 69: the lock's own reading this tick, so a hold can present the
+        // lock's real distance and rig rather than the argmax's.
+        uint64_t lock_rig = 0;
+        float    lock_d = 1e9f;
+        uint16_t lock_bones = 0;
+        float    lock_o[3] = {0.0f, 0.0f, 0.0f};
         for (uint32_t i = 0; i < kRingSize; ++i) {
             const uint64_t p = g_skel_ring[i].load(std::memory_order_relaxed);
             if (!p || p == body) continue;
@@ -1600,9 +2227,10 @@ void snap_drain() {
             if (!read_block(p + 0x120, o, sizeof(o)) ||
                 !isfinite(o[0]) || !isfinite(o[1]) || !isfinite(o[2]))
                 continue;
-            const float ref[3] = {hand_ok ? hand[0] : g_base_pos[0],
-                                  hand_ok ? hand[1] : g_base_pos[1],
-                                  hand_ok ? hand[2] : g_base_pos[2]};
+            const float ref[3] = {
+                groot_ok ? groot[0] : hand_ok ? hand[0] : g_base_pos[0],
+                groot_ok ? groot[1] : hand_ok ? hand[1] : g_base_pos[1],
+                groot_ok ? groot[2] : hand_ok ? hand[2] : g_base_pos[2]};
             const float dx = o[0] - ref[0], dy = o[1] - ref[1],
                         dz = o[2] - ref[2];
             const float d = sqrtf(dx * dx + dy * dy + dz * dz);
@@ -1614,20 +2242,351 @@ void snap_drain() {
                          (unsigned long long)p, (unsigned long long)rig,
                          bones, hand_ok ? "hand" : "cam", d,
                          o[0], o[1], o[2]);
+            if (p == g_wskel_lock) {         // the lock, if it is still alive
+                lock_d = d; lock_rig = rig; lock_bones = bones;
+                lock_o[0] = o[0]; lock_o[1] = o[1]; lock_o[2] = o[2];
+            }
             if (d < best_d) {
                 best_d = d; best = p; best_rig = rig; best_bones = bones;
+                best_o[0] = o[0]; best_o[1] = o[1]; best_o[2] = o[2];
             }
         }
+
+        // BUILD 69: THE LOCK. A per-tick argmax has no memory, so it retargets
+        // on any tick where noise reorders the candidates, and every retarget
+        // is a visible snap: the held weapon reverts to the engine's placement
+        // while some other weapon takes our controller ray. This is the same
+        // failure and the same remedy as the main-camera lock in the 6DOF
+        // Master Reference section 21: hold the current pick while it remains
+        // plausible, and require a challenger to win clearly and repeatedly
+        // before switching. On a single-weapon frame it is a no-op.
+        const char* lock_what = "acquire";
+        if (g_wskel_lock && lock_d <= kHoldD) {
+            // The lock is alive and still plausible. Only a decisively closer
+            // challenger, sustained, may take it.
+            if (best && best != g_wskel_lock && best_d < lock_d * 0.5f) {
+                if (best == g_wskel_chal) ++g_wskel_chal_hits;
+                else { g_wskel_chal = best; g_wskel_chal_hits = 1; }
+            } else {
+                g_wskel_chal = 0; g_wskel_chal_hits = 0;
+            }
+            if (g_wskel_chal_hits >= kLockSwitchTicks) {
+                g_wskel_lock = g_wskel_chal;
+                g_wskel_chal = 0; g_wskel_chal_hits = 0;
+                lock_what = "SWITCHED";
+            } else {
+                // Hold: present the lock as the pick, not the tick's argmax.
+                best = g_wskel_lock; best_d = lock_d; best_rig = lock_rig;
+                best_bones = lock_bones;
+                best_o[0] = lock_o[0]; best_o[1] = lock_o[1]; best_o[2] = lock_o[2];
+                lock_what = "held";
+            }
+        } else if (best && best_d <= kAcquireD) {
+            g_wskel_lock = best;
+            g_wskel_chal = 0; g_wskel_chal_hits = 0;
+        } else {
+            g_wskel_lock = 0;
+            g_wskel_chal = 0; g_wskel_chal_hits = 0;
+            lock_what = "none";
+        }
+
         if (best && best_d < 1.0f) {
             g_wskel_cand.store(best, std::memory_order_relaxed);
-            LOG_INFO("wskel: PICK 0x%012llX rig=0x%012llX bones=%u d%s=%.2fm "
-                     "(WHITE marker rides it)",
+            LOG_INFO("wskel: PICK 0x%012llX rig=0x%012llX bones=%u d%s=%.3fm "
+                     "lock=%s (WHITE marker rides it)",
                      (unsigned long long)best, (unsigned long long)best_rig,
-                     best_bones, hand_ok ? "hand" : "cam", best_d);
+                     best_bones,
+                     groot_ok ? "groot" : hand_ok ? "hand" : "cam",
+                     best_d, lock_what);
+
+            // Build 68: publish the weapon's TRANSFORM NODE as the
+            // substitution target, re-derived every tick and never cached.
+            // Both FRIK and UEVR report stale-handle bugs at exactly this
+            // point (a weapon node stays non-null while invalid, and a swap
+            // invalidates the object outright), so identity is resolved
+            // fresh: node = [[weapon instance + 0x10] + 0x18], the owner
+            // entity's transform node.
+            //
+            // BUILD 69: FAIL CLOSED. Selection happens here at 1 Hz; the
+            // substitution runs 144 times a second on the engine thread and
+            // trusts this pointer completely. So the target is published ONLY
+            // when the pick is gun-root verified: no gun root, or a pick that
+            // is not sitting on it, means no target and the engine keeps its
+            // own placement. A run that writes nothing is a bad run; a run that
+            // writes the controller ray onto the rifle on your back is a bug
+            // report, and this is the difference between them.
+            if (g_wnode_hook.installed()) {
+                uint64_t ent = 0, nd = 0;
+                const bool verified = groot_ok && best_d <= kAcquireD;
+                if (verified &&
+                    g_wnode_mode.load(std::memory_order_relaxed) > 0 &&
+                    read_block(best + 0x10, &ent, sizeof(ent)) &&
+                    ent > 0x10000 && !(ent & 7) &&
+                    read_block(ent + 0x18, &nd, sizeof(nd)) &&
+                    nd > 0x10000 && !(nd & 7)) {
+                    g_wnode_target.store(nd, std::memory_order_relaxed);
+                } else {
+                    g_wnode_target.store(0, std::memory_order_relaxed);
+                    if (!verified)
+                        LOG_INFO("wnode: target WITHHELD (%s, d=%.3fm). The "
+                                 "engine keeps its own placement.",
+                                 groot_ok ? "pick is not on the gun root"
+                                          : "no Fake_gunroot on the player rig",
+                                 best_d);
+                }
+                // BUILD 70: the census report. Every node the engine placed
+                // this run, ranked by how close it sits to the player's
+                // Fake_gunroot. The held weapon's node is the one ON the gun
+                // root being placed about twice a frame; a shared parent will
+                // show a much larger hit count, and the wrong object will not
+                // be on the bone at all. Reading this replaces the pointer
+                // chain guess with a measurement.
+                if (g_cen_on.load(std::memory_order_relaxed) && groot_ok) {
+                    // Republish the reference the hook gates on. Once a second
+                    // is enough: the gate is 1.5 m wide.
+                    g_cen_ref[0].store(groot[0], std::memory_order_relaxed);
+                    g_cen_ref[1].store(groot[1], std::memory_order_relaxed);
+                    g_cen_ref[2].store(groot[2], std::memory_order_relaxed);
+                    g_cen_ref_ok.store(1, std::memory_order_relaxed);
+
+                    struct Row { uint64_t n; uint32_t h; float d; };
+                    Row top[16] = {};
+                    int  ntop = 0, live = 0;
+                    for (uint32_t i = 0; i < kCenSlots; ++i) {
+                        const uint64_t n =
+                            g_cen[i].node.load(std::memory_order_relaxed);
+                        if (!n) continue;
+                        ++live;
+                        const float d = g_cen[i].dmin;
+                        if (!isfinite(d)) continue;
+                        Row r{n, g_cen[i].hits.load(std::memory_order_relaxed), d};
+                        int at = ntop;
+                        while (at > 0 && top[at-1].d > r.d) {
+                            if (at < 16) top[at] = top[at-1];
+                            --at;
+                        }
+                        if (at < 16) { top[at] = r; if (ntop < 16) ++ntop; }
+                    }
+                    // Saturation is stated out loud. Build 70 filled 509 of 512
+                    // slots and said nothing, so its ranking was read as "the
+                    // nearest" when it was "the nearest of what fitted".
+                    const uint32_t seen = g_cen_seen.load(std::memory_order_relaxed);
+                    const uint32_t rej  = g_cen_rejected.load(std::memory_order_relaxed);
+                    LOG_INFO("wcen: %d/%u slots used%s | in-radius %u, rejected "
+                             "%u (radius %.2fm) | groot %.2f %.2f %.2f",
+                             live, kCenSlots,
+                             live > (int)(kCenSlots * 9 / 10)
+                                 ? "  *** SATURATED, ranking is NOT trustworthy ***"
+                                 : "",
+                             seen, rej,
+                             g_cen_radius.load(std::memory_order_relaxed),
+                             groot[0], groot[1], groot[2]);
+                    for (int i = 0; i < ntop; ++i)
+                        LOG_INFO("wcen:   node=0x%012llX  dmin=%.4fm  hits=%u%s",
+                                 (unsigned long long)top[i].n, top[i].d,
+                                 top[i].h,
+                                 top[i].n == g_wnode_target.load(
+                                     std::memory_order_relaxed)
+                                     ? "   <<< build 68's target" : "");
+
+                    // BUILD 72: pick the anchor. It must be the part nearest
+                    // the gun root that is STILL BEING PLACED: the node that
+                    // sits exactly on the bone stops after its 333 attach-time
+                    // calls, and anchoring to a node the engine has finished
+                    // with would freeze the pivot at wherever the player was
+                    // standing when he drew. "Still being placed" is measured
+                    // against the previous tick, not assumed.
+                    // BUILD 73: the rate threshold. Build 72 accepted any node
+                    // whose hit count moved at all, so the attach-time node at
+                    // 0.0006 m kept winning on distance with 23 and then 54
+                    // placements, and the pivot it gave was a point the engine
+                    // had finished updating. A real weapon part is placed twice
+                    // a frame, about 144 times a second. Demanding a third of
+                    // that separates a part the gun is made of from an artefact
+                    // of drawing it, and does so by measurement.
+                    constexpr uint32_t kAnchorMinRate = 48;
+                    uint64_t anchor = 0;
+                    float    anchor_d = 1e9f;
+                    uint32_t anchor_rate = 0;
+                    uint32_t best_rate_seen = 0;
+                    // BUILD 75: hold the incumbent. Build 74 re-elected purely
+                    // on distance every tick and alternated between two nodes
+                    // 6 cm apart, and every alternation moves the pivot the
+                    // whole cluster rotates about. An anchor that still
+                    // qualifies keeps the job; only one that stops qualifying
+                    // is replaced. The pivot's job is to be the same point from
+                    // one frame to the next, not the best point.
+                    const uint64_t incumbent =
+                        g_wanchor.load(std::memory_order_relaxed);
+                    uint64_t inc_seen = 0;
+                    float    inc_d = 1e9f;
+                    uint32_t inc_rate = 0;
+                    for (uint32_t i = 0; i < kCenSlots; ++i) {
+                        const uint64_t n =
+                            g_cen[i].node.load(std::memory_order_relaxed);
+                        if (!n) continue;
+                        const uint32_t h =
+                            g_cen[i].hits.load(std::memory_order_relaxed);
+                        const uint32_t rate = h - g_cen[i].prev;
+                        g_cen[i].prev = h;
+                        if (rate > best_rate_seen) best_rate_seen = rate;
+                        if (n == incumbent) {
+                            inc_seen = n; inc_d = g_cen[i].dmin; inc_rate = rate;
+                        }
+                        if (rate < kAnchorMinRate) continue;
+                        if (g_cen[i].dmin < anchor_d) {
+                            anchor_d    = g_cen[i].dmin;
+                            anchor      = n;
+                            anchor_rate = rate;
+                        }
+                    }
+                    if (inc_seen && inc_rate >= kAnchorMinRate && inc_d <= 0.40f) {
+                        anchor = inc_seen; anchor_d = inc_d; anchor_rate = inc_rate;
+                    }
+                    if (anchor && anchor_d <= 0.40f) {
+                        if (g_wanchor.exchange(anchor, std::memory_order_relaxed)
+                                != anchor) {
+                            // A new anchor's pivot is NOT usable until the hook
+                            // has actually seen it placed. Otherwise the first
+                            // frames after a switch rotate the cluster about
+                            // the previous anchor's position.
+                            g_wanchor_ok.store(0, std::memory_order_relaxed);
+                            LOG_INFO("wanchor: 0x%012llX at %.4fm from the gun "
+                                     "root, %u placements/s. Parts within %.2fm "
+                                     "of it rotate with the gun.",
+                                     (unsigned long long)anchor, anchor_d,
+                                     anchor_rate,
+                                     g_wnode_radius.load(
+                                         std::memory_order_relaxed));
+                        }
+                    } else {
+                        if (g_wanchor.exchange(0, std::memory_order_relaxed))
+                            LOG_INFO("wanchor: LOST. Nothing within 0.40m of the "
+                                     "gun root is being placed at least %u times "
+                                     "a second (fastest seen %u/s). Mode 3 "
+                                     "writes nothing until it is back.",
+                                     kAnchorMinRate, best_rate_seen);
+                        g_wanchor_ok.store(0, std::memory_order_relaxed);
+                    }
+
+                    // BUILD 74: latch the barrel axis once the scores separate.
+                    // Requires both a decent sample count and a clear margin,
+                    // so a coincidence during a few seconds of standing still
+                    // cannot latch the wrong axis permanently.
+                    if (g_axis_idx.load(std::memory_order_relaxed) < 0) {
+                        const uint32_t ns =
+                            g_axis_samples.load(std::memory_order_relaxed);
+                        int   win = 0;
+                        float w1 = -1e30f, w2 = -1e30f;
+                        for (int i = 0; i < 6; ++i) {
+                            const float s = g_axis_score[i];
+                            if (s > w1) { w2 = w1; w1 = s; win = i; }
+                            else if (s > w2) { w2 = s; }
+                        }
+                        if (ns >= 200 && w1 > 0.0f && w1 > w2 * 1.30f) {
+                            g_axis_idx.store(win, std::memory_order_relaxed);
+                            static const char* kName[6] =
+                                {"+row0", "+row1", "+row2",
+                                 "-row0", "-row1", "-row2"};
+                            LOG_INFO("waxis: the barrel is %s of the weapon "
+                                     "part basis (score %.1f vs %.1f over %u "
+                                     "samples). Hip fire now rotates from the "
+                                     "GUN's forward, not the camera's.",
+                                     kName[win], w1, w2, ns);
+                        } else if (ns >= 600) {
+                            LOG_INFO("waxis: undecided after %u samples "
+                                     "(best %.1f vs %.1f). Still using the "
+                                     "camera forward, which is right in ADS "
+                                     "and wrong in hip fire.", ns, w1, w2);
+                            g_axis_samples.store(0, std::memory_order_relaxed);
+                            for (int i = 0; i < 6; ++i) g_axis_score[i] = 0.0f;
+                        }
+                    }
+
+                    // One line that says WHY nothing happened, if nothing did.
+                    LOG_INFO("wgate: subs=%llu | noanchor=%llu stale=%llu "
+                             "outside=%llu noview=%llu noray=%llu",
+                             (unsigned long long)g_wnode_hits,
+                             (unsigned long long)g_gate_noanchor,
+                             (unsigned long long)g_gate_stale,
+                             (unsigned long long)g_gate_outside,
+                             (unsigned long long)g_gate_noview,
+                             (unsigned long long)g_gate_noray);
+                }
+
+                LOG_INFO("wnode: mode=%d target=0x%012llX calls=%llu subs=%llu",
+                         g_wnode_mode.load(std::memory_order_relaxed),
+                         (unsigned long long)g_wnode_target.load(
+                             std::memory_order_relaxed),
+                         (unsigned long long)grwxr_wnode_calls,
+                         (unsigned long long)g_wnode_hits);
+            }
+
+            // Build 66, READ-ONLY half (2026-08-09). The user's goal is the
+            // GAME'S OWN weapon riding the controller, so the question is
+            // which field actually carries the rendered gun. Build 65 already
+            // proved the instance origin (+0x120/+0x250) is bookkeeping: 1680
+            // identity-checked writes moved nothing. The next consumer down,
+            // read off read_bone_world's own verified layout, is the pose
+            // ROOT: one rigid transform that carries the whole bone buffer to
+            // world, which is the "last consumer" shape.
+            //
+            // This logs it and nothing else. The GO/NO-GO for the write build
+            // is flags bit 26: if it is SET the bone buffer is already in
+            // world space and the root is NOT the carrier, so a write there
+            // would be pointless and the plan says stop. Printing rootT
+            // beside the instance origin also shows at a glance whether the
+            // two agree, which tells us if they are even the same object's
+            // idea of where the gun is.
+            uint64_t wpose = 0;
+            if (read_block(best + 0x238, &wpose, sizeof(wpose)) &&
+                wpose >= 0x10000 && !(wpose & 7)) {
+                float    rt[4] = {}, rq[4] = {};
+                uint32_t wflags = 0;
+                uint64_t wbuf = 0;
+                const bool okt = read_block(wpose + 0x00, rt, sizeof(rt));
+                const bool okq = read_block(wpose + 0x10, rq, sizeof(rq));
+                read_block(wpose + 0x8C, &wflags, sizeof(wflags));
+                read_block(wpose + 0x178, &wbuf, sizeof(wbuf));
+                const float qn = sqrtf(rq[0] * rq[0] + rq[1] * rq[1] +
+                                       rq[2] * rq[2] + rq[3] * rq[3]);
+                LOG_INFO("wpose: pose=0x%012llX buf=0x%012llX flags=0x%08X "
+                         "bit26=%s%s | rootT=(%.2f %.2f %.2f) "
+                         "rootQ=(%.3f %.3f %.3f %.3f) |q|=%.3f | inst=(%.2f "
+                         "%.2f %.2f) d(rootT,inst)=%.2fm",
+                         (unsigned long long)wpose, (unsigned long long)wbuf,
+                         wflags, (wflags & 0x04000000u) ? "SET" : "clear",
+                         (wflags & 0x04000000u)
+                             ? "  <<< STOP: buffer is WORLD space, the root is "
+                               "NOT the carrier"
+                             : "  (model space: the root IS the carrier, write "
+                               "test is GO)",
+                         okt ? rt[0] : 0.0f, okt ? rt[1] : 0.0f,
+                         okt ? rt[2] : 0.0f,
+                         okq ? rq[0] : 0.0f, okq ? rq[1] : 0.0f,
+                         okq ? rq[2] : 0.0f, okq ? rq[3] : 0.0f, qn,
+                         best_o[0], best_o[1], best_o[2],
+                         okt ? sqrtf((rt[0] - best_o[0]) * (rt[0] - best_o[0]) +
+                                     (rt[1] - best_o[1]) * (rt[1] - best_o[1]) +
+                                     (rt[2] - best_o[2]) * (rt[2] - best_o[2]))
+                             : -1.0f);
+            } else {
+                LOG_INFO("wpose: no pose at [pick+0x238] (read 0x%012llX). The "
+                         "weapon rig does not carry a final pose here; the "
+                         "root-write route does not apply to it.",
+                         (unsigned long long)wpose);
+            }
         } else {
             g_wskel_cand.store(0, std::memory_order_relaxed);
-            LOG_INFO("wskel: no pick (cands=%d best=%.2fm hand=%s)",
-                     cands, best ? best_d : -1.0f, hand_ok ? "ok" : "ABSENT");
+            // BUILD 69: losing the pick must also drop the substitution target.
+            // Without this the engine thread keeps writing a node we no longer
+            // believe in, at 144 a second, which is exactly the stale-handle
+            // bug FRIK and UEVR both report at this point.
+            g_wnode_target.store(0, std::memory_order_relaxed);
+            LOG_INFO("wskel: no pick (cands=%d best=%.2fm ref=%s), wnode target "
+                     "cleared",
+                     cands, best ? best_d : -1.0f,
+                     groot_ok ? "groot" : hand_ok ? "hand" : "cam");
         }
 
         // Build 65: publish or clear the write target. Rig first, target
@@ -1639,8 +2598,11 @@ void snap_drain() {
             if (best && best_d < 0.4f && hand_ok && w < kWskelWriteCap) {
                 g_wskel_tgt_rig.store(best_rig, std::memory_order_relaxed);
                 g_wskel_tgt.store(best, std::memory_order_relaxed);
-                LOG_INFO("wskelw: ARMED on 0x%012llX writes=%llu",
-                         (unsigned long long)best, (unsigned long long)w);
+                LOG_INFO("wskelw: ARMED on 0x%012llX writes=%llu target=%s",
+                         (unsigned long long)best, (unsigned long long)w,
+                         g_wskel_mode.load(std::memory_order_relaxed) >= 2
+                             ? "POSE ROOT [[pick+0x238]+0x08]"
+                             : "instance origin +0x120/+0x250");
             } else {
                 g_wskel_tgt.store(0, std::memory_order_relaxed);
                 LOG_INFO("wskelw: not armed (%s, writes=%llu)",
@@ -1811,6 +2773,187 @@ void snap_drain() {
                                      "R=(%.2f %.2f %.2f) H=(%.2f %.2f %.2f)",
                                      L[0], L[1], L[2], R[0], R[1], R[2],
                                      H[0], H[1], H[2]);
+                        }
+
+                        // 2026-08-09: THE WEAPON MOUNT CENSUS. Two independent
+                        // static passes cracked Skeleton::BipedBoneID out of
+                        // the Anvil reflection tables (docs/RE-notes.md), and
+                        // it turns out the character rig carries bones whose
+                        // only purpose is holding a gun. Resolve them by their
+                        // own CRC32 name hashes and measure each against the
+                        // weapon instance the wskel census already picked.
+                        //
+                        // A sub-centimetre match NAMES the mount point and
+                        // upgrades "the weapon is parented to the hand" from
+                        // strongly inferred to verified. A miss on all of them
+                        // kills the theory in one line, which is worth just as
+                        // much. Read-only: rig_find_node is a binary search
+                        // over a sorted map, read_bone_world only touches
+                        // range-checked memory.
+                        //
+                        // The pair FAKE_GUNROOT and FAKE_GUNROOT_GAMEPLAY is
+                        // the engine telling us outright that it keeps a
+                        // VISUAL gun root and an AUTHORITATIVE one, which is
+                        // skeleton rule 3 in the engine's own vocabulary.
+                        // Expect to write both.
+                        const uint64_t wpn =
+                            g_wskel_cand.load(std::memory_order_relaxed);
+                        if (wpn) {
+                            float wo[3] = {};
+                            if (read_block(wpn + 0x120, wo, sizeof(wo)) &&
+                                isfinite(wo[0]) && isfinite(wo[1]) &&
+                                isfinite(wo[2])) {
+                                struct Mount { uint32_t hash; const char* name; };
+                                static const Mount kMounts[] = {
+                                    {0x826846F3u, "Fake_gunroot"},
+                                    {0x08B4DDD5u, "FakeGunRoot_Gameplay"},
+                                    {0x53135E44u, "Prop_RightHand"},
+                                    {0x85562B5Cu, "Prop_LeftHand"},
+                                    {0x3FB256E5u, "RightHand_Weapon_Ref"},
+                                    {0xA9611103u, "LeftHand_Weapon_Ref"},
+                                };
+                                for (const Mount& m : kMounts) {
+                                    const int n = rig_find_node(rg, m.hash);
+                                    if (n < 0) {
+                                        LOG_INFO("mount: %-22s NOT ON THIS RIG",
+                                                 m.name);
+                                        continue;
+                                    }
+                                    float p[3] = {};
+                                    if (!read_bone_world(bestp,
+                                                         (unsigned int)n, p)) {
+                                        LOG_INFO("mount: %-22s node=%d "
+                                                 "UNREADABLE", m.name, n);
+                                        continue;
+                                    }
+                                    const float d = dist(p, wo);
+                                    LOG_INFO("mount: %-22s node=%-4d "
+                                             "pos=(%.2f %.2f %.2f) "
+                                             "d(weapon)=%.3fm%s",
+                                             m.name, n, p[0], p[1], p[2], d,
+                                             d < 0.05f
+                                                 ? "   <<< THIS IS THE MOUNT"
+                                                 : "");
+                                }
+
+                                // BUILD 79: which axis of the gun-root bone is
+                                // the barrel. While the player aims, the gun
+                                // points where the GAME aims, so the bone axis
+                                // whose world direction tracks view_fwd is the
+                                // barrel. Signed dots cover all six candidates
+                                // at once: the largest magnitude names the
+                                // axis and its sign names the direction.
+                                //
+                                // Every gate reports itself (the rule this
+                                // project wrote after one counter behind five
+                                // early returns cost three headset runs).
+                                if (g_wbaxis.load(std::memory_order_relaxed)) {
+                                    const int n10 =
+                                        rig_find_node(rg, kGunRootGameplay);
+                                    float wx[3], wy[3], wz[3], vf[3];
+                                    const bool okn = n10 >= 0;
+                                    const bool oka =
+                                        okn && read_bone_world_axes(
+                                                   bestp, (unsigned int)n10,
+                                                   wx, wy, wz);
+                                    const bool okv = aimtrace::view_fwd(vf);
+                                    float vn = 0.0f;
+                                    if (okv)
+                                        vn = sqrtf(vf[0] * vf[0] +
+                                                   vf[1] * vf[1] +
+                                                   vf[2] * vf[2]);
+                                    if (oka && okv && vn > 1e-6f) {
+                                        vf[0] /= vn; vf[1] /= vn; vf[2] /= vn;
+                                        auto dot = [&](const float* a) {
+                                            return a[0] * vf[0] +
+                                                   a[1] * vf[1] +
+                                                   a[2] * vf[2];
+                                        };
+                                        const float dx = dot(wx);
+                                        const float dy = dot(wy);
+                                        const float dz = dot(wz);
+                                        static double sx = 0, sy = 0, sz = 0;
+                                        static int ns = 0;
+                                        sx += dx; sy += dy; sz += dz; ++ns;
+                                        float cr[3], cd = 0.0f;
+                                        const bool okc = aimtrace::ctrl_ray(cr);
+                                        if (okc) {
+                                            const float cn = sqrtf(
+                                                cr[0] * cr[0] + cr[1] * cr[1] +
+                                                cr[2] * cr[2]);
+                                            if (cn > 1e-6f)
+                                                cd = (cr[0] * vf[0] +
+                                                      cr[1] * vf[1] +
+                                                      cr[2] * vf[2]) / cn;
+                                        }
+                                        LOG_INFO(
+                                            "wbax: node=%d n=%d | dot(view_fwd)"
+                                            " X=%+.3f Y=%+.3f Z=%+.3f | mean "
+                                            "X=%+.3f Y=%+.3f Z=%+.3f | "
+                                            "ctrl.view=%+.3f%s",
+                                            n10, ns, dx, dy, dz,
+                                            (float)(sx / ns), (float)(sy / ns),
+                                            (float)(sz / ns), cd,
+                                            okc ? "" : " NO-CTRL-RAY");
+                                    } else {
+                                        LOG_INFO("wbax: no sample. node10=%s "
+                                                 "axes=%s view_fwd=%s",
+                                                 okn ? "ok" : "NOT ON RIG",
+                                                 oka ? "ok" : "unreadable",
+                                                 (okv && vn > 1e-6f)
+                                                     ? "ok" : "not published");
+                                    }
+                                }
+
+                                // Build 67: arm (or disarm) the gun-root
+                                // write from this same verified tick. The
+                                // node index is resolved from the rig's own
+                                // name map rather than hardcoded, so a rig
+                                // change disarms instead of writing a wrong
+                                // bone. Skeleton pointer is published LAST:
+                                // the stub reads it first and treats zero as
+                                // disarmed, so a half-published state can
+                                // never write.
+                                if (g_wgun_hook.installed()) {
+                                    const int gn = g_wgun_on.load(
+                                        std::memory_order_relaxed)
+                                        ? rig_find_node(rg,
+                                              g_wgun_hash.load(
+                                                  std::memory_order_relaxed))
+                                        : -1;
+                                    if (gn >= 0) {
+                                        const float dz = g_wgun_dz_cfg.load(
+                                            std::memory_order_relaxed);
+                                        memcpy(&grwxr_wgun_dz, &dz,
+                                               sizeof(grwxr_wgun_dz));
+                                        grwxr_wgun_node = (uint32_t)gn;
+                                        grwxr_wgun_skel = bestp;
+                                    } else {
+                                        grwxr_wgun_skel = 0;
+                                    }
+                                    LOG_INFO("wgun: %s node=%d %s dz=%.2f "
+                                             "calls=%llu lifts=%llu rots=%llu "
+                                             "pos=%llu | skip nopose=%llu "
+                                             "nobuf=%llu norec=%llu noray=%llu "
+                                             "nopos=%llu badq=%llu",
+                                             gn >= 0 ? "ARMED" : "idle", gn,
+                                             grwxr_wgun_rot ? "ROTATE" : "lift",
+                                             g_wgun_dz_cfg.load(
+                                                 std::memory_order_relaxed),
+                                             (unsigned long long)
+                                                 grwxr_wgun_calls,
+                                             (unsigned long long)
+                                                 grwxr_wgun_writes,
+                                             (unsigned long long)grwxr_wg_rot,
+                                             (unsigned long long)grwxr_wg_pos,
+                                             (unsigned long long)grwxr_wg_nopose,
+                                             (unsigned long long)grwxr_wg_nobuf,
+                                             (unsigned long long)grwxr_wg_norec,
+                                             (unsigned long long)grwxr_wg_noray,
+                                             (unsigned long long)grwxr_wg_nopos,
+                                             (unsigned long long)grwxr_wg_badq);
+                                }
+                            }
                         }
                     }
                 }
@@ -2826,8 +3969,437 @@ void set_wskel(bool on) {
 // Build 65: a rising edge resets the write cap so the cfg toggle is the
 // re-arm; off clears the target immediately (the drain would too, one
 // second later).
-void set_wskel_write(bool on) {
+// Build 66: the value now selects the TARGET as well as arming.
+//   0 = off, 1 = instance origin (build 65, kept to reproduce its negative),
+//   2 = pose root translation.
+// Build 67: the gun-root write. mode 0 off, 1 Fake_gunroot (visual),
+// 2 FakeGunRoot_Gameplay (the engine's own authoritative twin). Disarming
+// clears the published skeleton immediately so the stub goes inert on the
+// very next call rather than one tick later.
+// Build 68: the weapon placement override. 0 off, 1 lift by dz (mechanism
+// test), 2 barrel follows the controller ray (the feature). Disarming clears
+// the target immediately so the stub goes inert on the very next call.
+void set_wnode(int mode, float dz) {
+    g_wnode_dz.store(dz, std::memory_order_relaxed);
+    g_wnode_mode.store(mode, std::memory_order_relaxed);
+    if (mode <= 0) {
+        g_wnode_target.store(0, std::memory_order_relaxed);
+        g_wanchor.store(0, std::memory_order_relaxed);
+        g_wanchor_ok.store(0, std::memory_order_relaxed);
+    }
+    // Mode 3 cannot find its anchor without the census, so it arms it rather
+    // than failing silently if the tester did not know to set both keys.
+    if (mode == 3 && !g_cen_on.load(std::memory_order_relaxed))
+        set_wnode_census(1);
+}
+
+// BUILD 75: cfg wnode_axis. -1 keeps the automatic calibration; 0..5 forces
+// which signed basis row is treated as the barrel (+row0, +row1, +row2, -row0,
+// -row1, -row2 in that order).
+//
+// The automatic version scored each candidate against the camera forward and
+// latched +row0 with a 3.2x margin, and the tester's "I have to point hard
+// right to get it in front of me" says that is the gun's RIGHT axis, not its
+// barrel. A confident wrong answer, because on a canted rifle the right axis
+// can correlate with gaze better than the barrel does. Six candidates is small
+// enough that settling it in the headset costs two minutes and is certain,
+// which beats a fourth inference from a proxy measurement.
+void set_wnode_axis(int idx) {
+    if (idx < 0) {
+        g_axis_idx.store(-1, std::memory_order_relaxed);
+        g_axis_samples.store(0, std::memory_order_relaxed);
+        for (int i = 0; i < 6; ++i) g_axis_score[i] = 0.0f;
+        LOG_INFO("waxis: automatic calibration re-armed (wnode_axis=-1).");
+        return;
+    }
+    if (idx > 5) idx = 5;
+    static const char* kName[6] =
+        {"+row0", "+row1", "+row2", "-row0", "-row1", "-row2"};
+    if (g_axis_idx.exchange(idx, std::memory_order_relaxed) != idx)
+        LOG_INFO("waxis: FORCED to %s (wnode_axis=%d). The gun's forward is "
+                 "taken as this axis of the weapon part basis.",
+                 kName[idx], idx);
+}
+
+// BUILD 76: cycle the barrel axis from a key, because settling this in the
+// headset means editing a text file, and editing a text file means taking the
+// headset off, which means the tester is judging orientation from memory rather
+// than from what is in front of him. Each press steps to the next candidate and
+// the gun re-orients immediately, so the gun itself is the readout: there is
+// nothing to read and nothing to remember. This is the same problem the tester
+// panel exists to solve generally; the key is the version of it that works
+// today.
+void cycle_wnode_axis() {
+    static const char* kName[6] =
+        {"+row0", "+row1", "+row2", "-row0", "-row1", "-row2"};
+    int cur = g_axis_idx.load(std::memory_order_relaxed);
+    cur = (cur < 0) ? 0 : (cur + 1) % 6;
+    g_axis_idx.store(cur, std::memory_order_relaxed);
+    LOG_INFO("waxis: NUMPAD 4 -> %s (index %d of 0..5). The gun's forward is "
+             "now this axis of the weapon part basis.", kName[cur], cur);
+}
+
+void set_wnode_radius(float r) {
+    if (r < 0.05f) r = 0.05f;
+    if (r > 1.00f) r = 1.00f;
+    g_wnode_radius.store(r, std::memory_order_relaxed);
+}
+
+// Build 70. Arming clears the table, so a census always describes the run you
+// are actually watching and never carries samples from a previous weapon.
+void set_wnode_census(int on) {
+    const int want = on ? 1 : 0;
+    if (g_cen_on.exchange(want, std::memory_order_relaxed) == want) return;
+    if (want) {
+        for (uint32_t i = 0; i < kCenSlots; ++i) {
+            g_cen[i].node.store(0, std::memory_order_relaxed);
+            g_cen[i].hits.store(0, std::memory_order_relaxed);
+            g_cen[i].dmin = 1e9f;
+        }
+        g_cen_seen.store(0, std::memory_order_relaxed);
+        g_cen_rejected.store(0, std::memory_order_relaxed);
+        g_cen_ref_ok.store(0, std::memory_order_relaxed);   // wait for a real groot
+        LOG_INFO("wcen: SetWorldTransform census ARMED. It only observes, so it "
+                 "is safe with wnode=0, which is how it should be run: no "
+                 "substitution, no visual mess, just the ranking.");
+    } else {
+        LOG_INFO("wcen: census off.");
+    }
+}
+
+void set_wgun(int mode, float dz) {
+    g_wgun_dz_cfg.store(dz, std::memory_order_relaxed);
+    g_wgun_hash.store(mode >= 2 ? kGunRootGameplay : kFakeGunRootHash,
+                      std::memory_order_relaxed);
+    grwxr_wgun_rot = (mode >= 3) ? 1u : 0u;
+    const bool on = mode > 0;
+    g_wgun_on.store(on, std::memory_order_relaxed);
+    // Always disarm on a mode change. The bone INDEX the stub uses is only
+    // resolved inside the census tick, so between here and the next tick an
+    // armed stub would keep acting on the previous mode's bone. Mode 1 is node
+    // 8 and modes 2 and 3 are node 10, so that is a real difference, and a
+    // stale node would show the tester the wrong mode's result under the new
+    // mode's name. Costs up to 5 s of inactivity; buys an unambiguous reading.
+    grwxr_wgun_skel = 0;
+    g_wgun_gen.fetch_add(1, std::memory_order_relaxed);   // restart the filter
+}
+
+void set_wgun_pos(int on, float scale, float clamp_m, float smooth) {
+    if (scale < 0.10f) scale = 0.10f;
+    if (scale > 3.00f) scale = 3.00f;
+    if (clamp_m < 0.05f) clamp_m = 0.05f;
+    if (clamp_m > 3.00f) clamp_m = 3.00f;
+    if (smooth < 0.01f) smooth = 0.01f;
+    if (smooth > 1.00f) smooth = 1.00f;
+    g_wgun_pos_scale.store(scale, std::memory_order_relaxed);
+    g_wgun_pos_clamp.store(clamp_m, std::memory_order_relaxed);
+    g_wgun_pos_smooth.store(smooth, std::memory_order_relaxed);
+    const int want = on ? 1 : 0;
+    if (g_wgun_pos.exchange(want, std::memory_order_relaxed) == want) return;
+    g_wgun_gen.fetch_add(1, std::memory_order_relaxed);
+    LOG_INFO("wgun: position %s (scale %.2f, clamp %.2f m, smooth %.2f). The "
+             "gun-root is placed ON the controller, never further than the "
+             "clamp from where the engine put it.",
+             want ? "ON" : "off", scale, clamp_m, smooth);
+}
+
+void set_wgun_filter(float smooth, float maxstep_deg) {
+    if (smooth < 0.01f) smooth = 0.01f;
+    if (smooth > 1.00f) smooth = 1.00f;
+    if (maxstep_deg < 0.10f) maxstep_deg = 0.10f;
+    if (maxstep_deg > 90.0f) maxstep_deg = 90.0f;
+    g_wgun_smooth.store(smooth, std::memory_order_relaxed);
+    g_wgun_maxstep.store(maxstep_deg, std::memory_order_relaxed);
+}
+
+// BUILD 78: cycle the gun-root bone from a key, same rationale as build 76's
+// NUMPAD 4. The two candidate bones are coincident to 2 mm, so telling them
+// apart means A/B-ing them, and A/B-ing them by editing a text file means
+// taking the headset off between the two halves of the comparison.
+//
+// The immediate disarm matters. grwxr_wgun_node is only resolved inside the
+// 5 Hz census tick, from the rig's own name map, so between the press and the
+// next tick the stub would otherwise keep offsetting the PREVIOUS bone. That
+// would show the tester the old mode's result and label it as the new one,
+// which is exactly the class of measurement lie this project has already paid
+// for three times. Zeroing the skeleton pointer makes the gun snap back to
+// normal first, so the transition is visible and unambiguous.
+void cycle_wgun() {
+    static const char* kName[4] = {
+        "off",
+        "LIFT node 8, Fake_gunroot (the FALLBACK bone: verified to do nothing)",
+        "LIFT node 10, FakeGunRoot_Gameplay (verified: raises the gun 60 cm)",
+        "ROTATE node 10: the barrel is set ON the controller ray, absolutely"};
+    int cur = 0;
+    if (g_wgun_on.load(std::memory_order_relaxed)) {
+        cur = (g_wgun_hash.load(std::memory_order_relaxed) == kGunRootGameplay)
+                  ? 2 : 1;
+        if (grwxr_wgun_rot) cur = 3;
+    }
+    const int next = (cur + 1) % 4;
+    grwxr_wgun_skel = 0;              // disarm BEFORE the mode changes
+    set_wgun(next, g_wgun_dz_cfg.load(std::memory_order_relaxed));
+    LOG_INFO("wgun: NUMPAD 5 -> mode %d, %s. Disarmed now; re-arms on the next "
+             "census tick (up to 5 s), so expect the gun to return to normal "
+             "briefly before the new bone takes effect.",
+             next, kName[next]);
+}
+
+// BUILD 80: THE BARREL RIDES THE CONTROLLER.
+//
+// Runs on the engine's own thread at PublishAttachments entry, gated on the
+// player skeleton by the asm stub, so it is the last writer before the engine
+// composes the weapon from this bone. No allocation, no lock, no logging:
+// rule 8 holds. Counters only, drained at 1 Hz elsewhere.
+//
+// ABSOLUTE, not a delta from the game's aim. Mode 3 of the old wnode path
+// rotated from "where the game is aiming" onto "where the controller points",
+// and that is exactly the incremental shape both Halo MCC VR and the Cyberpunk
+// port had to abandon after it ratcheted. Here the barrel is SET to the ray, so
+// hip fire and ADS become the same operation and there is nothing to creep.
+//
+// The axis is `[VERIFIED, headset, build 79]`: +Y of the FakeGunRoot_Gameplay
+// bone frame is the barrel, 0.999 against the game's aim direction across 14
+// consecutive held-ADS samples.
+//
+// Skeleton rule 5: the controller direction is filtered and rate-limited
+// before it reaches the game. The filter is on the TARGET DIRECTION rather
+// than on the output quaternion, which avoids quaternion sign handling
+// entirely and is what the Cyberpunk port settled on after its own attempts.
+extern "C" void grwxr_wgun_apply(void* skelp) {
+    const uint64_t skel = (uint64_t)skelp;
+
+    auto bump = [](volatile uint64_t* c) {
+        _InterlockedIncrement64((volatile long long*)c);
+    };
+
+    uint64_t pose = 0, buf = 0;
+    if (!read_block(skel + 0x238, &pose, sizeof(pose)) ||
+        pose < 0x10000 || (pose & 7)) { bump(&grwxr_wg_nopose); return; }
+    if (!read_block(pose + 0x178, &buf, sizeof(buf)) ||
+        buf < 0x10000 || (buf & 7)) { bump(&grwxr_wg_nobuf); return; }
+
+    const uint64_t rec = buf + (uint64_t)grwxr_wgun_node * 0x20;
+    float bq[4], rq[4];
+    if (!read_block(rec + 0x10, bq, sizeof(bq)) ||
+        !read_block(pose + 0x10, rq, sizeof(rq))) {
+        bump(&grwxr_wg_norec); return;
+    }
+    for (int i = 0; i < 4; ++i)
+        if (!isfinite(bq[i]) || !isfinite(rq[i])) { bump(&grwxr_wg_badq); return; }
+
+    float ray[3];
+    if (!aimtrace::ctrl_ray(ray)) { bump(&grwxr_wg_noray); return; }
+    const float rl = sqrtf(ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]);
+    if (!(rl > 1e-6f)) { bump(&grwxr_wg_noray); return; }
+    ray[0] /= rl; ray[1] /= rl; ray[2] /= rl;
+
+    // The root quaternion carries a uniform scale in w (offline note), so it is
+    // normalised before use exactly as read_bone_world does.
+    const float rn = sqrtf(rq[0] * rq[0] + rq[1] * rq[1] +
+                           rq[2] * rq[2] + rq[3] * rq[3]);
+    if (!(rn > 1e-6f)) { bump(&grwxr_wg_badq); return; }
+    const float rx = rq[0] / rn, ry = rq[1] / rn,
+                rz = rq[2] / rn, rw = rq[3] / rn;
+
+    auto qmul = [](const float a[4], const float b[4], float o[4]) {
+        o[3] = a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2];
+        o[0] = a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1];
+        o[1] = a[3]*b[1] - a[0]*b[2] + a[1]*b[3] + a[2]*b[0];
+        o[2] = a[3]*b[2] + a[0]*b[1] - a[1]*b[0] + a[2]*b[3];
+    };
+    auto qrot = [](const float q[4], const float v[3], float o[3]) {
+        const float cx = q[1]*v[2] - q[2]*v[1];
+        const float cy = q[2]*v[0] - q[0]*v[2];
+        const float cz = q[0]*v[1] - q[1]*v[0];
+        o[0] = v[0] + 2.0f*(q[3]*cx + q[1]*cz - q[2]*cy);
+        o[1] = v[1] + 2.0f*(q[3]*cy + q[2]*cx - q[0]*cz);
+        o[2] = v[2] + 2.0f*(q[3]*cz + q[0]*cy - q[1]*cx);
+    };
+
+    const float root[4] = {rx, ry, rz, rw};
+    float worldQ[4];
+    qmul(root, bq, worldQ);
+    const float wn = sqrtf(worldQ[0]*worldQ[0] + worldQ[1]*worldQ[1] +
+                           worldQ[2]*worldQ[2] + worldQ[3]*worldQ[3]);
+    if (!(wn > 1e-6f)) { bump(&grwxr_wg_badq); return; }
+    for (int i = 0; i < 4; ++i) worldQ[i] /= wn;
+
+    // FILTER. One-pole toward the ray, with a hard per-call angular cap. At
+    // ~144 calls per second a 5 degree cap is 720 deg/s, far faster than a
+    // hand moves and slow enough that a tracking dropout cannot snap the gun
+    // across the world in one frame.
+    static float s_dir[3] = {0, 0, 0};
+    static uint32_t s_gen = 0xFFFFFFFFu;
+    const uint32_t gen = g_wgun_gen.load(std::memory_order_relaxed);
+    if (gen != s_gen) {                       // fresh arm: start ON the ray
+        s_gen = gen;
+        s_dir[0] = ray[0]; s_dir[1] = ray[1]; s_dir[2] = ray[2];
+    } else {
+        float d = s_dir[0]*ray[0] + s_dir[1]*ray[1] + s_dir[2]*ray[2];
+        if (d > 1.0f) d = 1.0f;
+        if (d < -1.0f) d = -1.0f;
+        const float ang = acosf(d);
+        if (ang > 1e-5f) {
+            const float alpha = g_wgun_smooth.load(std::memory_order_relaxed);
+            const float cap =
+                g_wgun_maxstep.load(std::memory_order_relaxed) * 0.01745329f;
+            float step = alpha * ang;
+            if (step > cap) step = cap;
+            const float t = step / ang;
+            s_dir[0] += t * (ray[0] - s_dir[0]);
+            s_dir[1] += t * (ray[1] - s_dir[1]);
+            s_dir[2] += t * (ray[2] - s_dir[2]);
+            const float sn = sqrtf(s_dir[0]*s_dir[0] + s_dir[1]*s_dir[1] +
+                                   s_dir[2]*s_dir[2]);
+            if (!(sn > 1e-6f)) { bump(&grwxr_wg_badq); return; }
+            s_dir[0] /= sn; s_dir[1] /= sn; s_dir[2] /= sn;
+        }
+    }
+
+    // Where the barrel points right now: the bone's +Y in world space.
+    const float ey[3] = {0, 1, 0};
+    float fwd[3];
+    qrot(worldQ, ey, fwd);
+    const float fn = sqrtf(fwd[0]*fwd[0] + fwd[1]*fwd[1] + fwd[2]*fwd[2]);
+    if (!(fn > 1e-6f)) { bump(&grwxr_wg_badq); return; }
+    fwd[0] /= fn; fwd[1] /= fn; fwd[2] /= fn;
+
+    // Shortest arc taking fwd onto the filtered target: q = (fwd x tgt, 1+dot),
+    // normalised. The only degenerate case is an exact 180 degrees, where the
+    // axis is undefined; we skip rather than pick an arbitrary one, because a
+    // wrong axis there would roll the gun unpredictably and it resolves itself
+    // on the next call as the filter moves the target off the antipode.
+    const float c = fwd[0]*s_dir[0] + fwd[1]*s_dir[1] + fwd[2]*s_dir[2];
+    if (c < -0.9999f) { bump(&grwxr_wg_badq); return; }
+    float sw[4] = {fwd[1]*s_dir[2] - fwd[2]*s_dir[1],
+                   fwd[2]*s_dir[0] - fwd[0]*s_dir[2],
+                   fwd[0]*s_dir[1] - fwd[1]*s_dir[0],
+                   1.0f + c};
+    const float swn = sqrtf(sw[0]*sw[0] + sw[1]*sw[1] + sw[2]*sw[2] + sw[3]*sw[3]);
+    if (!(swn > 1e-6f)) { bump(&grwxr_wg_badq); return; }
+    for (int i = 0; i < 4; ++i) sw[i] /= swn;
+
+    float desired[4];
+    qmul(sw, worldQ, desired);               // swing applied in WORLD space
+
+    // Back to model space: modelQ = conj(rootQ) * desiredWorldQ.
+    const float conj[4] = {-rx, -ry, -rz, rw};
+    float modelQ[4];
+    qmul(conj, desired, modelQ);
+    const float mn = sqrtf(modelQ[0]*modelQ[0] + modelQ[1]*modelQ[1] +
+                           modelQ[2]*modelQ[2] + modelQ[3]*modelQ[3]);
+    if (!(mn > 1e-6f)) { bump(&grwxr_wg_badq); return; }
+    for (int i = 0; i < 4; ++i) modelQ[i] /= mn;
+    for (int i = 0; i < 4; ++i)
+        if (!isfinite(modelQ[i])) { bump(&grwxr_wg_badq); return; }
+
+    __try {
+        float* q = (float*)(rec + 0x10);
+        q[0] = modelQ[0]; q[1] = modelQ[1];
+        q[2] = modelQ[2]; q[3] = modelQ[3];
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        bump(&grwxr_wg_badq);
+        return;
+    }
+    bump(&grwxr_wg_rot);
+
+    // BUILD 81: POSITION. Rotation alone pivots the gun where the animation
+    // put it, so you can point it but not raise it to your eye. This puts the
+    // gun-root ON the controller.
+    //
+    // Off by default and separate from the mode, so rotation-only and
+    // rotation-plus-position are one cfg line apart and a regression in this
+    // half cannot cost the half that is already verified.
+    if (!g_wgun_pos.load(std::memory_order_relaxed)) return;
+
+    float cp[3];
+    if (!aimtrace::ctrl_pos(cp)) { bump(&grwxr_wg_nopos); return; }
+    for (int i = 0; i < 3; ++i)
+        if (!isfinite(cp[i])) { bump(&grwxr_wg_nopos); return; }
+
+    float bt[4], rt[4];
+    if (!read_block(rec + 0x00, bt, sizeof(bt)) ||
+        !read_block(pose + 0x00, rt, sizeof(rt))) {
+        bump(&grwxr_wg_norec); return;
+    }
+    for (int i = 0; i < 3; ++i)
+        if (!isfinite(bt[i]) || !isfinite(rt[i])) { bump(&grwxr_wg_badq); return; }
+
+    // The engine's own placement this frame, in world space, is the anchor the
+    // clamp is measured from: world = rootQ * boneT + rootT.
+    float engw[3];
+    qrot(root, bt, engw);
+    engw[0] += rt[0]; engw[1] += rt[1]; engw[2] += rt[2];
+
+    // Scale hand travel about the engine's own gun position rather than about
+    // the world origin, so a scale other than 1.0 changes how far the gun
+    // moves per centimetre of hand and nothing else.
+    const float sc = g_wgun_pos_scale.load(std::memory_order_relaxed);
+    float want[3] = {engw[0] + (cp[0] - engw[0]) * sc,
+                     engw[1] + (cp[1] - engw[1]) * sc,
+                     engw[2] + (cp[2] - engw[2]) * sc};
+
+    // HARD CLAMP, skeleton rule 5. However wrong the controller pose is, the
+    // gun stays inside this radius of where the engine put it. A tracking
+    // dropout or a bad recenter then misplaces the gun by at most this much
+    // instead of throwing it across the map, which is the difference between
+    // "that looks off" and "the session is over".
+    const float lim = g_wgun_pos_clamp.load(std::memory_order_relaxed);
+    float dv[3] = {want[0] - engw[0], want[1] - engw[1], want[2] - engw[2]};
+    const float dl = sqrtf(dv[0]*dv[0] + dv[1]*dv[1] + dv[2]*dv[2]);
+    if (dl > lim && dl > 1e-6f) {
+        const float k = lim / dl;
+        want[0] = engw[0] + dv[0] * k;
+        want[1] = engw[1] + dv[1] * k;
+        want[2] = engw[2] + dv[2] * k;
+    }
+
+    // One-pole in WORLD space, reset on the same generation counter the
+    // rotation filter uses so arming never slews out of a stale position.
+    static float s_pos[3] = {0, 0, 0};
+    static uint32_t s_pgen = 0xFFFFFFFFu;
+    if (gen != s_pgen) {
+        s_pgen = gen;
+        s_pos[0] = want[0]; s_pos[1] = want[1]; s_pos[2] = want[2];
+    } else {
+        const float pa = g_wgun_pos_smooth.load(std::memory_order_relaxed);
+        s_pos[0] += pa * (want[0] - s_pos[0]);
+        s_pos[1] += pa * (want[1] - s_pos[1]);
+        s_pos[2] += pa * (want[2] - s_pos[2]);
+    }
+
+    // Back to model space: modelT = conj(rootQ) * (world - rootT).
+    const float rel[3] = {s_pos[0] - rt[0], s_pos[1] - rt[1], s_pos[2] - rt[2]};
+    float modelT[3];
+    qrot(conj, rel, modelT);
+    for (int i = 0; i < 3; ++i)
+        if (!isfinite(modelT[i])) { bump(&grwxr_wg_badq); return; }
+
+    __try {
+        float* t = (float*)(rec + 0x00);
+        t[0] = modelT[0]; t[1] = modelT[1]; t[2] = modelT[2];
+        // t[3] is the record's w lane: left exactly as the engine wrote it.
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        bump(&grwxr_wg_badq);
+        return;
+    }
+    bump(&grwxr_wg_pos);
+}
+
+void set_wbaxis(int on) {
+    const int want = on ? 1 : 0;
+    if (g_wbaxis.exchange(want, std::memory_order_relaxed) == want) return;
+    LOG_INFO("wbax: barrel-axis measurement %s. Log only, writes nothing. Aim "
+             "at something and hold it: the bone axis whose dot with the game's"
+             " aim direction stays near 1.0 (or -1.0) is the barrel.",
+             want ? "ARMED" : "off");
+}
+
+void set_wskel_write(int mode) {
+    const bool on  = mode > 0;
     const bool was = g_wskel_write_on.exchange(on, std::memory_order_relaxed);
+    g_wskel_mode.store(mode, std::memory_order_relaxed);
     if (on && !was) g_wskel_writes.store(0, std::memory_order_relaxed);
     if (!on) g_wskel_tgt.store(0, std::memory_order_relaxed);
 }

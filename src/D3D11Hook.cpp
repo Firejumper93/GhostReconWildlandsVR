@@ -31,6 +31,15 @@ State g_state;
 std::atomic<PresentCallback> g_callback{nullptr};
 std::atomic<bool> g_installed{false};
 
+// Frames in flight (see D3D11Hook.h). The request is written by the cfg reader
+// on the init thread and read on the init thread, but it is atomic so a future
+// caller on another thread cannot tear it. The other three are touched only by
+// poll_max_frame_latency, which is init-thread only, so they are plain.
+std::atomic<int> g_flat_request{0};       // cfg value, 0 = leave the engine alone
+int              g_flat_applied = -1;     // -1 = nothing decided yet
+UINT             g_flat_original = 0;     // the engine's own value, for restore
+bool             g_flat_have_original = false;
+
 // Write one pointer into a read-only vtable.
 bool patch_slot(void** vtable, int slot, void* fn, void** out_original) {
     DWORD old = 0;
@@ -253,6 +262,55 @@ void drain_capture_log() {
 }
 
 unsigned long long frame_count() { return g_state.frames; }
+
+void request_max_frame_latency(int frames) {
+    if (frames < 0)  frames = 0;
+    if (frames > 16) frames = 16;   // DXGI's own ceiling
+    g_flat_request.store(frames, std::memory_order_relaxed);
+}
+
+void poll_max_frame_latency() {
+    const int want = g_flat_request.load(std::memory_order_relaxed);
+    if (want == g_flat_applied) return;              // nothing changed
+    if (!g_state.ready || !g_state.device) return;   // no device yet, retry next tick
+
+    IDXGIDevice1* dev1 = nullptr;
+    if (FAILED(g_state.device->QueryInterface(__uuidof(IDXGIDevice1), (void**)&dev1)) || !dev1) {
+        LOG_WARN("frame latency: the game device has no IDXGIDevice1, max_frame_latency ignored");
+        g_flat_applied = want;                       // do not retry every second
+        return;
+    }
+
+    if (!g_flat_have_original) {
+        UINT orig = 0;
+        if (SUCCEEDED(dev1->GetMaximumFrameLatency(&orig))) {
+            g_flat_original     = orig;
+            g_flat_have_original = true;
+        }
+    }
+
+    if (want == 0) {
+        if (g_flat_applied < 0) {
+            // Startup with the key absent or 0. Report the engine's own value,
+            // which is free diagnostic information, and touch nothing.
+            LOG_INFO("frame latency: engine value %u, max_frame_latency=0 so it is left alone",
+                     g_flat_original);
+        } else if (g_flat_have_original) {
+            const HRESULT hr = dev1->SetMaximumFrameLatency(g_flat_original);
+            LOG_INFO("frame latency: restored to the engine's %u (hr 0x%08lX)",
+                     g_flat_original, (unsigned long)hr);
+        }
+    } else {
+        const HRESULT hr = dev1->SetMaximumFrameLatency((UINT)want);
+        UINT now = 0;
+        dev1->GetMaximumFrameLatency(&now);
+        LOG_INFO("frame latency: engine %u -> requested %d, device reads back %u (hr 0x%08lX)",
+                 g_flat_original, want, now, (unsigned long)hr);
+    }
+
+    dev1->Release();
+    g_flat_applied = want;
+}
 
 }  // namespace d3d11
 }  // namespace grwxr

@@ -123,6 +123,47 @@ struct Build {
     // only ambient traffic: the wrapper hook was blind to them.
     uintptr_t raycast2_thunk;
     uintptr_t raycast2_impl;
+
+    // XInputGetState shadow-IAT slot (XInputMerge). The game resolves XInput by
+    // hand (GetModuleHandle + GetProcAddress) into a fixed data global and calls
+    // through it, bypassing the real IAT, so this data slot is the only pointer
+    // to patch. Its RVA moves on every recompile: the 2023 value 0x03851120
+    // (identical Steam/store) became 0x038A4138 on the 2026-08 update. Pinned
+    // per build so an unknown binary installs nothing (rule 7). Re-derived via
+    // the resolver-anchor AOB, Steam positive control passing.
+    uintptr_t xinput_slot;
+
+    // Head-hide SetHidden body signature. Per build: the 2026-08 recompile
+    // re-registered the body (mov r10 vs r9 at byte 10), so the 2023 bytes
+    // get zero hits there and the install refuses (rule 7). The campaign doc
+    // (UPDATE-CAMPAIGN-2026-08.md section 1) derived both and directed
+    // "keep both signatures build-specific". The verify contract in
+    // CameraProbe is unchanged: the signature must hit uniquely AND at
+    // head_setter_impl, or head hide stays off.
+    const char* head_setter_sig;
+
+    // Skeleton::PublishAttachments. The character's skeleton update composes
+    // each attached object's world transform here, from its own pose bone
+    // buffer, and then places the object. So this is the LAST INSTANT at which
+    // the gun-root bone can be changed and still be the value the engine uses
+    // to place the weapon: writing earlier is overwritten by the animation
+    // solver, writing later is too late. 0 = not derived, and the consumer
+    // installs nothing (rule 7). Chain and evidence: docs/RE-notes.md
+    // "THE HELD-WEAPON ATTACHMENT CHAIN".
+    uintptr_t publish_thunk;
+    uintptr_t publish_impl;
+
+    // TransformNode::SetWorldTransform. THE write target for making the game's
+    // own weapon follow the controller. Signature
+    // __fastcall(TransformNode* rcx, const float4x4* rdx, bool, bool); rows
+    // +0x00/+0x10/+0x20 are the rotation basis, translation is the FOURTH ROW
+    // at +0x30. Substituting rdx here is not a race with the engine, it IS the
+    // engine's own commit, which is why every precedent (FRIK abandoning its
+    // renderer hooks, REFramework hooking named pipeline stages, UEVR's
+    // "Permanent Change") converges on being the last writer. 9 rel32 sites,
+    // so gating on rcx is MANDATORY. 0 = not derived, installs nothing.
+    uintptr_t setworld_thunk;
+    uintptr_t setworld_impl;
 };
 
 // The table for the binary this process actually loaded, detected once from

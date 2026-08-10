@@ -1,5 +1,14 @@
 import pefile, struct, ctypes, sys
-DLL=r'C:\Steam\steamapps\common\Wildlands\shadercontainer_engine_win64_2015_f.dll'
+# 2026-08 update renamed this container: the _2015_ segment was dropped. Keep the
+# old name as a fallback so the tool still works against a pre-update install.
+# NOTE: this container holds post-process/terrain/water shaders only. MATERIAL
+# shaders (SHD_Weapon_InGame, SHD_Basic) live in the .forge data and come out via
+# Ubisoft_DATA_Tool.exe: see docs/RE-notes.md, "HOW A WEAPON IS ACTUALLY DRAWN".
+import os as _os
+_BASE = r'C:\Steam\steamapps\common\Wildlands'
+DLL = _os.path.join(_BASE, 'shadercontainer_engine_win64_f.dll')
+if not _os.path.exists(DLL):
+    DLL = _os.path.join(_BASE, 'shadercontainer_engine_win64_2015_f.dll')
 pe=pefile.PE(DLL,fast_load=True)
 pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT']])
 exp={e.name.decode():e.address for e in pe.DIRECTORY_ENTRY_EXPORT.symbols if e.name}

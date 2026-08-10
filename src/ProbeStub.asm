@@ -11,7 +11,7 @@
 ;   * docs/RE-notes.md documents six projection variants with different shapes.
 ;     Guessing which arguments are floats in xmm and which are pointers in
 ;     integer registers is exactly the kind of plausible-but-wrong step that
-;     the project rules forbids. Get it backwards and we forward garbage to the engine.
+;     the project rules forbid. Get it backwards and we forward garbage to the engine.
 ;   * on_calc_mvp takes 21 arguments. Writing that prototype by hand, from a
 ;     static reading of one call site, and then having the engine execute it, is
 ;     not a risk worth taking to answer a question about call counts.
@@ -65,6 +65,21 @@ EXTERN grwxr_headhide_on    : DWORD    ; 1 = force hide on the matching class
 EXTERN grwxr_headhide_calls : QWORD
 EXTERN grwxr_headhide_forced: QWORD
 EXTERN grwxr_headhide_obj   : QWORD    ; last matching object seen
+
+; Build 67: the gun-root bone write. See CameraProbe.cpp for the evidence.
+EXTERN grwxr_wgun_skel  : QWORD        ; player skeleton to match, 0 = disarmed
+EXTERN grwxr_wgun_impl  : QWORD        ; the real PublishAttachments
+EXTERN grwxr_wgun_node  : DWORD        ; bone node index (Fake_gunroot)
+EXTERN grwxr_wgun_dz    : DWORD        ; float, metres added to the z lane
+EXTERN grwxr_wgun_calls : QWORD
+EXTERN grwxr_wgun_writes: QWORD
+EXTERN grwxr_wgun_rot   : DWORD       ; build 80: 1 = rotate, 0 = the lift
+EXTERN grwxr_wgun_apply : PROC        ; build 80: the quaternion helper
+
+; Build 68: TransformNode::SetWorldTransform substitution.
+EXTERN grwxr_wnode_impl : QWORD
+EXTERN grwxr_wnode_calls: QWORD
+EXTERN grwxr_wnode_prep : PROC     ; C: returns replacement matrix, or 0
 
 ; Build 50, the aim-reader census (see AimTrace.h). Unlike every stub above,
 ; these two RECORD ONLY: they modify no argument and no engine state.
@@ -264,6 +279,112 @@ hh_pass:
     mov     rax, [grwxr_headhide_impl]
     jmp     rax
 grwxr_headhide_entry ENDP
+
+; ---------------------------------------------------------------------------
+; Build 67: THE GUN-ROOT BONE WRITE, at Skeleton::PublishAttachments.
+;
+; VERIFIED (headset, 88 samples, log grwxr-18692): the held weapon's world
+; origin tracks the PLAYER rig's Fake_gunroot bone to within 0..6 mm across
+; 0.7 m of movement. PublishAttachments is the function that composes each
+; attached object's world transform from this bone buffer and then places the
+; object, so its entry is the last instant at which changing the bone still
+; changes where the engine puts the gun. Writing at SkeletonPostUpdate entry
+; instead would be overwritten by the animation solver that runs in between.
+;
+; rcx = Skeleton*, edx = 0xFFFF, r8b = flag. xmm0 carries no argument here
+; (all three parameters are integer), and xmm0 is volatile, so using it needs
+; no save. Rule 8 holds: no call, no stack, no allocation, no logging.
+;
+; Every dereference is guarded, and a zero grwxr_wgun_skel disarms the whole
+; stub, so the pass-through path is the same instruction stream the game
+; would have run anyway.
+; ---------------------------------------------------------------------------
+; BUILD 80: mode 3 routes to a C helper instead, because setting the barrel on
+; the controller ray is quaternion work. The LIFT path below is untouched: it
+; is verified in the headset (node 10 raises the gun 60 cm) and a refactor of a
+; proven path to share code with an unproven one would put both at risk.
+;
+; The call needs rdx and r8 preserved, which the lift path never did because it
+; called nothing: PublishAttachments takes (rcx skeleton, dx boneFilter,
+; r8b recurse) and the C helper is free to clobber all three volatiles.
+; Entry via jmp leaves rsp congruent to 8 mod 16 and 38h is itself 8 mod 16, so
+; the call sees a 16-aligned stack, the same arithmetic grwxr_aimget_common
+; documents.
+grwxr_wgun_entry PROC
+    lock inc qword ptr [grwxr_wgun_calls]
+    mov     rax, [grwxr_wgun_skel]
+    test    rax, rax
+    jz      wg_pass
+    cmp     rax, rcx                       ; player skeleton only
+    jne     wg_pass
+    cmp     dword ptr [grwxr_wgun_rot], 0
+    jne     wg_rot
+    mov     rax, [rcx + 238h]              ; pose = [skel+0x238]
+    test    rax, rax
+    jz      wg_pass
+    mov     r11, [rax + 178h]              ; buf = [pose+0x178]
+    test    r11, r11
+    jz      wg_pass
+    mov     eax, dword ptr [grwxr_wgun_node]
+    shl     rax, 5                         ; record stride 0x20
+    add     r11, rax                       ; rec = buf + node*0x20
+    movss   xmm0, dword ptr [r11 + 8]      ; translation z lane (game up axis)
+    addss   xmm0, dword ptr [grwxr_wgun_dz]
+    movss   dword ptr [r11 + 8], xmm0
+    lock inc qword ptr [grwxr_wgun_writes]
+    jmp     wg_pass
+wg_rot:
+    sub     rsp, 38h
+    mov     [rsp+20h], rcx
+    mov     [rsp+28h], rdx
+    mov     [rsp+30h], r8
+    call    grwxr_wgun_apply               ; (rcx = skeleton)
+    mov     rcx, [rsp+20h]
+    mov     rdx, [rsp+28h]
+    mov     r8,  [rsp+30h]
+    add     rsp, 38h
+wg_pass:
+    mov     rax, [grwxr_wgun_impl]
+    jmp     rax
+grwxr_wgun_entry ENDP
+
+; ---------------------------------------------------------------------------
+; Build 68: THE WEAPON PLACEMENT SUBSTITUTION.
+;
+; TransformNode::SetWorldTransform(node rcx, const float4x4* rdx, bool r8b,
+; bool r9b) is the engine's own commit of an object's world placement, and for
+; a held weapon it is called by the character's attachment publish. Replacing
+; rdx here is NOT a race with the engine: we are inside the writer, handing it
+; a different value to commit. Every precedent converges on this (FRIK
+; abandoned its renderer and animation hooks for the player update; UEVR calls
+; the equivalent "Permanent Change"; REFramework hooks named pipeline stages),
+; and it is the only option with no timing hazard at all.
+;
+; We never write through the caller's pointer. The C helper fills OUR buffer
+; and returns it, so a non-matching node leaves every byte of the game's own
+; argument untouched and the call proceeds exactly as it would have.
+;
+; 9 rel32 sites reach this function, so the C helper's node gate is what keeps
+; us off every other object in the world.
+; ---------------------------------------------------------------------------
+grwxr_wnode_entry PROC
+    lock inc qword ptr [grwxr_wnode_calls]
+    sub     rsp, 68h                       ; 0x20 shadow + saves, keeps 16-align
+    mov     [rsp+30h], rcx
+    mov     [rsp+38h], rdx
+    mov     [rsp+40h], r8
+    mov     [rsp+48h], r9
+    call    grwxr_wnode_prep               ; (rcx = node, rdx = matrix)
+    mov     rcx, [rsp+30h]
+    mov     rdx, [rsp+38h]
+    mov     r8,  [rsp+40h]
+    mov     r9,  [rsp+48h]
+    test    rax, rax
+    cmovnz  rdx, rax                       ; substitute only on a gate match
+    add     rsp, 68h
+    mov     rax, [grwxr_wnode_impl]
+    jmp     rax
+grwxr_wnode_entry ENDP
 
 ; ---------------------------------------------------------------------------
 ; Build 50: replacements for the aim-angle GETTER dispatch stubs, RVA

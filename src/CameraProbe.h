@@ -93,7 +93,83 @@ bool wskel_marker(float out[3]);
 // the pick is a DRAWN gun, the skeleton recorder adds +0.30 m of height to
 // the instance origin and its copy each update, hard-capped; a rising edge
 // resets the cap. Requires wskel on for the pick to exist.
-void set_wskel_write(bool on);
+// Build 66: the value selects the write target as well as arming it.
+//   0 = off, 1 = instance origin (+0x120/+0x250, build 65's proven negative),
+//   2 = pose root translation ([[pick+0x238]+0x08], the model-space carrier).
+void set_wskel_write(int mode);
+
+// Build 67: THE GUN-ROOT BONE WRITE (cfg wgun, wgun_dz). While armed, the
+// player's gun-root bone translation is offset by wgun_dz metres at
+// Skeleton::PublishAttachments, the instant before the engine composes the
+// held weapon's placement from it. mode: 0 off, 1 Fake_gunroot (visual),
+// 2 FakeGunRoot_Gameplay (authoritative twin). One binary question: does the
+// rendered gun move.
+// Build 80 adds mode 3: ROTATE node 10 so the bone's +Y (the barrel, VERIFIED
+// build 79) is set ON the controller ray, absolutely rather than as a delta
+// from the game's aim. Modes 1 and 2 remain the verified constant lift.
+void set_wgun(int mode, float dz);
+
+// Build 80: skeleton rule 5's filter and clamp for the rotation. smooth is the
+// one-pole weight per call (0.01..1.0, default 0.25); maxstep_deg hard-caps the
+// per-call angular step (default 5.0, which at ~144 calls/s is 720 deg/s: far
+// faster than a hand moves, slow enough that a tracking dropout cannot snap the
+// gun across the world in a single frame). cfg wgun_smooth, wgun_maxstep_deg.
+void set_wgun_filter(float smooth, float maxstep_deg);
+
+// Build 81: gun POSITION rides the controller, so the weapon can be raised to
+// the eye instead of pivoting where the animation left it. Applies only in
+// wgun mode 3 and is OFF by default, so the verified rotation cannot regress
+// behind it. scale is metres of gun per metre of hand; clamp_m is a hard cap
+// on how far the gun may sit from the engine's own placement, which bounds
+// every possible tracking failure; smooth is the one-pole weight per call.
+// cfg wgun_pos, wgun_pos_scale, wgun_pos_clamp, wgun_pos_smooth.
+void set_wgun_pos(int on, float scale, float clamp_m, float smooth);
+
+// Build 78: step wgun 0 -> 1 -> 2 -> 0 from a key (NUMPAD 5), so the tester can
+// compare the two gun-root bones without removing the headset to edit a file.
+// The write DISARMS immediately on every press and re-arms on the next census
+// tick (up to 5 s), because the bone index the stub uses is only resolvable
+// inside that tick: without the disarm, a press would keep writing the previous
+// bone for those seconds and the tester would be judging a stale mode.
+void cycle_wgun();
+
+// Build 79: LOG ONLY (cfg wbaxis). While on, every census tick logs the dot
+// product of each of the gun-root bone's three world axes with the direction
+// the GAME is aiming. The axis that tracks the aim is the barrel, and its sign
+// is the direction. Replaces build 74's scoring against camera forward, which
+// returned a confident wrong answer because on a canted weapon the gun's right
+// axis correlates with gaze better than its barrel does. Writes nothing.
+void set_wbaxis(int on);
+
+// Build 68: THE WEAPON PLACEMENT OVERRIDE (cfg wnode, wnode_dz). Substitutes
+// the matrix the engine is about to commit for the held weapon, inside
+// TransformNode::SetWorldTransform. Not a race: we are the writer.
+//   0 = off
+//   1 = lift the weapon by wnode_dz metres (mechanism test)
+//   2 = the barrel follows the controller ray, position untouched
+void set_wnode(int mode, float dz);
+
+// Build 70: the SetWorldTransform census (cfg wnode_census). Observes every
+// node the engine places and ranks them by distance to the player's
+// Fake_gunroot, so the held weapon's node names itself instead of being
+// guessed at by a pointer chain. Log only; run it with wnode = 0.
+void set_wnode_census(int on);
+
+// Build 72: mode 3's gate width, metres from the anchor part. Every placement
+// inside it rotates with the gun. cfg wnode_radius.
+void set_wnode_radius(float r);
+
+// Build 75: cfg wnode_axis. -1 = calibrate automatically, 0..5 = force which
+// signed basis row of a weapon part is its barrel (+row0,+row1,+row2,
+// -row0,-row1,-row2). Cycling this in the headset settles the engine's
+// convention in two minutes and with certainty.
+void set_wnode_axis(int idx);
+
+// Build 76: step to the next barrel-axis candidate. Bound to NUMPAD 4 so the
+// tester can settle the engine's convention without removing the headset to
+// edit a file, judging each candidate against the gun in front of him rather
+// than from memory.
+void cycle_wnode_axis();
 
 // Build 18: while on, the SetHidden detour forces the head-visibility
 // component hidden on every engine call (the engine re-asserts visibility

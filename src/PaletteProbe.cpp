@@ -38,6 +38,7 @@
 #include <cstdint>
 
 #include "PaletteProbe.h"
+#include "WeaponDraw.h"
 #include "DrawHook.h"
 #include "Log.h"
 
@@ -140,6 +141,11 @@ void record_compute(ID3D11DeviceContext* ctx, UINT thread_groups) {
 // Build 36: the single recorder DrawHook calls for every detoured draw, on
 // whatever thread the game draws from. Rule 8 discipline is unchanged.
 void on_draw(ID3D11DeviceContext* ctx, drawhook::Kind kind, uint32_t count) {
+    // 2026-08-09: the weapon draw census shares this one recorder (DrawHook
+    // takes a single callback). Inert until its own hotkey arms a bucket, and
+    // rule-8 clean either way: no COM, no lock, no allocation.
+    weapondraw::on_draw(kind, count);
+
     switch (kind) {
         case drawhook::Kind::DrawIndexed:
             g_n_di.fetch_add(1, std::memory_order_relaxed); break;

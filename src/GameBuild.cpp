@@ -42,6 +42,10 @@ constexpr Build kSteam = {
     0x030AC6A0, 0x13E5EA30,
     0x162AD098, 0x162AD0A0,
     0x030C9990, 0x13EA3550,       // TtCastRay thunk + impl (build 58)
+    0x03851120,                   // XInputGetState shadow-IAT slot
+    "48 83 EC 08 44 0F B6 DA 49 89 C9 38 51 68 74 ? 44 0F B7 51 4A",
+    0, 0,                         // PublishAttachments NOT derived here
+    0, 0,                         // SetWorldTransform NOT derived here
 };
 
 constexpr Build kStore = {
@@ -69,15 +73,21 @@ constexpr Build kStore = {
     0x030AC4F0, 0x152E3E70,
     0x16F0F098, 0x16F0F0A0,
     0, 0,                         // TtCastRay NOT derived here
+    0x03851120,                   // XInputGetState shadow-IAT slot (identical to Steam)
+    "48 83 EC 08 44 0F B6 DA 49 89 C9 38 51 68 74 ? 44 0F B7 51 4A",
+    0, 0,                         // PublishAttachments NOT derived here
+    0, 0,                         // SetWorldTransform NOT derived here
 };
 
 // The 2026-08 "Last Rites" update. Steam and Ubisoft Connect ship the SAME
 // exe (sha 56791ff5..., byte-identical), so one row covers both stores.
 // Derived 2026-08-07 with tools/store_port.py old-Steam -> new exe: every
 // non-zero row hit exactly once with the Steam control OK (output archived
-// at binaries/store_port-2026aug-output.txt). Zero rows are honest misses
-// (bodies recompiled: wfire and its two in-body shot sites, getpitch stub,
-// head-hide setter, bone gather consumer); their consumers refuse to arm.
+// at binaries/store_port-2026aug-output.txt). The rows store_port missed
+// (bodies recompiled) were restored 2026-08-08 by the update research
+// campaign: matched on function shape, string xrefs and caller intersection
+// with Steam positive controls, each with a fresh single-hit raw-file AOB.
+// Full evidence chains: docs/UPDATE-CAMPAIGN-2026-08.md.
 constexpr Build kUpdate2026 = {
     "2026-08-update", 0x6A692948, 0x18502000,
     {{0x013786F0, 0x0DB26FA0},    // proj[0] anchor
@@ -92,17 +102,22 @@ constexpr Build kUpdate2026 = {
      {0x018F4180, 0x0F1B82F0},    // HIK datablock reader
      {0x02759D40, 0x13435390}},   // cPlayerComponent::OnInit callee
     0x004487D0, 0x004477F0,       // setyaw, setpitch stubs
-    0x00447400, 0,                // getyaw stub; getpitch MISS (fp-max 0 hits)
-    0, 0,                         // per-shot sites live inside wfire: MISS
-    0, 0,                         // wfire body recompiled: MISS
+    0x00447400, 0x00447330,       // getyaw, getpitch stubs (13-byte stub AOB, 1 hit)
+    0x1464DEDB, 0x1464DF1C,       // per-shot aim read sites (caller intersection)
+    0x02A02DC0, 0x1464DCE0,       // weapon per-frame update thunk + impl
     0x03100590, 0x161AEDE0,       // hknpWorld::castRay thunk + impl
     0x029F6FB0, 0x14619440,       // GetAimOrientation thunk + impl
     0x029D7760, 0x145BB050,       // ballistic projectile spawn thunk + impl
-    0, 0, 0,                      // head-hide family: setter body MISS
+    0x04AFB540, 0x02A2D550, 0x146D7630,  // head_table, setter thunk + impl
     0x146691CC,                   // no-blur match
     0x030FC350, 0x161A55E0,       // weapon setterA thunk + impl
     0x1820C098, 0x1820C0A0,       // ansel IAT slots
     0x03119640, 0x161E6D60,       // TtCastRay thunk + impl
+    0x038A4138,                   // XInputGetState shadow-IAT slot (moved +0x53018)
+    // Recompiled body: r9->r10 at byte 10 (campaign single-hit AOB, hit = impl).
+    "48 83 EC 08 44 0F B6 DA 49 89 CA 38 51 68 74 ? 0F B7 41 4A 85 C0 74 ?",
+    0x018A03B0, 0x0F090D00,       // Skeleton::PublishAttachments thunk + impl
+    0x017E1770, 0x0EAB1C60,       // TransformNode::SetWorldTransform thunk + impl
 };
 
 const Build* kKnown[] = {&kSteam, &kStore, &kUpdate2026};

@@ -271,6 +271,10 @@ uint8_t g_trk_buf[kTrkFrames][kTrkBytes];
 // ballistics stay the engine's and only the line is ours.
 volatile float    g_cr_dir[3] = {0, 0, 0};   // published by VRMirror
 volatile uint32_t g_cr_ok     = 0;
+// Build 81: the right controller's POSITION in the same engine world space,
+// published from the same pass so origin and direction can never disagree.
+volatile float    g_cr_pos[3] = {0, 0, 0};
+volatile uint32_t g_cr_pos_ok = 0;
 volatile uint32_t g_cr_armed  = 0;           // cfg bullet_ctrl
 volatile uint32_t g_fly_on    = 0;           // this flight is being relocated
 volatile float    g_fly_org[3]   = {};       // ray origin = spawn origin
@@ -293,6 +297,24 @@ bool verify_site(const uint8_t* base, uintptr_t site, uintptr_t stub,
     if (!site) {
         LOG_WARN("aimtrace: no %s shot site derived for this binary, so the "
                  "per-shot override cannot arm on it (rule 7).", what);
+        return false;
+    }
+    // BUILD 83, rule 7. The site can come straight from grwxr.cfg, so it is
+    // arbitrary user input and must be range-checked BEFORE it is
+    // dereferenced. Setting aim_shot_site_yaw to 1 (mistaking an RVA key for a
+    // boolean) made this read `base + 1 - 5`, four bytes below the image, and
+    // killed the process 14 seconds into a run. A number in a text file must
+    // never be able to do that: rule 7 says a bad address disarms loudly and
+    // leaves the game running.
+    const uintptr_t span = g_image_end - g_image_base;
+    if (!g_image_base || !g_image_end || site < 5 || site >= span) {
+        LOG_WARN("aimtrace: %s shot site 0x%08llX is outside this image "
+                 "(base 0x%p, size 0x%llX). It is almost certainly a bad "
+                 "grwxr.cfg value: aim_shot_site_yaw/pitch take a hex RVA, "
+                 "and 0 means 'use the derived per-shot sites'. Override "
+                 "DISARMED on this axis; nothing was read or written.",
+                 what, (unsigned long long)site, (void*)g_image_base,
+                 (unsigned long long)span);
         return false;
     }
     const uint8_t* call = base + site - 5;
@@ -1053,6 +1075,32 @@ void set_shot_offset(float yaw_rad, float pitch_rad) {
 
 void set_shot_alternate(bool on) { g_shot_alternate = on ? 1u : 0u; }
 
+// Build 72: the direction the GAME is currently aiming, in engine world space,
+// published from the same per-frame pass as the controller ray so the two are
+// always from one instant. The weapon rotation is built as the delta between
+// them, which is why it needs no knowledge of the engine's axis convention.
+volatile uint32_t g_vf_ok = 0;
+float g_vf_dir[3] = {};
+
+void set_view_fwd(const float dir[3], bool ok) {
+    if (ok && dir) {
+        g_vf_dir[0] = dir[0];
+        g_vf_dir[1] = dir[1];
+        g_vf_dir[2] = dir[2];
+        g_vf_ok = 1;
+    } else {
+        g_vf_ok = 0;
+    }
+}
+
+bool view_fwd(float out[3]) {
+    if (!g_vf_ok || !out) return false;
+    out[0] = g_vf_dir[0];
+    out[1] = g_vf_dir[1];
+    out[2] = g_vf_dir[2];
+    return true;
+}
+
 void set_ctrl_ray(const float dir[3], bool ok) {
     if (ok && dir) {
         g_cr_dir[0] = dir[0];
@@ -1062,6 +1110,35 @@ void set_ctrl_ray(const float dir[3], bool ok) {
     } else {
         g_cr_ok = 0;
     }
+}
+
+// Build 68: the same ray the bullets ride, exposed so the weapon's rendered
+// orientation can be built from it. Sharing one source is the point: the gun
+// and the rounds then cannot diverge, which is the defect class that produced
+// the tester's ADS complaint.
+bool ctrl_ray(float out[3]) {
+    if (!g_cr_ok || !out) return false;
+    out[0] = g_cr_dir[0];
+    out[1] = g_cr_dir[1];
+    out[2] = g_cr_dir[2];
+    return true;
+}
+
+void set_ctrl_pos(const float p[3], bool ok) {
+    if (ok && p) {
+        g_cr_pos[0] = p[0];
+        g_cr_pos[1] = p[1];
+        g_cr_pos[2] = p[2];
+    }
+    g_cr_pos_ok = ok ? 1u : 0u;
+}
+
+bool ctrl_pos(float out[3]) {
+    if (!g_cr_pos_ok || !out) return false;
+    out[0] = g_cr_pos[0];
+    out[1] = g_cr_pos[1];
+    out[2] = g_cr_pos[2];
+    return true;
 }
 
 void set_bullet_ctrl(bool on) {
@@ -1091,6 +1168,27 @@ void set_bullet_yaw(float deg) {
              "m_vBulletSimulationDirection at the spawn and restores the "
              "engine's own value immediately after, so nothing stays "
              "modified. If impacts move, the bullet is ours.", deg);
+}
+
+// BUILD 82: step the spawn-direction yaw from a key, because settling "is
+// owner+0x140 the authoritative shot direction" means firing under two
+// opposite offsets and comparing, and doing that by editing a text file means
+// taking the headset off between the two halves of the comparison.
+//
+// The sequence is 0, +20, -20 deliberately. A single offset can only be judged
+// against a remembered impact point, and this project has already learned that
+// a tester judging from memory is a measurement that lies. Opposite signs make
+// the round its own reference: left then right is unambiguous, and a constant
+// misalignment cannot alternate.
+void cycle_bullet_yaw() {
+    static const float kSteps[3] = {0.0f, 20.0f, -20.0f};
+    static int idx = 0;
+    idx = (idx + 1) % 3;
+    set_bullet_yaw(kSteps[idx]);
+    LOG_INFO("aimtrace: NUMPAD 4 -> bullet_yaw %+.0f deg. Fire a group at a "
+             "wall: if impacts sit off to one side and SWAP sides on the next "
+             "press, m_vBulletSimulationDirection is the shot direction and we "
+             "can write the controller ray straight into it.", kSteps[idx]);
 }
 
 void set_aim_quat(float deg, int axis) {

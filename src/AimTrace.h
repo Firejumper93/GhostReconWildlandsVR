@@ -82,6 +82,22 @@ void set_logging(bool on);
 // last good ray is NOT held, a spawn with no fresh ray flies unmodified.
 void set_ctrl_ray(const float dir[3], bool ok);
 
+// Build 68: read back that ray (engine world space). False while no valid
+// controller ray has been published.
+bool ctrl_ray(float out[3]);
+
+// Build 81: the right controller's POSITION in the same engine world space,
+// published from the same pass as the ray so origin and direction can never
+// disagree. False until a valid controller pose has been published.
+void set_ctrl_pos(const float p[3], bool ok);
+bool ctrl_pos(float out[3]);
+
+// Build 72: the direction the GAME is aiming, engine world space, published in
+// the same per-frame pass as the controller ray. The weapon rotation is the
+// delta between the two, so it needs no knowledge of the engine's axis order.
+void set_view_fwd(const float dir[3], bool ok);
+bool view_fwd(float out[3]);
+
 // cfg bullet_ctrl: 1 = every player round is relocated, frame by frame,
 // onto the controller ray captured at its spawn. The engine keeps drop and
 // drag (its own per-frame step length and deviation are preserved); only
@@ -133,6 +149,12 @@ void set_aim_quat(float deg, int axis);
 // writable, and "the gun rides the controller" becomes a matter of feeding
 // this one vector from the controller pose.
 void set_bullet_yaw(float deg);
+
+// Build 82: step the spawn-direction yaw 0 -> +20 -> -20 from NUMPAD 4, so the
+// "is this the shot direction" question can be answered in the headset. The
+// opposite signs make the round its own reference: a constant misalignment
+// cannot swap sides, so a real effect is distinguishable from a fixed error.
+void cycle_bullet_yaw();
 
 // Build 52, THE CONTROL. Retargets the override at an arbitrary call site
 // (0 restores the build-pinned per-shot sites). Its purpose is to point the

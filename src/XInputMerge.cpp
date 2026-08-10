@@ -7,6 +7,7 @@
 
 #include "XInputMerge.h"
 #include "AimTrace.h"
+#include "GameBuild.h"
 #include "HeadPose.h"
 #include "Log.h"
 
@@ -14,8 +15,10 @@ namespace grwxr {
 namespace xin {
 namespace {
 
-// Shadow-IAT slot for XInputGetState (ordinal 2), RE-notes 2026-08-03.
-constexpr uintptr_t kSlotRva = 0x03851120;
+// Shadow-IAT slot for XInputGetState (ordinal 2). The RVA is build-specific
+// (0x03851120 on the 2023 builds, 0x038A4138 on the 2026-08 update), so it is
+// selected from the GameBuild pin, not hardcoded: an unknown binary yields 0
+// and try_install installs nothing (rule 7). See GameBuild.h xinput_slot.
 
 // XINPUT_STATE, declared locally so this file needs no XInput import.
 #pragma pack(push, 1)
@@ -165,9 +168,19 @@ bool readable(const void* p, size_t n) {
 }
 
 bool try_install() {
+    const gamebuild::Build* gb = gamebuild::get();
+    if (!gb || !gb->xinput_slot) {
+        static bool s_warned = false;
+        if (!s_warned) {
+            s_warned = true;
+            LOG_WARN("xin: no XInput slot for this binary (unknown build or "
+                     "not derived); Touch gamepad disabled (rule 7)");
+        }
+        return false;
+    }
     uint8_t* base = (uint8_t*)GetModuleHandleW(nullptr);
     if (!base) return false;
-    void** slot = (void**)(base + kSlotRva);
+    void** slot = (void**)(base + gb->xinput_slot);
     if (!readable(slot, sizeof(void*))) return false;
     void* cur = *slot;
     if (!cur) return false;                       // not resolved yet, retry

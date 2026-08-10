@@ -76,5 +76,30 @@ void drain_capture_log();
 
 unsigned long long frame_count();
 
+// FRAMES IN FLIGHT. Prior art: "Making 6DOF Mods 3D, Rev 4" section 15.8, which
+// records that Luke Ross's R.E.A.L. caps D3D max frame latency to 1 under
+// alternate-frame stereo, for the same reason we might want to. Fewer frames
+// queued means the eye a frame was BUILT with reaches Present sooner, so the two
+// AER eyes are paired more tightly in time. Our own build-10b logs measured the
+// build-to-present depth flapping between 0 and 1, which is exactly the quantity
+// this bounds, and that flap was the mechanism behind the session-13 rotation
+// stutter.
+//
+// grwxr.cfg `max_frame_latency`:
+//   0     (default) leave the engine's own value completely alone. Nothing is
+//         written, so a DLL carrying this code behaves exactly as one without it
+//         until the key is set.
+//   1..16 request that queue depth.
+// Setting the key back to 0 restores the value the device had when we captured
+// it, so the experiment is fully reversible live, through the cfg hot reload,
+// with no relaunch and no second build.
+void request_max_frame_latency(int frames);
+
+// Init thread only. Applies a pending request once the device exists, logs the
+// engine's own value, what was asked for and what the device reads back, and
+// returns immediately when nothing has changed. Never called from Present:
+// this does COM work and logs, both banned on the render thread (rule 8).
+void poll_max_frame_latency();
+
 }  // namespace d3d11
 }  // namespace grwxr

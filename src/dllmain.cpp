@@ -36,8 +36,10 @@
 #include "XInputMerge.h"
 #include "RenderDocCapture.h"
 #include "PaletteProbe.h"
+#include "WeaponDraw.h"
 #include "WeaponProbe.h"
 #include "AimTrace.h"
+#include "Menu.h"
 
 // Forward every export of the real dxgi.dll to dxgi_real.dll.
 // deploy.bat places a copy of C:\Windows\System32\dxgi.dll as dxgi_real.dll
@@ -252,11 +254,53 @@ DWORD WINAPI init_thread(LPVOID) {
     // first frames" from "ran fine then died at a specific event".
     unsigned long long last = 0;
     for (int tick = 0; ; ++tick) {
-        Sleep(1000);
+        // BUILD 77: the second is spent in 50 ms slices so hotkeys are read at
+        // 20 Hz instead of 1 Hz, with the KEY-IS-DOWN bit and our own edge
+        // detection.
+        //
+        // Builds 74 and 76 used GetAsyncKeyState's pressed-since-last-call bit
+        // on a once-a-second poll, and neither F1 nor NUMPAD 4 ever registered
+        // a single press across a whole session. The reason is that the bit is
+        // consumed by whoever calls first, and the game polls input every
+        // frame, so it was almost always already cleared by the time we looked.
+        // The keys that have always worked in this mod (NUMPAD 7, NUMPAD 8) are
+        // read at frame rate off the down bit, which is the pattern this now
+        // matches. A tester pressing a key and getting nothing is the exact
+        // failure the panel exists to remove, and it is worse when the cause is
+        // ours.
+        {
+            static bool f1_prev = false, np4_prev = false, np5_prev = false;
+            for (int slice = 0; slice < 20; ++slice) {
+                Sleep(50);
+                const bool f1 = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
+                if (f1 && !f1_prev && grwxr::menu::ready())
+                    grwxr::menu::toggle();
+                f1_prev = f1;
+
+                // Build 82: NUMPAD 4 was the wnode_axis cycler. That path is
+                // retired (build 80 supersedes it) but the key stayed live and
+                // logged cheerfully while doing nothing, which is exactly what
+                // made a "nothing happened" report take a log dig to explain.
+                // Retire the key with its feature; give it to the question we
+                // are actually asking.
+                const bool np4 = (GetAsyncKeyState(VK_NUMPAD4) & 0x8000) != 0;
+                if (np4 && !np4_prev) grwxr::aimtrace::cycle_bullet_yaw();
+                np4_prev = np4;
+
+                // Build 78: step the gun-root bone (off / node 8 / node 10).
+                const bool np5 = (GetAsyncKeyState(VK_NUMPAD5) & 0x8000) != 0;
+                if (np5 && !np5_prev) grwxr::camera::cycle_wgun();
+                np5_prev = np5;
+            }
+        }
         grwxr::d3d11::drain_capture_log();
         grwxr::vr::drain_log();
         grwxr::vr::drain_input();
         grwxr::vr::poll_config();
+        // Right after poll_config so a cfg edit lands in the same tick that
+        // read it. Init thread: this does COM work and logs, both banned on
+        // the render thread (rule 8).
+        grwxr::d3d11::poll_max_frame_latency();
         grwxr::xin::poll_install();
         grwxr::xin::drain();
         grwxr::ansel::drain();
@@ -293,6 +337,26 @@ DWORD WINAPI init_thread(LPVOID) {
             grwxr::pal::install(st.device, st.context);
         }
         grwxr::pal::poll();
+
+        // 2026-08-09: the weapon draw census (WeaponDraw.h). Shares the draw
+        // detours pal installed; NUMPAD 7 walks it through weapon-visible,
+        // weapon-gone, dump. Log only, and inert until that key is pressed.
+        grwxr::weapondraw::poll();
+
+        // The tester panel (Menu.h). Built on the game's own device once it
+        // exists, exactly as the palette probe is. This build renders NO
+        // pixels: it proves that ImGui links, that a context and a font atlas
+        // come up on a Denuvo-protected process's D3D11 device, and that the
+        // toggle works, before any of it goes near the render thread.
+        static bool menu_tried = false;
+        if (!menu_tried && st.ready && st.device && st.context) {
+            menu_tried = true;
+            grwxr::menu::init(st.device, st.context);
+        }
+        // F1 toggles. GetAsyncKeyState's low bit means "pressed since the last
+        // call", so a 1 Hz poll on this thread still catches a quick tap and we
+        // do not have to put a key read in Present for it.
+        grwxr::menu::poll();
 
         const unsigned long long now = grwxr::d3d11::frame_count();
         LOG_INFO("hb %4d  frames=%llu  (+%llu in the last second)",

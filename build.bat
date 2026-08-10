@@ -29,13 +29,27 @@ REM without knowing the hooked function's prototype. See src/ProbeStub.asm.
 ml64 /nologo /c /Fo build\ProbeStub.obj src\ProbeStub.asm
 if errorlevel 1 ( echo *** ASSEMBLY FAILED *** & popd & exit /b 1 )
 
+REM Dear ImGui (src\imgui, MIT, vendored upstream v1.91.5) is third-party code.
+REM It is compiled in its own pass at /W0 so that OUR sources keep /W4 and a
+REM warning in the mod can never be lost in a wall of warnings from a library
+REM we do not maintain. Objects go to build\imgui\ so the two passes cannot
+REM collide on a shared object name.
+if not exist build\imgui mkdir build\imgui
+cl /nologo /std:c++20 /EHsc /O2 /W0 /MT /DNDEBUG /c ^
+   /I src\imgui /I src\imgui\backends ^
+   /Fo:build\imgui\ /Fd:build\imgui\ ^
+   src\imgui\imgui.cpp src\imgui\imgui_draw.cpp src\imgui\imgui_tables.cpp ^
+   src\imgui\imgui_widgets.cpp src\imgui\backends\imgui_impl_dx11.cpp
+if errorlevel 1 ( echo *** IMGUI BUILD FAILED *** & popd & exit /b 1 )
+
 cl /nologo /std:c++20 /EHsc /O2 /W4 /MT /DNDEBUG /LD /I tools\xr_probe\extern\include ^
+   /I src\imgui /I src\imgui\backends ^
    /Fo:build\ /Fd:build\ ^
    src\dllmain.cpp src\Log.cpp src\D3D11Hook.cpp src\Crash.cpp src\VRMirror.cpp src\AnselProbe.cpp ^
    src\Sig.cpp src\ThunkHook.cpp src\CameraProbe.cpp src\HeadPose.cpp src\FactoryHook.cpp src\XInputMerge.cpp ^
    src\RenderDocCapture.cpp src\PaletteProbe.cpp src\DrawHook.cpp src\WeaponProbe.cpp src\GameBuild.cpp ^
-   src\AimTrace.cpp ^
-   build\ProbeStub.obj ^
+   src\AimTrace.cpp src\GunModel.cpp src\WeaponDraw.cpp src\Menu.cpp ^
+   build\ProbeStub.obj build\imgui\*.obj ^
    /link /DLL /LIBPATH:tools\xr_probe\extern\lib openxr_loader.lib /OUT:build\dxgi.dll
 
 if errorlevel 1 (

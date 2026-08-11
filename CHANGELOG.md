@@ -5,6 +5,50 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
+## v0.8.4-alpha (2026-08-11, startup fixes for two different tester failures)
+
+Two testers on v0.8.3 failed at startup in two different ways. Both were in the
+same function, `D3D11Hook::install()`, which builds a throwaway Direct3D
+swapchain purely to read one function pointer out of it. Neither failure was the
+motion-controlled weapon, the compiler, the headset runtime, or a missing Visual
+C++ redistributable (the build is `/MT` and imports no runtime).
+
+- **Fixed: the mod silently switching itself off.** The throwaway swapchain was
+  created on `GetDesktopWindow()`, a window this process does not own. DXGI is
+  entitled to refuse that, and on one tester's PC it did, with `E_ACCESSDENIED`.
+  With no vtable there was no Present hook, so the mod stood down and left the
+  game completely unmodified. Reported as "nothing happens, I hear sound in the
+  headset": the game was fine, the mod had disabled itself. `install()` now
+  creates and owns a hidden window, and tries three routes in order (own window
+  plus hardware device, desktop window plus hardware device, own window plus
+  WARP), logging each route's own `HRESULT` with `E_ACCESSDENIED` named
+  explicitly. This defect had been present in every release since v0.1.0.
+- **Fixed: a frozen black screen needing a force-kill.** `install()` armed the
+  Present hook *before* releasing the throwaway objects. Those three `Release()`
+  calls cost 127-140 ms on the test system and never completed on a tester's PC,
+  because the game's render thread was by then already inside the freshly armed
+  hook (which calls `GetDevice`, `GetImmediateContext` and `GetDesc` into DXGI)
+  while the init thread was inside DXGI destroying a device. One process-wide
+  lock, two threads, no timeout. Cleanup now runs **before** the hook is armed,
+  which removes the race rather than narrowing it.
+- The module owning the swapchain vtable is now pinned before the last reference
+  is dropped. Required by the change above: on both testers, the mod itself was
+  the first thing in the process to load DXGI at all, which is precisely the
+  difference that made these bugs reachable on their PCs and not on the test
+  system.
+- **Logs: the previous session is no longer destroyed on relaunch.** It is kept
+  as `GRWVR\grwxr-prev.log`. Relaunching after a crash to see whether it repeats
+  used to erase the only evidence of it.
+- `Collect-Logs.bat` now ships in the release zip and is installed into `GRWVR`.
+
+Motion controls are unchanged and remain on by default (`wgun = 3`,
+`wgun_pos = 1`). That code is byte-for-byte identical to the build in which it
+was first confirmed working in a headset.
+
+Marked otherwise, per the note at the top of this file: **v0.8.4 has not been
+confirmed in a headset.** It was built on a machine with no headset attached.
+Both diagnoses came from tester logs, not from reproduction.
+
 ## v0.8.3-alpha, "The Weapon" (2026-08-10, GPU-mismatch startup-crash fix)
 
 Targets the startup crash on v0.8.0-v0.8.2 (black screen, then the game closes).

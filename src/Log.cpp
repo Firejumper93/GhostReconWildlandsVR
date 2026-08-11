@@ -89,7 +89,20 @@ void init(HMODULE self) {
     // GRW.exe can appear more than once (the launcher path re-spawns it), so if
     // the primary name is already held by another instance, fall back to a
     // pid-suffixed file rather than silently losing the log.
+    //
+    // Rotate, do not truncate. Mode "w" destroys the previous session's log, and
+    // that is precisely the file we need after a crash: a tester who crashes and
+    // immediately relaunches to see whether it repeats has erased the only
+    // evidence before anyone could collect it. Keep one generation back.
+    //
+    // If the rename fails because a live instance still holds grwxr.log open,
+    // the _wfsopen below fails for the same reason and we fall through to the
+    // pid-suffixed name exactly as before. Rotation adds no new failure path.
     std::wstring log_path = g_data_dir + L"\\grwxr.log";
+    if (GetFileAttributesW(log_path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        const std::wstring prev_path = g_data_dir + L"\\grwxr-prev.log";
+        MoveFileExW(log_path.c_str(), prev_path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    }
     g_file = _wfsopen(log_path.c_str(), L"w", _SH_DENYWR);
     if (!g_file) {
         wchar_t alt[MAX_PATH];

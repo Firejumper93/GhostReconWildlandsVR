@@ -5,6 +5,38 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
+## v0.8.5-alpha (2026-08-11, exclusive fullscreen fix)
+
+Targets a black screen after exactly one frame, confirmed from a tester's logs on
+v0.8.4. This was our bug and it was caused by our own installation guide, which
+told users to run the game in fullscreen.
+
+In exclusive fullscreen a swapchain's backbuffer size is a real **display mode**,
+not merely a buffer. The mod forces a 3840x2160 internal render for a sharp VR
+image, so on a 1920x1080 display that became a request for a 4K display mode the
+monitor does not have. One frame reached the headset and then everything stopped.
+In one of the tester's sessions it also took the NVIDIA display driver down with
+it (an access violation inside `nvwgf2umx.dll`, with no mod code on the stack).
+
+- **The mod now declines exclusive fullscreen and keeps the game windowed.** New
+  hook on `IDXGISwapChain::SetFullscreenState`. This is the effective seam: the
+  swapchain is created *windowed* and the engine switches to exclusive fullscreen
+  afterwards, so nothing at creation time can prevent it. cfg `force_windowed`,
+  default 1, and on when the key is absent so updaters are covered.
+  It **fails open**: if the engine insists past eight attempts the mod stands down
+  and allows fullscreen, logging why, rather than fighting the game forever.
+- This is not a tradeoff. Windowed avoids the display mode change **and** keeps
+  the sharp internal render at any desktop resolution. The desktop window is only
+  a mirror of the headset view.
+- **`ResizeBuffers` no longer upsizes in exclusive fullscreen** either, as a
+  safety net for `force_windowed = 0`. The equivalent guard already existed at
+  swapchain creation ("exclusive fullscreen sizes are modes, not ours to invent")
+  but could never fire, because creation happens while still windowed.
+- **`INSTALL.txt` no longer asks you to pick a window mode.** Set whatever you
+  like. The previous advice in that file caused this failure.
+
+Not confirmed in a headset by the author: built on a machine with no headset
+attached. The diagnosis came from a tester's log bundle.
 ## v0.8.4-alpha (2026-08-11, startup fixes for two different tester failures)
 
 Two testers on v0.8.3 failed at startup in two different ways. Both were in the

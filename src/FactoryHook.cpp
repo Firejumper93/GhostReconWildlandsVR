@@ -106,6 +106,15 @@ std::atomic<int> g_cfg_state{0};   // 0 unread, 1 reading, 2 ready
 UINT g_up_w = 3840;
 UINT g_up_h = 2160;
 
+// v0.8.5: keep the game out of exclusive fullscreen. Default ON, and ON when
+// the key is absent, so users who UPDATE and keep their old cfg are protected
+// too. Exclusive fullscreen is where the backbuffer size stops being ours and
+// becomes a real display mode, which is what cost a tester his whole session
+// (see hooked_resize_buffers). Windowed also lets us keep the 4K internal
+// render on a 1080p display, so this is the setting that makes the mod both
+// safer AND sharper. force_windowed=0 restores the engine's own behaviour.
+bool g_force_windowed = true;
+
 void load_cfg_once() {
     int expect = 0;
     if (!g_cfg_state.compare_exchange_strong(expect, 1, std::memory_order_acq_rel)) {
@@ -139,6 +148,8 @@ void load_cfg_once() {
                 if (v > 4320) v = 4320;
                 g_up_h = v;
             }
+            if (sscanf_s(line, " force_windowed = %u", &v) == 1)
+                g_force_windowed = (v != 0);
         }
         fclose(f);
     }
@@ -262,6 +273,32 @@ HRESULT STDMETHODCALLTYPE hooked_resize_buffers(IDXGISwapChain* sc, UINT count, 
         return orig(sc, count, w, h, fmt, flags);
     }
 
+    // v0.8.5: the same rule should_upsize() already applies at creation
+    // ("exclusive fullscreen sizes are modes, not ours to invent") has to apply
+    // HERE too, and did not. A swapchain is created windowed and goes exclusive
+    // fullscreen afterwards, so the creation-time check cannot see this.
+    //
+    // A tester's v0.8.4 log (2026-08-11, Virtual Desktop, 1920x1080 display):
+    //     factory: swapchain pass-through 3840x2160 ... windowed=1
+    //     factory: ResizeBuffers 1920x1080 UPSIZED -> 3840x2160
+    //     windowed : NO (exclusive fullscreen)
+    //     hb 24  frames=1  (+0 in the last second)
+    // The game was resizing back to the real 1920x1080 display mode on its way
+    // into exclusive fullscreen, and we overrode it to 4K. Backbuffer and
+    // display mode then disagree: one frame presented, then nothing, and in a
+    // second session an access violation inside nvwgf2umx.dll (the NVIDIA D3D11
+    // user-mode driver) with no frame of ours on the stack.
+    //
+    // Windowed is the only state where the backbuffer size is ours to choose.
+    BOOL fs = FALSE;
+    if (SUCCEEDED(sc->GetFullscreenState(&fs, nullptr)) && fs) {
+        note("factory: ResizeBuffers %ux%u NOT upsized: swapchain is in exclusive "
+             "fullscreen, where the size is a display mode and not ours to invent. "
+             "Set the game to windowed to get the %ux%u internal render back.",
+             w, h, g_up_w, g_up_h);
+        return orig(sc, count, w, h, fmt, flags);
+    }
+
     HRESULT hr = orig(sc, count, g_up_w, g_up_h, fmt, flags);
     if (SUCCEEDED(hr)) {
         note("factory: ResizeBuffers %ux%u UPSIZED -> %ux%u (bufs=%u fmt=%d)",
@@ -337,9 +374,109 @@ void** find_iat_slot(HMODULE mod, const char* func) {
     return nullptr;
 }
 
-// Patch a created swapchain's ResizeBuffers slot, once per distinct vtable.
-// Runs inside the creation hook, so the game's first post-create resize
-// already lands on the hook.
+// ---------------------------------------------------------------------------
+// v0.8.5: the SetFullscreenState hook. IDXGISwapChain vtable slot 10.
+//
+// This is the seam that actually decides the failure. A tester's v0.8.4 log
+// shows the swapchain CREATED windowed ("windowed=1") and exclusive fullscreen
+// arriving only afterwards, so nothing at creation time can prevent it. The
+// engine gets there by calling SetFullscreenState(TRUE), and that call is the
+// one place we can say no.
+//
+// Windowed is strictly better for this mod: the backbuffer size stays ours (so
+// the 4K internal render survives on a 1080p display) and no display mode
+// change is ever requested. The desktop window is a mirror of the headset view,
+// so the user is not looking at it anyway.
+//
+// FAIL-OPEN BY DESIGN. If the engine insists past kMaxDenials, we stop
+// overriding and let it through. A mod that fights the game's own state machine
+// forever is worse than a mod that renders at desktop resolution.
+constexpr int kSetFullscreenSlot = 10;
+constexpr int kMaxDenials        = 8;
+
+using SetFullscreenFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, BOOL, IDXGIOutput*);
+
+Patched          g_fs_patched[4];
+std::atomic<int> g_fs_npatched{0};
+std::atomic<int> g_fs_denials{0};
+
+SetFullscreenFn fs_orig_for(void** vt) {
+    const int n = g_fs_npatched.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i)
+        if (g_fs_patched[i].vt == vt) return (SetFullscreenFn)g_fs_patched[i].orig;
+    return nullptr;
+}
+
+HRESULT STDMETHODCALLTYPE hooked_set_fullscreen(IDXGISwapChain* sc, BOOL fullscreen,
+                                                IDXGIOutput* target) {
+    SetFullscreenFn orig = fs_orig_for(*(void***)sc);
+    if (!orig) {
+        auto fallback = (SetFullscreenFn)g_fs_patched[0].orig;
+        return fallback ? fallback(sc, fullscreen, target) : E_FAIL;
+    }
+
+    ReentryGuard guard;
+    if (!guard.ok) return orig(sc, fullscreen, target);   // DXGI re-entered
+
+    // Going windowed, or not our business: never interfere.
+    if (!fullscreen || !g_force_windowed || !host_is_game())
+        return orig(sc, fullscreen, target);
+
+    const int n = g_fs_denials.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n > kMaxDenials) {
+        if (n == kMaxDenials + 1) {
+            note("factory: the engine has asked for exclusive fullscreen %d times. "
+                 "Standing down and allowing it (fail-open). If the headset goes "
+                 "black after one frame, set the game to windowed or borderless, "
+                 "or set upsize_width=0 and upsize_height=0 in grwxr.cfg.",
+                 kMaxDenials);
+        }
+        return orig(sc, fullscreen, target);
+    }
+
+    if (n == 1) {
+        note("factory: exclusive fullscreen DENIED, staying windowed "
+             "(force_windowed=1). This keeps the %ux%u internal render on any "
+             "desktop resolution and avoids a display mode change. "
+             "force_windowed=0 in grwxr.cfg restores the engine's own behaviour.",
+             g_up_w, g_up_h);
+    }
+    // Report success. The engine believes its request was honoured, which is
+    // what keeps its own settings state machine quiet, and the desktop window
+    // is only a mirror of the headset view.
+    return S_OK;
+}
+
+// Patch a created swapchain's ResizeBuffers and SetFullscreenState slots, once
+// per distinct vtable. Runs inside the creation hook, so the game's first
+// post-create resize already lands on the hook.
+void patch_fullscreen(IDXGISwapChain* sc) {
+    if (!sc || !host_is_game()) return;
+    void** vt = *(void***)sc;
+    AcquireSRWLockExclusive(&g_patch_lock);
+    if (!fs_orig_for(vt)) {
+        const int n = g_fs_npatched.load(std::memory_order_relaxed);
+        if (n < (int)_countof(g_fs_patched) &&
+            vt[kSetFullscreenSlot] != (void*)&hooked_set_fullscreen) {
+            DWORD old = 0;
+            if (VirtualProtect(&vt[kSetFullscreenSlot], sizeof(void*), PAGE_READWRITE, &old)) {
+                g_fs_patched[n].vt   = vt;
+                g_fs_patched[n].orig = vt[kSetFullscreenSlot];
+                g_fs_npatched.store(n + 1, std::memory_order_release);
+                vt[kSetFullscreenSlot] = (void*)&hooked_set_fullscreen;
+                VirtualProtect(&vt[kSetFullscreenSlot], sizeof(void*), old, &old);
+                note("factory: swapchain vtable 0x%p SetFullscreenState hooked "
+                     "(orig 0x%p, guarded, force_windowed=%d)",
+                     (void*)vt, (void*)g_fs_patched[n].orig, (int)g_force_windowed);
+            } else {
+                note("factory: VirtualProtect FAILED on swapchain vtable 0x%p, "
+                     "SetFullscreenState not hooked", (void*)vt);
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&g_patch_lock);
+}
+
 void patch_resize(IDXGISwapChain* sc) {
     if (!sc || !host_is_game()) return;
     void** vt = *(void***)sc;
@@ -392,7 +529,10 @@ HRESULT STDMETHODCALLTYPE hooked_create_swapchain(IDXGIFactory* self, IUnknown* 
         // 15b: even a pass-through creation (the D3D11Hook dummy) exposes the
         // shared swapchain vtable; arming the resize hook here means it is in
         // place before the game's own swapchain exists at all.
-        if (SUCCEEDED(hr) && out && *out) patch_resize(*out);
+        if (SUCCEEDED(hr) && out && *out) {
+            patch_resize(*out);
+            patch_fullscreen(*out);
+        }
         return hr;
     }
 
@@ -406,6 +546,7 @@ HRESULT STDMETHODCALLTYPE hooked_create_swapchain(IDXGIFactory* self, IUnknown* 
              (int)desc->BufferDesc.Format, desc->BufferCount,
              (int)desc->SwapEffect, (void*)desc->OutputWindow);
         patch_resize(*out);
+        patch_fullscreen(*out);
         return hr;
     }
     note("factory: upsize %ux%u -> %ux%u FAILED hr=0x%08lX, retrying at requested size",
@@ -413,7 +554,10 @@ HRESULT STDMETHODCALLTYPE hooked_create_swapchain(IDXGIFactory* self, IUnknown* 
          (unsigned long)hr);
     hr = orig(self, device, desc, out);
     note("factory: fallback create at requested size hr=0x%08lX", (unsigned long)hr);
-    if (SUCCEEDED(hr) && out && *out) patch_resize(*out);
+    if (SUCCEEDED(hr) && out && *out) {
+        patch_resize(*out);
+        patch_fullscreen(*out);
+    }
     return hr;
 }
 

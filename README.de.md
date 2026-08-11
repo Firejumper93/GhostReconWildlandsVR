@@ -1,6 +1,6 @@
 # Ghost Recon Wildlands VR (GRW-XR)
 
-[English](README.md) | **Deutsch**
+[English](README.md) | **Deutsch** | [한국어](README.ko.md)
 
 > Diese Seite ist eine gekürzte deutsche Fassung. Sie enthält alle Warnungen, die
 > Installation, die Basiseinstellungen und die ehrliche Einordnung dessen, was der
@@ -338,6 +338,11 @@ und in den Kommentaren der Konfigurationsdatei selbst.
   [Thread über diesen Mod](https://vrforum.de/threads/ghost-recon-wildlands-grw-xr.14507/)
   und dafür, deutschsprachige Spielerinnen und Spieler darauf aufmerksam gemacht zu
   haben. Dieser Thread ist der Grund, warum es diese deutsche Fassung gibt.
+- **아키아PhD**, für den
+  [Beitrag über diesen Mod im Naver Cafe](https://cafe.naver.com/ca-fe/cafes/27902572/articles/252399)
+  und dafür, koreanischsprachige Spielerinnen und Spieler darauf aufmerksam gemacht zu
+  haben. Dieser Beitrag ist der Grund, warum es die koreanische Fassung gibt
+  ([README.ko.md](README.ko.md)).
 - Tom Clancy's Ghost Recon Wildlands ist Eigentum von Ubisoft. Dieses Projekt steht
   in keiner Verbindung zu Ubisoft, wird von Ubisoft weder unterstützt noch
   gebilligt, und verbreitet keine Inhalte von Ubisoft.

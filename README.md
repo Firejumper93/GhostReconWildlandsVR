@@ -1,6 +1,6 @@
 # Ghost Recon Wildlands VR (GRW-XR)
 
-**English** | [Deutsch](README.de.md)
+**English** | [Deutsch](README.de.md) | [한국어](README.ko.md)
 
 > [!WARNING]
 > **SINGLEPLAYER ONLY. Solo campaign, never co-op, never PvP, never matchmaking.**
@@ -506,6 +506,10 @@ continuously fed.
   [thread about this mod](https://vrforum.de/threads/ghost-recon-wildlands-grw-xr.14507/)
   and for bringing German-speaking players to it. That thread is the reason this
   README now exists in German ([README.de.md](README.de.md)).
+- **아키아PhD**, for the
+  [Naver Cafe post about this mod](https://cafe.naver.com/ca-fe/cafes/27902572/articles/252399)
+  and for bringing Korean-speaking players to it. That post is the reason this README
+  now exists in Korean ([README.ko.md](README.ko.md)).
 - Tom Clancy's Ghost Recon Wildlands is the property of Ubisoft. This project is not
   affiliated with, endorsed by, or supported by Ubisoft, and distributes none of
   their work.

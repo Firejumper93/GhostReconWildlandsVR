@@ -2,11 +2,30 @@
 
 **English** | [Deutsch](README.de.md) | [한국어](README.ko.md)
 
+> [!CAUTION]
+> **A NEWER GAME UPDATE (2026-08-13) BREAKS THIS RELEASE.** Ubisoft replaced
+> `GRW.exe` again on 2026-08-13. This is a *different, newer* executable than the
+> one v0.7.0 added support for. On it, **v0.8.5-alpha will not do anything.**
+>
+> This is not a crash and nothing is damaged. The mod checks the executable's
+> identity before touching it, does not recognise this one, installs nothing, and
+> logs `build pin: UNKNOWN GRW.exe binary`. **The game simply runs flat and
+> unmodified.** You do not need to uninstall anything.
+>
+> The new executable is `TimeDateStamp 6A75F2F4`, `SizeOfImage 18B09000`,
+> SHA256 `4b222677c5068d40104144af79f0e31fdc4d62d1a48f6ba07bc70b4ee167e56e`.
+>
+> Support for it is in development and **is not in any release yet.** There is no
+> ETA. Do not report "the mod does nothing" on this game version; it is expected.
+
 > [!WARNING]
 > **SINGLEPLAYER ONLY. Solo campaign, never co-op, never PvP, never matchmaking.**
-> The game ships Easy Anti-Cheat for multiplayer and this mod must never run in
-> that context. Playing offline (Steam offline mode or Ubisoft Connect offline) is
-> recommended while testing.
+> This is a hard rule of the project and it has not changed.
+>
+> Note that the 2026-08-13 title update **removed Easy Anti-Cheat** from the game.
+> That does not loosen this rule: the mod is built and tested for the solo
+> campaign only, and multiplayer remains out of scope. Playing offline (Steam
+> offline mode or Ubisoft Connect offline) is still recommended while testing.
 >
 > **THIS IS NOT A COMPLETE VR EXPERIENCE.** This mod is in the EARLY STAGES of
 > development and testing. The rendering side is genuinely good: stereo depth, a
@@ -278,8 +297,14 @@ is about the bullets following it, after which a public **beta** follows.
 
 ## Which version of the game do I need?
 
-**The current, updated game (August 2026 "Last Rites" patch) is verified, on Steam,
-in the headset.** Since that update, Steam and Ubisoft Connect ship the byte-identical
+> [!IMPORTANT]
+> **Not the newest one.** The 2026-08-13 title update replaced `GRW.exe` with a
+> build this release does not carry a table for, and on it the mod installs
+> nothing. See the caution at the top. Everything in this section describes the
+> game as it was *before* 2026-08-13.
+
+**The August 2026 "Last Rites" patch is verified, on Steam, in the headset.**
+Since that update, Steam and Ubisoft Connect ship the byte-identical
 executable, so Ubisoft Connect installs are covered by the very same verified
 address table (headset confirmation from a Ubisoft Connect user is still welcome).
 

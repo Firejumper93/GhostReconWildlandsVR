@@ -5,6 +5,37 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
+## Unreleased: the 2026-08-13 title update breaks v0.8.5-alpha
+
+**There is no release for this game version yet, and no ETA.** This entry exists
+so the failure is documented rather than reported as a bug.
+
+Ubisoft replaced `GRW.exe` again on 2026-08-13. This is a **different, newer**
+executable than the one v0.7.0 added support for, despite both being talked about
+as the August 2026 update:
+
+| | supported by v0.7.0+ | the 2026-08-13 build |
+|---|---|---|
+| TimeDateStamp | `6A692948` (compiled 2026-07-28) | `6A75F2F4` (compiled 2026-08-07) |
+| SizeOfImage | `18502000` | `18B09000` |
+
+**What you will see.** Nothing. The mod verifies the executable's identity before
+touching anything, does not recognise this build, installs nothing, and logs
+`build pin: UNKNOWN GRW.exe binary`. The game runs flat and unmodified. It does
+not crash and it does not damage anything, which is the behaviour this check
+exists to produce. You do not need to uninstall.
+
+**Why it is not a quick fix.** The mod locates engine functions at specific
+addresses inside `GRW.exe`. A new executable moves all of them, and every address
+has to be re-derived and re-verified against the new binary rather than guessed.
+That work is underway. Most of the table has been recovered; a few functions were
+recompiled enough that they have to be found again by hand, and at least one of
+them gates several features at once.
+
+**Easy Anti-Cheat was removed in this update.** Confirmed from inside the game
+process, not just from the files on disk. This does not change the mod's scope:
+it remains singleplayer only. Denuvo is unchanged.
+
 ## v0.8.5-alpha (2026-08-11, exclusive fullscreen fix)
 
 Targets a black screen after exactly one frame, confirmed from a tester's logs on

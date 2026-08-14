@@ -2,6 +2,23 @@
 
 [English](README.md) | **Deutsch** | [한국어](README.ko.md)
 
+> [!CAUTION]
+> **DAS SPIEL-UPDATE VOM 13.08.2026 MACHT DIESE VERSION UNWIRKSAM.** Ubisoft hat
+> `GRW.exe` erneut ersetzt. Das ist eine **neuere** Programmdatei als die, für die
+> v0.7.0 Unterstützung hinzugefügt hat. Auf dieser Spielversion tut v0.8.5-alpha
+> nichts.
+>
+> Das ist kein Absturz, und es wird nichts beschädigt. Der Mod prüft die Identität
+> der Programmdatei, erkennt diese nicht, installiert nichts und schreibt
+> `build pin: UNKNOWN GRW.exe binary` ins Protokoll. Das Spiel läuft dann einfach
+> normal und ohne VR weiter. Es muss nichts deinstalliert werden.
+>
+> Unterstützung dafür ist in Arbeit, aber in **keiner** Version enthalten, und es
+> gibt keinen Termin. Bitte nicht als Fehler melden.
+>
+> Das Update hat ausserdem Easy Anti-Cheat aus dem Spiel entfernt. An der Regel
+> ändert das nichts: Der Mod bleibt ausschliesslich für die Solo-Kampagne.
+
 > Diese Seite ist eine gekürzte deutsche Fassung. Sie enthält alle Warnungen, die
 > Installation, die Basiseinstellungen und die ehrliche Einordnung dessen, was der
 > Mod kann. Die ausführlichen Abschnitte (Roadmap, technische Funktionsweise,

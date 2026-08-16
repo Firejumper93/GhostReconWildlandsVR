@@ -599,7 +599,7 @@ int main(int argc, char** argv) {
         double avgMs = periodSum / (double)periodCount;
         logf("mean predicted display period: %.4f ms  (%.2f Hz)", avgMs, 1000.0 / avgMs);
         logf("");
-        logf("  NOTE: the project rules targets 72 Hz. Under the reference mod's AFR with");
+        logf("  NOTE: the project targets 72 Hz. Under the reference mod's AFR with");
         logf("        NO reprojection, the GAME would have to render at twice this");
         logf("        rate, %.0f fps, which is why stale-eye reprojection is a", 2.0 * (1000.0 / avgMs));
         logf("        required feature rather than an optimisation.");

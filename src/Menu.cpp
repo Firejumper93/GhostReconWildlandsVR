@@ -1,6 +1,8 @@
 #include "Menu.h"
 #include "D3D11Hook.h"
+#include "GameBuild.h"   // build 86: the pin, shown first on the Status page
 #include "Log.h"
+#include "VRMirror.h"    // build 86: live barrel-aim state for the panel
 
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
@@ -122,6 +124,45 @@ Setting g_set[] = {
      "leaves the game's own setting alone. 1 pairs the two eyes more tightly "
      "in time; put it back to 0 if it costs frame rate.",
      0.0f, 0.0f, 4.0f, false, 0.0f, false},
+
+    // Build 86: the weapon and aim rows. These are the settings a headset test
+    // actually needs to change, and until now every one of them required
+    // taking the headset off and editing grwxr.cfg in a text editor. That is
+    // a large part of why the two-handed hold and the barrel aim have both
+    // sat built-but-untested across several sessions.
+    {"aim_barrel", "Bullets follow the barrel",
+     "0 off. 1 steers only while you hold the fire trigger. 2 keeps the gun's "
+     "aim live all the time, which is the one that behaves like a real weapon, "
+     "because a real gun is already pointing where it points before you pull. "
+     "Needs the motion-controlled weapon switched on.",
+     0.0f, 0.0f, 2.0f, false, 0.0f, false},
+
+    {"wgun_twohand", "Two-handed hold",
+     "Your rear hand sets where the gun is, your front hand sets where it "
+     "points, like a real rifle. Off means the rear hand alone aims it.",
+     1.0f, 0.0f, 1.0f, true, 1.0f, false},
+
+    {"wgun_pos_clamp", "Gun reach (metres)",
+     "How far the gun may travel from its resting anchor before it stops "
+     "following your hand. Raise it if the gun feels tethered and will not "
+     "come up to your eye; lower it if it wanders too far.",
+     0.60f, 0.10f, 2.00f, false, 0.60f, false},
+
+    {"wgun_pos_scale", "Gun travel scale",
+     "Multiplies how far the gun moves for a given hand movement. 1.0 is "
+     "one-to-one with your real hand. Below 1 damps it, above 1 exaggerates.",
+     1.0f, 0.25f, 2.0f, false, 1.0f, false},
+
+    {"wgun_roll_deg", "Gun roll trim (degrees)",
+     "Rotates the weapon about its own barrel. Use this if the gun is canted "
+     "or upside down; the usual corrections are 90 or 180.",
+     0.0f, -180.0f, 180.0f, false, 0.0f, false},
+
+    {"aim_ads", "Trigger also aims down sights",
+     "OFF gives you real hip fire, with aiming moved to the left trigger where "
+     "the game normally puts it. ON is the older behaviour where a half pull "
+     "raises the sights, which means every shot goes through ADS.",
+     0.0f, 0.0f, 1.0f, true, 0.0f, false},
 };
 constexpr int kSettingCount = (int)(sizeof(g_set) / sizeof(g_set[0]));
 
@@ -316,6 +357,67 @@ void draw_captures_page() {
 }
 
 void draw_status_page() {
+    // Build 86: the game-build pin, first, because every other line on this
+    // page is meaningless if the mod did not recognise the exe. After the
+    // 2026-08-13 update this was the difference between "the feature does not
+    // work" and "nothing installed at all", and that distinction previously
+    // lived only in the log.
+    const auto* gb = gamebuild::get();
+    if (gb) {
+        ImGui::Text("Game build       : %s  (recognised)", gb->name);
+    } else {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                           "Game build       : NOT RECOGNISED");
+        ImGui::TextWrapped(
+            "The game has been updated to a binary this mod has not been "
+            "taught yet, so nothing that depends on engine addresses has "
+            "installed and the game is running unmodified. Nothing below "
+            "will do anything until that is fixed.");
+        ImGui::Separator();
+    }
+
+    // Anti-cheat, read from the process rather than assumed. Ubisoft removed
+    // EasyAntiCheat in the 2026-08-13 update; this is the one place that can
+    // confirm it from inside, which is stronger than any external check.
+    ImGui::Text("EasyAntiCheat    : %s",
+                GetModuleHandleW(L"EasyAntiCheat_x64.dll") ? "LOADED"
+                                                           : "not loaded");
+    ImGui::Separator();
+
+    // Barrel aim. The three questions a test has to answer, in order: did the
+    // loop run at all, did it use the real barrel or fall back to the raw
+    // controller ray, and is the error converging toward zero.
+    const vr::BarrelStatus b = vr::barrel_status();
+    const char* mode = b.mode == 2 ? "2 (always on)"
+                     : b.mode == 1 ? "1 (only while firing)"
+                                   : "0 (off)";
+    ImGui::Text("Bullets follow   : %s", mode);
+    if (b.mode != 0) {
+        const char* src = b.src == 1 ? "the real barrel"
+                        : b.src == 2 ? "CONTROLLER RAY (fallback)"
+                                     : "nothing yet";
+        ImGui::Text("  steering from  : %s", src);
+        ImGui::Text("  frames driven  : %u", b.frames);
+        ImGui::Text("  last error     : yaw %+.2f  pitch %+.2f deg",
+                    b.err_yaw_deg, b.err_pitch_deg);
+        if (b.nodir || b.noview || b.overcap) {
+            ImGui::Text("  skipped        : no-direction %u  no-view %u  "
+                        "over-limit %u", b.nodir, b.noview, b.overcap);
+        }
+        if (b.src == 2) {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                "The motion-controlled weapon is not publishing a barrel, so "
+                "this is steering off the raw controller ray. Turn the weapon "
+                "on, or this is not testing what you think it is.");
+        }
+        if (b.frames == 0) {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                "Armed, but it has never actually driven the aim. That is a "
+                "different problem from it running and not helping.");
+        }
+    }
+    ImGui::Separator();
+
     const auto& st = d3d11::state();
     ImGui::Text("Frames presented : %llu", st.frames);
     ImGui::Text("Backbuffer       : %u x %u  (format %d)", st.width, st.height, (int)st.format);
@@ -387,7 +489,7 @@ bool init(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     // NEVER let ImGui write its own ini. It would land beside the game exe,
-    // and the default project rule is that we place nothing in the install
+    // and the project's default rule is that we place nothing in the install
     // except the proxy and the GRWVR folder.
     io.IniFilename  = nullptr;
     io.LogFilename  = nullptr;

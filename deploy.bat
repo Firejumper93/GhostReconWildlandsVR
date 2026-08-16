@@ -56,10 +56,17 @@ REM Everything in docs/RE-notes.md is pinned to this exact build. Steam is set
 REM to auto-update and Ubisoft Connect auto-patches, so the exe CAN change under
 REM us. If it does, every RVA, signature and offset we have derived is suspect
 REM and we must know BEFORE we spend a night debugging against a moved target.
-REM 2026-08-07: repinned to the "Last Rites" update exe (Steam and Ubisoft
-REM Connect ship the identical binary, TimeDateStamp 6A692948). Previous pin
-REM 2586065396... is archived as binaries\GRW.exe.steam-2017pin.
-set "PINNED=56791ff5a6c213a77eebedaeaee3026d63b70806071358ce96abd3ed7947ade7"
+REM 2026-08-07: repinned to TimeDateStamp 6A692948. NOTE: that comment called
+REM it "Last Rites", which was wrong. 6A692948 compiles to 2026-07-28; it is
+REM the late-July update, not Last Rites. Archived as
+REM binaries\GRW.exe.ubistore-2026aug-update.
+REM 2026-08-14: repinned again to the ACTUAL Last Rites build, compiled
+REM 2026-08-07 15:00 UTC (TimeDateStamp 6A75F2F4, SizeOfImage 18B09000) and
+REM shipped to Steam on 2026-08-13. That update also stripped EasyAntiCheat.
+REM Previous pins archived as binaries\GRW.exe.steam-2017pin and
+REM binaries\GRW.exe.ubistore-2026aug-update; this one as
+REM binaries\GRW.exe.steam-2026aug-lastrites.
+set "PINNED=4b222677c5068d40104144af79f0e31fdc4d62d1a48f6ba07bc70b4ee167e56e"
 certutil -hashfile "%GAME%\GRW.exe" SHA256 | findstr /i /c:"%PINNED%" >nul
 if errorlevel 1 goto err_exe_changed
 echo     GRW.exe matches the pinned build.
@@ -122,8 +129,9 @@ echo ***********************************************************************
 echo  *** GRW.exe NO LONGER MATCHES THE PINNED BUILD ***
 echo.
 echo  The game has been updated or verified by Steam / Ubisoft Connect.
-echo  Every RVA, offset and signature in docs/RE-notes.md was derived from
-echo  build 2586065396... and is now UNTRUSTWORTHY.
+echo  Every RVA, offset and signature is pinned per build in src/GameBuild.cpp
+echo  and the address table for THIS exe is now UNTRUSTWORTHY.
+echo  Currently pinned: %PINNED%
 echo.
 echo  Do NOT deploy or interpret any test result until this is resolved.
 echo.

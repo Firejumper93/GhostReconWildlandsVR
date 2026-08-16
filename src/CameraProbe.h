@@ -116,6 +116,19 @@ void set_wgun(int mode, float dz);
 // gun across the world in a single frame). cfg wgun_smooth, wgun_maxstep_deg.
 void set_wgun_filter(float smooth, float maxstep_deg);
 
+// 2026-08-13. TWO-HANDED AIM: the barrel points from the rear hand toward the
+// front hand instead of along the rear controller's own forward, blended in by
+// hand separation so it degrades to the one-handed behaviour when the hands
+// come together (where a two-point direction goes noisy). cfg wgun_twohand.
+//
+// ROLL: twisting the wrist twists the gun about its barrel. Applied as a
+// rotation about the aim axis, which fixes that axis exactly, so roll cannot
+// move the point of aim. wgun_roll_deg trims the unknown constant offset
+// between the model's up axis and the controller's. cfg wgun_roll,
+// wgun_roll_deg.
+void set_wgun_twohand(int on);
+void set_wgun_roll(int on, float trim_deg);
+
 // Build 81: gun POSITION rides the controller, so the weapon can be raised to
 // the eye instead of pivoting where the animation left it. Applies only in
 // wgun mode 3 and is OFF by default, so the verified rotation cannot regress
@@ -177,6 +190,22 @@ void cycle_wnode_axis();
 // from the first-person state each frame; off restores engine behaviour
 // within a frame. Safe from any thread; a no-op if the hook did not install.
 void set_head_hide(bool on);
+
+// Build 96: zero the head-compose counters.
+//
+// The drain's "head compose:" line gates on frames != 0, and the counters are
+// cumulative for the life of the process. So once the camera write has run at
+// all, turning it OFF leaves that line printing its last totals forever, which
+// reads as "still composing" when nothing is. That is exactly what
+// grwxr-13140.log did at 19:52 onward: 41067 writes over 13695 frames, frozen,
+// for a full minute after the write had stopped.
+//
+// The Numpad 0 toggle calls this on every press, for the same reason
+// cycle_aim_barrel resets the barrel counters: the question the log answers is
+// about the state just selected, not about a total carried over from the
+// previous one. After a toggle to OFF the line becomes the idle branch, which
+// names the consequence out loud.
+void reset_head_telemetry();
 
 }  // namespace camera
 }  // namespace grwxr

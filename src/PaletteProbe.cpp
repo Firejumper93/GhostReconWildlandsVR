@@ -254,8 +254,39 @@ void dump() {
 
 }  // namespace
 
+// The draw detours reroute EVERY DrawIndexed/Draw/... the game makes through
+// our trampolines in d3d11.dll. They exist only for the palette and
+// weapon-draw research captures, the VR mirror does not need them, and their
+// per-draw cost has never been measured. They are the highest-risk thing the
+// mod does to the game's own render thread, so from v0.8.2 they are OPT-IN:
+// this reads the one cfg key directly (the cfg is not parsed this early), and
+// with it off NOTHING is detoured. Default OFF. This is also the first thing
+// to turn back on when chasing a per-frame render hang, since it is the only
+// hook that touches the game's draw path unconditionally.
+bool draw_probes_requested() {
+    const std::wstring path = log::data_dir() + L"\\grwxr.cfg";
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return false;
+    char line[256];
+    bool on = false;
+    while (fgets(line, sizeof(line), f)) {
+        float v = 0.0f;
+        if (sscanf_s(line, " draw_probes = %f", &v) == 1) on = v > 0.0f;
+    }
+    fclose(f);
+    return on;
+}
+
 bool install(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     if (g_installed || !ctx) return g_installed;
+
+    if (!draw_probes_requested()) {
+        LOG_INFO("pal: draw probes are OFF (draw_probes=0 or absent in "
+                 "grwxr.cfg). The game's draw calls are NOT detoured; this is "
+                 "the shipping default. Set draw_probes=1 only for palette or "
+                 "weapon-draw research.");
+        return false;
+    }
 
     // Build 36: code detours in d3d11.dll, not vtable patches. Build 33.1
     // patched two context objects' HEAP vtables and counted zero draws in 81

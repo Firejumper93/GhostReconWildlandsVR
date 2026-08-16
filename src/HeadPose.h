@@ -134,6 +134,67 @@ bool fp_head_anchor();
 void set_fp_head_eye(float meters);
 float fp_head_eye();
 
+// Build 89: route the camera pose write through the `selector` camera target
+// when `on_calc_mvp` is not derived for this binary (cfg key
+// cam_selector_pose, default OFF).
+//
+// write_pose_head is what composes the headset rotation onto the camera, what
+// applies the per-eye IPD offset, and what captures the base transform that
+// first person anchors against. It has exactly one caller, the on_calc_mvp
+// recorder, so on a binary missing that row the headset is mono and the FP
+// toggle does nothing. The selector receives the same camera object and is
+// hooked; whether it runs early enough in the frame for the write to survive
+// is [UNKNOWN] and is what the flag exists to test.
+void set_cam_selector_pose(bool on);
+bool cam_selector_pose();
+
+// Build 90: does the camera write compose the headset rotation onto the
+// camera basis, or does it only move the viewpoint (cfg key cam_pose_rot,
+// default on, so a build that derives on_calc_mvp keeps its designed
+// behaviour without a cfg change).
+//
+// Off is the answer to "the camera fights". Head look already reaches the
+// view through the SetYaw/SetPitch absorb-and-inject path, so composing here
+// is a second authority on one channel; the flat first-person mod writes the
+// pose's fourth row only, for the same reason. With this off the write does
+// nothing but place the viewpoint at the head bone and offset it per eye.
+void set_cam_pose_rot(bool on);
+bool cam_pose_rot();
+
+// Build 91: THE VIEWPOINT PLACEMENT TRIO, ported from this author's flat
+// first-person mod (E:\GRW-FP\flat\src\FpCamera.cpp), where each has a measured
+// reason behind it. The VR camera write had none of them and took the animated
+// head bone raw, three times a frame.
+//
+// fp_fwd    metres the eyes sit FORWARD of the head joint, which is at the base
+//           of the skull. HORIZONTALIZED, so this frame's pitch never moves
+//           this frame's position, and when the view looks near straight up or
+//           down (where the horizontal forward collapses) the last good forward
+//           is reused rather than dropping the offset and leaving the viewpoint
+//           on the bare joint, inside the head mesh.
+// fp_clamp  metres the viewpoint may stray horizontally from the character
+//           origin, so an animation that whips the head (vault, melee) cannot
+//           whip the view. 0.20 was measured TOO TIGHT: the sprint lean held
+//           the head outside it continuously, and a clamped sustained lean
+//           parks the camera inside the torso.
+// fp_smooth / fp_smooth_z  EMA time constants in ms, horizontal and vertical.
+//           Locomotion bobs the head bone hard. The filter runs in
+//           ORIGIN-RELATIVE space, not world space: a world-space EMA lags a
+//           moving target by tau times velocity, about 0.3 m at sprint, which
+//           puts the camera back inside the torso. The origin carries the whole
+//           locomotion velocity and is already smooth, so filtering only the
+//           bone's deviation from it removes the bob with zero velocity lag,
+//           and teleports pass through instantly because they move the origin
+//           rather than the deviation.
+void set_fp_fwd(float meters);
+float fp_fwd();
+void set_fp_clamp(float meters);
+float fp_clamp();
+void set_fp_smooth(float ms);
+float fp_smooth();
+void set_fp_smooth_z(float ms);
+float fp_smooth_z();
+
 // The player's Head node index inside the rig's pose buffer, resolved on the
 // drain thread (1 Hz binary search over the rig name map) and consumed by the
 // camera write on the engine thread. 0xFFFF means "not resolved": the camera
@@ -193,6 +254,15 @@ int  eye_tag_depth();         // diagnostic: current ring occupancy
 // stereo routing cannot be trusted.
 unsigned long long pops_tagged();
 unsigned long long pops_mono();
+
+// Build 93: pushes dropped for a full ring. Any nonzero value means the eye
+// parity flipped and stayed flipped, because the producer toggles the eye
+// BEFORE it pushes. Never nonzero in any run measured so far.
+unsigned long long tag_drops();
+
+// Build 93: resynchronise the ring at session re-begin, so a headset doff does
+// not leave one stale tag in flight and swap the eyes for the rest of the run.
+void reset_eye_tags();
 
 // Build 19: VR AIM INJECTION accounting. The render thread injects head
 // yaw/pitch deltas into the engine's absolute aim pair (CameraProbe) and

@@ -275,6 +275,13 @@ volatile uint32_t g_cr_ok     = 0;
 // published from the same pass so origin and direction can never disagree.
 volatile float    g_cr_pos[3] = {0, 0, 0};
 volatile uint32_t g_cr_pos_ok = 0;
+// 2026-08-13: the LEFT controller's position, for the two-handed weapon, and
+// the RIGHT controller's up vector, which carries the roll the aim ray throws
+// away (a direction vector has no twist about itself).
+volatile float    g_cl_pos[3] = {0, 0, 0};
+volatile uint32_t g_cl_pos_ok = 0;
+volatile float    g_cr_up[3]  = {0, 0, 0};
+volatile uint32_t g_cr_up_ok  = 0;
 volatile uint32_t g_cr_armed  = 0;           // cfg bullet_ctrl
 volatile uint32_t g_fly_on    = 0;           // this flight is being relocated
 volatile float    g_fly_org[3]   = {};       // ray origin = spawn origin
@@ -1101,6 +1108,45 @@ bool view_fwd(float out[3]) {
     return true;
 }
 
+// Build 84: the barrel direction, published by grwxr_wgun_apply after its
+// filter. See AimTrace.h for why this is not the same thing as ctrl_ray.
+//
+// Freshness is a GENERATION COUNTER rather than a timestamp: no clock call on
+// a path entered 144 times a second, and it answers the only question the
+// reader has, which is "did the weapon writer run since I last looked". With
+// wgun = 0 nothing publishes, the counter stands still, and the reader falls
+// back instead of aiming at a barrel direction from minutes ago.
+volatile uint32_t g_bd_gen = 0;
+float             g_bd_dir[3] = {};
+
+void set_barrel_dir(const float dir[3], bool ok) {
+    if (!ok || !dir) return;
+    g_bd_dir[0] = dir[0];
+    g_bd_dir[1] = dir[1];
+    g_bd_dir[2] = dir[2];
+    // Bumped AFTER the vector, so a reader that sees a new generation is
+    // reading the vector that came with it, not the one before.
+    _ReadWriteBarrier();
+    g_bd_gen = g_bd_gen + 1;
+}
+
+bool barrel_dir(float out[3]) {
+    // Starts at 0, which is also the generation before anything has ever been
+    // published. So "wgun has never run" reads as stale and returns false,
+    // rather than handing back the zero vector the array was born with. That
+    // zero would have passed a naive length check nowhere but would have gone
+    // straight into an atan2 as a direction.
+    static uint32_t s_seen = 0;
+    if (!out) return false;
+    const uint32_t g = g_bd_gen;
+    if (g == s_seen) return false;        // wgun has not run since the last read
+    s_seen = g;
+    out[0] = g_bd_dir[0];
+    out[1] = g_bd_dir[1];
+    out[2] = g_bd_dir[2];
+    return true;
+}
+
 void set_ctrl_ray(const float dir[3], bool ok) {
     if (ok && dir) {
         g_cr_dir[0] = dir[0];
@@ -1138,6 +1184,46 @@ bool ctrl_pos(float out[3]) {
     out[0] = g_cr_pos[0];
     out[1] = g_cr_pos[1];
     out[2] = g_cr_pos[2];
+    return true;
+}
+
+// 2026-08-13: the LEFT controller's position and the RIGHT controller's up
+// vector, published from the same pass and the same basis as the two above, so
+// a two-handed weapon can never be assembled out of two different instants.
+// Same contract as the rest of this file: ok=false means "not tracked THIS
+// frame" and the last good value is deliberately NOT held, so a consumer sees
+// a dropout rather than a stale pose it cannot distinguish from a real one.
+void set_ctrl_pos_l(const float p[3], bool ok) {
+    if (ok && p) {
+        g_cl_pos[0] = p[0];
+        g_cl_pos[1] = p[1];
+        g_cl_pos[2] = p[2];
+    }
+    g_cl_pos_ok = ok ? 1u : 0u;
+}
+
+bool ctrl_pos_l(float out[3]) {
+    if (!g_cl_pos_ok || !out) return false;
+    out[0] = g_cl_pos[0];
+    out[1] = g_cl_pos[1];
+    out[2] = g_cl_pos[2];
+    return true;
+}
+
+void set_ctrl_up(const float u[3], bool ok) {
+    if (ok && u) {
+        g_cr_up[0] = u[0];
+        g_cr_up[1] = u[1];
+        g_cr_up[2] = u[2];
+    }
+    g_cr_up_ok = ok ? 1u : 0u;
+}
+
+bool ctrl_up(float out[3]) {
+    if (!g_cr_up_ok || !out) return false;
+    out[0] = g_cr_up[0];
+    out[1] = g_cr_up[1];
+    out[2] = g_cr_up[2];
     return true;
 }
 
@@ -1247,6 +1333,7 @@ bool shot_sites_ready() {
 }
 
 void set_firing(bool held) { g_firing = held ? 1u : 0u; }
+bool firing()              { return g_firing != 0u; }
 
 void uninstall() {
     g_getyaw_hook.restore();

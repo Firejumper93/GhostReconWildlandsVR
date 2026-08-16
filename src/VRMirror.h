@@ -54,5 +54,66 @@ void drain_input();
 // hotkeys). Init thread only: it does file I/O.
 void poll_config();
 
+// Build 86: live barrel-aim state for the in-headset panel.
+//
+// This exists because the tester is IN A HEADSET. A test that requires reading
+// grwxr.log or editing a cfg file in a text editor is not a test he can run,
+// and every barrel-aim result so far has been unobtainable for exactly that
+// reason. The panel needs the same three facts the log line carries: did the
+// loop run, did it use the real barrel or the fallback, and is the error
+// converging.
+//
+// Plain relaxed reads of the atomics the aim block already writes. No lock and
+// no allocation; called once per panel frame, never from a per-draw path.
+struct BarrelStatus {
+    int      mode;          // cfg aim_barrel: 0 off, 1 trigger-gated, 2 always
+    int      src;           // 1 = real barrel, 2 = ctrl_ray fallback, 0 = none
+    unsigned frames;        // frames the loop actually drove the aim
+    unsigned nodir;         // wanted to drive, had no direction at all
+    unsigned noview;        // wanted to drive, engine aim unreadable
+    unsigned overcap;       // error exceeded aim_barrel_max and was refused
+    float    err_yaw_deg;   // last applied error, degrees
+    float    err_pitch_deg;
+};
+BarrelStatus barrel_status();
+
+// Build 86: headset-reachable hotkeys, same pattern as the existing Numpad 4
+// and Numpad 5 cyclers.
+//
+// The panel can DISPLAY these but cannot change them: menu::set_pointer has no
+// caller, so the panel has no working input device. Until that is wired, a
+// key press is the only way to change a setting without taking the headset
+// off and editing grwxr.cfg in a text editor, and both of these settings are
+// ones a test needs to flip back and forth to mean anything.
+//
+// Both targets are atomics that the aim path already reads with relaxed
+// ordering, so an init-thread write is safe. Each logs its new state.
+void cycle_aim_barrel();   // Numpad 1: 0 off -> 1 while firing -> 2 always
+void toggle_aim_ads();     // Numpad 3: trigger-also-aims on/off (hip fire)
+
+// Build 96: Numpad 0 toggles cam_selector_pose, the camera pose write.
+//
+// This is the control for the gun jitter reported 2026-08-15. The gun's world
+// origin is camera::base_frame's position, which is Camera+0x000 row 3, and
+// since build 89 we write that same row about three times a frame. Turning the
+// write off makes the row single valued again, which is what build 88 (the
+// confirmed motion control) ran on. If the jitter goes with it, the coupling is
+// the cause; if it stays, the camera write is exonerated.
+//
+// It is a hotkey and not a cfg key only because the A/B has to be run WHILE
+// walking, in the headset, which a text editor cannot do.
+//
+// TWO WARNINGS, both earned. First, hazard 24 says tuning belongs in the cfg;
+// this is a diagnostic toggle for an open investigation, not tuning, and it
+// comes back out with the investigation (rule 6). Second, and this is the
+// NUMPAD 5 lesson from 2026-08-15: this key turns OFF first person and stereo
+// separation, so a stray press degrades the mod while the tester is blind. Two
+// mitigations, both deliberate: Numpad 0 is the double-width key at the bottom
+// of the pad, unmistakable by feel and nowhere near the 1 / 3 / 4 block in
+// constant use, and every press resets the head-compose counters so the very
+// next "head compose:" line states which state is live instead of printing a
+// frozen total from the previous one.
+void toggle_cam_pose();    // Numpad 0: camera pose write (first person, stereo)
+
 }  // namespace vr
 }  // namespace grwxr

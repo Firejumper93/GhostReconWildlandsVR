@@ -269,7 +269,8 @@ DWORD WINAPI init_thread(LPVOID) {
         // failure the panel exists to remove, and it is worse when the cause is
         // ours.
         {
-            static bool f1_prev = false, np4_prev = false, np5_prev = false;
+            static bool f1_prev = false, np4_prev = false;
+            static bool np1_prev = false, np3_prev = false, np0_prev = false;
             for (int slice = 0; slice < 20; ++slice) {
                 Sleep(50);
                 const bool f1 = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
@@ -287,10 +288,55 @@ DWORD WINAPI init_thread(LPVOID) {
                 if (np4 && !np4_prev) grwxr::aimtrace::cycle_bullet_yaw();
                 np4_prev = np4;
 
-                // Build 78: step the gun-root bone (off / node 8 / node 10).
-                const bool np5 = (GetAsyncKeyState(VK_NUMPAD5) & 0x8000) != 0;
-                if (np5 && !np5_prev) grwxr::camera::cycle_wgun();
-                np5_prev = np5;
+                // Build 93: NUMPAD 5 IS RETIRED, for the same reason NUMPAD 4
+                // was retired in build 82, and rule 6 (revert failed
+                // experiments rather than leaving dormant switches).
+                //
+                // It cycled the gun-root bone through off / node 8 / node 10 /
+                // rotate, a build 78 A/B that is long settled: the mount is
+                // node 10 and the mode is 3, both headset-verified, and node 8
+                // was measured to do nothing at all. Three of the four
+                // positions this key could select were retired states, and one
+                // of them silently disarms the headline feature of the mod.
+                //
+                // It did exactly that on 2026-08-15. Five presses landed inside
+                // one second at 04:27:19 while the tester was working the keys
+                // around it, the cycle stopped on mode 0, and the weapon writer
+                // sat disarmed for the rest of the session: `wgun: idle
+                // node=-1`, rots frozen at 2164 while calls climbed past
+                // 690,000. It presented as "the rotation and control from the
+                // front hand is gone" and read as a regression in that day's
+                // camera work, which it was not. The only feedback the mod gave
+                // was a log line, and the tester was wearing a headset.
+                //
+                // NUMPAD 5 also sits in the middle of the block he uses
+                // constantly: 1 cycles barrel aim, 3 toggles ADS, 4 cycles
+                // bullet yaw, 8 toggles first person. cfg `wgun` still selects
+                // the mode for anyone who wants the old A/B, and it hot-reloads
+                // in about a second, so nothing is actually lost here.
+
+                // Build 86: the two settings a barrel-aim test has to flip
+                // back and forth. They were cfg-only, which meant every A/B
+                // needed the headset off and a text editor, which is why the
+                // feature has never actually been tested.
+                const bool np1 = (GetAsyncKeyState(VK_NUMPAD1) & 0x8000) != 0;
+                if (np1 && !np1_prev) grwxr::vr::cycle_aim_barrel();
+                np1_prev = np1;
+
+                const bool np3 = (GetAsyncKeyState(VK_NUMPAD3) & 0x8000) != 0;
+                if (np3 && !np3_prev) grwxr::vr::toggle_aim_ads();
+                np3_prev = np3;
+
+                // Build 96: NUMPAD 0 toggles the camera pose write, the
+                // control for the gun jitter. It is the double-width key at
+                // the bottom of the pad, deliberately: it is the one key on
+                // the numpad that cannot be hit by mistake while feeling for
+                // the 1 / 3 / 4 block, and unlike NUMPAD 5 it announces its
+                // consequence and resets the counters that grade it. See
+                // VRMirror.h.
+                const bool np0 = (GetAsyncKeyState(VK_NUMPAD0) & 0x8000) != 0;
+                if (np0 && !np0_prev) grwxr::vr::toggle_cam_pose();
+                np0_prev = np0;
             }
         }
         grwxr::d3d11::drain_capture_log();

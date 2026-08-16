@@ -92,11 +92,47 @@ bool ctrl_ray(float out[3]);
 void set_ctrl_pos(const float p[3], bool ok);
 bool ctrl_pos(float out[3]);
 
+// 2026-08-13, for the two-handed weapon.
+//
+// ctrl_pos_l: the LEFT controller's position, engine world space, from the
+// same pass and basis as the right. With both hands in one space the weapon's
+// direction can be the line between them, which is how a real long gun is
+// actually pointed: the rear hand is the pivot, the front hand aims it.
+//
+// ctrl_up: the RIGHT controller's up vector. The aim ray is a direction, and a
+// direction has no twist about itself, so roll is thrown away the moment the
+// controller quaternion is collapsed to a ray. This carries it back. Roll is
+// taken from the REAR hand deliberately: it is the hand that actually rolls a
+// weapon, and it keeps roll independent of hand separation.
+void set_ctrl_pos_l(const float p[3], bool ok);
+bool ctrl_pos_l(float out[3]);
+void set_ctrl_up(const float u[3], bool ok);
+bool ctrl_up(float out[3]);
+
 // Build 72: the direction the GAME is aiming, engine world space, published in
 // the same per-frame pass as the controller ray. The weapon rotation is the
 // delta between the two, so it needs no knowledge of the engine's axis order.
 void set_view_fwd(const float dir[3], bool ok);
 bool view_fwd(float out[3]);
+
+// Build 84: WHERE THE BARREL ACTUALLY POINTS, engine world space.
+//
+// This is not the controller ray. It is the FINAL filtered, two-hand-blended,
+// rate-limited target that grwxr_wgun_apply aligns the gun-root bone's +Y onto,
+// published from that function after the filter. After the swing the barrel IS
+// this vector, so it is the only direction in the process that is guaranteed to
+// match what the player sees the gun doing.
+//
+// It exists so the aim and the drawn weapon come from ONE source. Deriving the
+// aim from ctrl_ray instead would reintroduce exactly the divergence class that
+// produced the tester's ADS complaint: two consumers filtering the same input
+// differently and drifting apart.
+//
+// Stale-safe: published every wgun call, and the reader checks freshness by
+// generation, because with wgun = 0 nothing writes it and a held stale barrel
+// would aim the gun at where it pointed minutes ago.
+void set_barrel_dir(const float dir[3], bool ok);
+bool barrel_dir(float out[3]);
 
 // cfg bullet_ctrl: 1 = every player round is relocated, frame by frame,
 // onto the controller ray captured at its spawn. The engine keeps drop and
@@ -170,6 +206,11 @@ bool shot_sites_ready();
 // which is the merged Touch-or-pad value. Marks the shot window that the
 // fire= column counts. One plain store; no allocation, no lock.
 void set_firing(bool held);
+
+// Build 84: read it back. This is the merged gamepad's own fire state, so it
+// is true for the Touch trigger and for a real pad alike, and it crosses at
+// the same threshold the GAME uses rather than at one this mod invented.
+bool firing();
 
 // Restores both stubs.
 void uninstall();

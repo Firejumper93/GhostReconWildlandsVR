@@ -271,6 +271,9 @@ DWORD WINAPI init_thread(LPVOID) {
         {
             static bool f1_prev = false, np4_prev = false;
             static bool np1_prev = false, np3_prev = false, np0_prev = false;
+            static bool ndiv_prev = false, nmul_prev = false, nadd_prev = false;
+            static bool kins_prev = false, kpgu_prev = false;
+            static bool kpgd_prev = false, kdel_prev = false;
             for (int slice = 0; slice < 20; ++slice) {
                 Sleep(50);
                 const bool f1 = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
@@ -337,6 +340,43 @@ DWORD WINAPI init_thread(LPVOID) {
                 const bool np0 = (GetAsyncKeyState(VK_NUMPAD0) & 0x8000) != 0;
                 if (np0 && !np0_prev) grwxr::vr::toggle_cam_pose();
                 np0_prev = np0;
+
+                // Build 97 (user directive): the settings an open test asks him
+                // to change are reachable from inside the headset. The
+                // arithmetic row and the tall + key, because none of them
+                // borders a live digit key. See VRMirror.h.
+                const bool ndiv = (GetAsyncKeyState(VK_DIVIDE) & 0x8000) != 0;
+                if (ndiv && !ndiv_prev) grwxr::vr::step_ipd_scale(-1);
+                ndiv_prev = ndiv;
+
+                const bool nmul = (GetAsyncKeyState(VK_MULTIPLY) & 0x8000) != 0;
+                if (nmul && !nmul_prev) grwxr::vr::step_ipd_scale(+1);
+                nmul_prev = nmul;
+
+                const bool nadd = (GetAsyncKeyState(VK_ADD) & 0x8000) != 0;
+                if (nadd && !nadd_prev) grwxr::vr::toggle_cam_pose_rot();
+                nadd_prev = nadd;
+
+                // Build 99: THE TUNER. One key selects, two step, one resets,
+                // so no future setting ever needs another key. The six-key
+                // island above the arrows: findable by feel, and nowhere near
+                // the numpad, so nothing here can be hit while reaching for
+                // first person or the barrel aim. See VRMirror.h.
+                const bool kins = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
+                if (kins && !kins_prev) grwxr::vr::tuner_cycle();
+                kins_prev = kins;
+
+                const bool kpgu = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
+                if (kpgu && !kpgu_prev) grwxr::vr::tuner_step(+1);
+                kpgu_prev = kpgu;
+
+                const bool kpgd = (GetAsyncKeyState(VK_NEXT) & 0x8000) != 0;
+                if (kpgd && !kpgd_prev) grwxr::vr::tuner_step(-1);
+                kpgd_prev = kpgd;
+
+                const bool kdel = (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
+                if (kdel && !kdel_prev) grwxr::vr::tuner_reset();
+                kdel_prev = kdel;
             }
         }
         grwxr::d3d11::drain_capture_log();

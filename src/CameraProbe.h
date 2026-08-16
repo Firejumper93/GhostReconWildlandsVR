@@ -67,6 +67,13 @@ int  aim_arm(int axis, float delta_engine_units);
 //
 // The read is deliberately unsynchronized, so a caller on another thread can
 // see a position torn between two frames. That error is centimetres.
+//
+// BUILD 98: BOTH OF THESE NOW PREFER THE PER-FRAME ENGINE LATCH. Read the long
+// comment above base_frame_engine in CameraProbe.cpp before changing either.
+// The short version: since build 89 we WRITE Camera+0x000 row 3 about three
+// times a frame, so reading it live returns whichever of two values, 1.9 m
+// apart, the read happened to land between. Everything these two feed is ours,
+// and all of it wants the engine's own camera, not the row we are editing.
 bool base_pos(float out[3]);
 
 // Build 45: the player camera's full world frame, read from the camera
@@ -137,6 +144,42 @@ void set_wgun_roll(int on, float trim_deg);
 // every possible tracking failure; smooth is the one-pole weight per call.
 // cfg wgun_pos, wgun_pos_scale, wgun_pos_clamp, wgun_pos_smooth.
 void set_wgun_pos(int on, float scale, float clamp_m, float smooth);
+
+// Build 99: WHERE THE GUN SITS IN YOUR HANDS.
+//
+// Build 81 put the gun ROOT on the right controller. The root is not the grip:
+// it is wherever the model's origin happens to be, so the weapon sits at some
+// fixed but arbitrary offset from your fist and no amount of aiming tuning
+// fixes it. These are that offset, in the WEAPON'S OWN frame, so they rotate
+// with the gun and mean the same thing at any angle.
+//
+//   fwd  metres along the barrel (+Y, [VERIFIED] build 79 as the bore axis).
+//        POSITIVE pushes the gun forward through your hand, so your hand ends
+//        up further back along the weapon.
+//   lat  metres along the weapon's +X.
+//   up   metres along the weapon's +Z.
+//
+// `two` is the front-hand grip, 0..1, and it is a different kind of thing. With
+// both hands tracked the rear hand fixes position and the front hand fixes
+// direction, so the handguard already points AT your left hand but is not
+// necessarily AT it: real hands are not always the weapon's own spacing apart.
+// This slides the weapon ALONG ITS OWN BARREL until the measured handguard
+// point sits on the front hand. `[VERIFIED, 2026-08-13, 112 samples, stable to
+// one millimetre]` that point is +0.481 m along the barrel from the root.
+//
+//   0.0  rear hand only, exactly the build 81 behaviour
+//   1.0  the handguard lands on the front hand and the rear grip absorbs all
+//        of the spacing error
+//   0.5  the error splits between the hands, which is what it feels like to
+//        hold a real rifle with your hands slightly off its natural spacing
+//
+// It is a translation along the aim axis, so like the roll trim it CANNOT move
+// point of aim. That is algebra, not tuning.
+//
+// All four default to zero, so a build carrying this behaves exactly as the one
+// before it until a key is pressed.
+void set_wgun_grip(float fwd, float lat, float up, float two);
+void get_wgun_grip(float* fwd, float* lat, float* up, float* two);
 
 // Build 78: step wgun 0 -> 1 -> 2 -> 0 from a key (NUMPAD 5), so the tester can
 // compare the two gun-root bones without removing the headset to edit a file.

@@ -514,6 +514,11 @@ static float g_cfg_wgun_roll     = 1.0f;
 static float g_cfg_wgun_roll_deg = 0.0f;
 static float g_cfg_wgun_smooth  = 0.25f;   // build 80, rotation filter
 static float g_cfg_wgun_maxstep = 5.00f;   // build 80, degrees per call
+// Build 99: the grip offsets, all zero so a fresh install behaves as build 98.
+static float g_cfg_wgun_grip_fwd = 0.0f;
+static float g_cfg_wgun_grip_lat = 0.0f;
+static float g_cfg_wgun_grip_up  = 0.0f;
+static float g_cfg_wgun_grip_two = 0.0f;
 static float g_cfg_wgun_pos        = 0.0f;   // build 81, position rides ctrl
 static float g_cfg_wgun_pos_scale  = 1.0f;
 static float g_cfg_wgun_pos_clamp  = 1.0f;
@@ -796,6 +801,15 @@ void load_config() {
             g_cfg_wgun_pos_smooth = v;
         if (sscanf_s(line, " wgun_dz = %f", &v) == 1)
             g_cfg_wgun_dz = v;
+        // Build 99: the grip. All default 0, which is the build 98 behaviour.
+        if (sscanf_s(line, " wgun_grip_fwd = %f", &v) == 1)
+            g_cfg_wgun_grip_fwd = v;
+        if (sscanf_s(line, " wgun_grip_lat = %f", &v) == 1)
+            g_cfg_wgun_grip_lat = v;
+        if (sscanf_s(line, " wgun_grip_up = %f", &v) == 1)
+            g_cfg_wgun_grip_up = v;
+        if (sscanf_s(line, " wgun_grip_two = %f", &v) == 1)
+            g_cfg_wgun_grip_two = v;
         if (sscanf_s(line, " wnode = %f", &v) == 1)
             g_cfg_wnode = v;
         if (sscanf_s(line, " wnode_dz = %f", &v) == 1)
@@ -901,6 +915,10 @@ void load_config() {
     camera::set_wgun_filter(g_cfg_wgun_smooth, g_cfg_wgun_maxstep);
     camera::set_wgun_pos((int)g_cfg_wgun_pos, g_cfg_wgun_pos_scale,
                          g_cfg_wgun_pos_clamp, g_cfg_wgun_pos_smooth);
+    // Build 99: the grip, applied with the rest of the weapon block so a cfg
+    // save is the way back from any amount of tuner wandering.
+    camera::set_wgun_grip(g_cfg_wgun_grip_fwd, g_cfg_wgun_grip_lat,
+                          g_cfg_wgun_grip_up, g_cfg_wgun_grip_two);
     camera::set_wgun_twohand((int)g_cfg_wgun_twohand);
     camera::set_wgun_roll((int)g_cfg_wgun_roll, g_cfg_wgun_roll_deg);
     camera::set_wgun((int)g_cfg_wgun, g_cfg_wgun_dz);
@@ -2913,6 +2931,16 @@ bool begin_and_arm() {
              "Numpad 4 bullet yaw, Numpad 7 weapon-draw recorder, "
              "Numpad 8 first person, Numpad 0 camera pose write (gun-jitter "
              "A/B), Numpad Decimal head aim, F1 panel.");
+    LOG_INFO("VR: tuning keys: Numpad / world BIGGER, Numpad * world SMALLER "
+             "(ipd_scale, 0.05 a step, clamped 0.30..1.50), Numpad + head roll "
+             "into the camera (cam_pose_rot, DIAGNOSTIC: it also makes the "
+             "camera fight yaw and pitch). Saving grwxr.cfg restores its "
+             "values.");
+    LOG_INFO("VR: THE TUNER (build 99): INSERT cycles which setting is live, "
+             "PAGE UP and PAGE DOWN step it, DELETE resets it. Every press logs "
+             "the name, the value and what it changes. Start with "
+             "wgun_grip_fwd to seat the gun in your hand, then wgun_grip_two "
+             "for the front-hand hold.");
     LOG_INFO("VR: all tuning lives in grwxr.cfg, hot-reloaded ~1 s after any save");
     LOG_INFO("VR: (edit by hand or with cfg_gui.exe). Build 21.");
     LOG_INFO("VR: fullscreen %s, fov %.2f rad; desktop view %s, crop %.2f rad",
@@ -3896,6 +3924,169 @@ void toggle_cam_pose() {
                     "eyes get the same image, but the gun's origin is the "
                     "engine's own camera again (the build 88 configuration). "
                     "This is a DIAGNOSTIC state, not a setting to keep.");
+}
+
+// Build 97: Numpad / and Numpad *. See VRMirror.h.
+//
+// The log line names which way the WORLD moved, not just the number, because
+// the mapping is the opposite of the intuitive one and the tester is converging
+// this by eye with no reference to check against. A narrower baseline is less
+// parallax, which the brain reads as a more distant and therefore larger
+// object: perceived size scales by (true IPD / rendered baseline).
+void step_ipd_scale(int dir) {
+    const float step = 0.05f;
+    float v = headpose::ipd_scale() + (dir < 0 ? -step : step);
+    // Clamp before it reaches the player. 0.30 is already a strongly
+    // exaggerated world and 1.50 a strongly miniaturised one; there is no
+    // legitimate tuning target outside that, and a key held down by accident
+    // must not be able to walk out of it.
+    if (v < 0.30f) v = 0.30f;
+    if (v > 1.50f) v = 1.50f;
+    // Snap to the step grid so repeated presses cannot accumulate float drift
+    // into values like 0.7999998 that read as noise in the log.
+    v = floorf(v * 20.0f + 0.5f) / 20.0f;
+    headpose::set_ipd_scale(v);
+    LOG_INFO("hotkey: ipd_scale = %.2f (the world just got %s; lower = bigger "
+             "world, higher = smaller. Save grwxr.cfg to restore its value)",
+             v, dir < 0 ? "BIGGER" : "SMALLER");
+}
+
+// ---------------------------------------------------------------------------
+// Build 99: THE TUNER. See VRMirror.h for why it exists and what the keys are.
+//
+// Each row is a name, a getter, a setter, a step, bounds, and one line of help
+// that says what the tester will SEE change. The help matters more than it
+// looks: he is reading these from a log after the fact to work out which half
+// of an A/B a stretch of play belongs to, and a bare number does not tell him.
+//
+// The cfg default is captured the first time a row is touched, not at load, so
+// Delete restores what the file actually said even after a hot-reload changed
+// it under us.
+// ---------------------------------------------------------------------------
+namespace {
+
+float tune_get_grip_fwd() { float v; camera::get_wgun_grip(&v, 0, 0, 0); return v; }
+float tune_get_grip_lat() { float v; camera::get_wgun_grip(0, &v, 0, 0); return v; }
+float tune_get_grip_up()  { float v; camera::get_wgun_grip(0, 0, &v, 0); return v; }
+float tune_get_grip_two() { float v; camera::get_wgun_grip(0, 0, 0, &v); return v; }
+
+void tune_set_grip(int which, float v) {
+    float f, l, u, t;
+    camera::get_wgun_grip(&f, &l, &u, &t);
+    if (which == 0) f = v;
+    if (which == 1) l = v;
+    if (which == 2) u = v;
+    if (which == 3) t = v;
+    camera::set_wgun_grip(f, l, u, t);
+}
+void tune_set_grip_fwd(float v) { tune_set_grip(0, v); }
+void tune_set_grip_lat(float v) { tune_set_grip(1, v); }
+void tune_set_grip_up (float v) { tune_set_grip(2, v); }
+void tune_set_grip_two(float v) { tune_set_grip(3, v); }
+
+float tune_get_ipd() { return headpose::ipd_scale(); }
+void  tune_set_ipd(float v) { headpose::set_ipd_scale(v); }
+
+float tune_get_roll_deg() { return g_cfg_wgun_roll_deg; }
+void  tune_set_roll_deg(float v) {
+    g_cfg_wgun_roll_deg = v;
+    camera::set_wgun_roll((int)g_cfg_wgun_roll, v);
+}
+
+float tune_get_pos_clamp() { return g_cfg_wgun_pos_clamp; }
+void  tune_set_pos_clamp(float v) {
+    g_cfg_wgun_pos_clamp = v;
+    camera::set_wgun_pos((int)g_cfg_wgun_pos, g_cfg_wgun_pos_scale,
+                         g_cfg_wgun_pos_clamp, g_cfg_wgun_pos_smooth);
+}
+
+struct Tunable {
+    const char* name;
+    float (*get)();
+    void  (*set)(float);
+    float step, lo, hi;
+    const char* help;
+};
+
+const Tunable kTunables[] = {
+    {"wgun_grip_fwd", tune_get_grip_fwd, tune_set_grip_fwd, 0.02f, -0.80f, 0.80f,
+     "slides the gun ALONG ITS BARREL through your right hand: + puts your hand "
+     "further back on the weapon"},
+    {"wgun_grip_up", tune_get_grip_up, tune_set_grip_up, 0.02f, -0.40f, 0.40f,
+     "raises or lowers the gun in your right hand"},
+    {"wgun_grip_lat", tune_get_grip_lat, tune_set_grip_lat, 0.02f, -0.40f, 0.40f,
+     "shifts the gun left or right in your right hand"},
+    {"wgun_grip_two", tune_get_grip_two, tune_set_grip_two, 0.10f, 0.00f, 1.00f,
+     "the FRONT HAND HOLD: 0 the left hand only points, 1 the handguard lands "
+     "in it, 0.5 splits the difference. Cannot move point of aim"},
+    {"wgun_roll_deg", tune_get_roll_deg, tune_set_roll_deg, 5.0f, -180.0f, 180.0f,
+     "rotates the gun about its own barrel. Cannot move point of aim"},
+    {"wgun_pos_clamp", tune_get_pos_clamp, tune_set_pos_clamp, 0.05f, 0.10f, 2.00f,
+     "how far the gun may sit from where the engine put it. Raise it if the gun "
+     "will not reach your hand"},
+    {"ipd_scale", tune_get_ipd, tune_set_ipd, 0.05f, 0.30f, 1.50f,
+     "world scale: LOWER makes the world look BIGGER"},
+};
+const int kTunableCount = (int)(sizeof(kTunables) / sizeof(kTunables[0]));
+
+int   g_tune_sel = 0;
+float g_tune_default[kTunableCount] = {};
+bool  g_tune_have_default[kTunableCount] = {};
+
+void tune_capture_default(int i) {
+    if (!g_tune_have_default[i]) {
+        g_tune_default[i] = kTunables[i].get();
+        g_tune_have_default[i] = true;
+    }
+}
+
+}  // namespace
+
+void tuner_cycle() {
+    g_tune_sel = (g_tune_sel + 1) % kTunableCount;
+    const Tunable& t = kTunables[g_tune_sel];
+    tune_capture_default(g_tune_sel);
+    LOG_INFO("tuner: [%d/%d] %s = %.2f  (Page Up / Page Down step by %.2f, "
+             "Delete resets). %s",
+             g_tune_sel + 1, kTunableCount, t.name, t.get(), t.step, t.help);
+}
+
+void tuner_step(int dir) {
+    const Tunable& t = kTunables[g_tune_sel];
+    tune_capture_default(g_tune_sel);
+    float v = t.get() + (dir < 0 ? -t.step : t.step);
+    if (v < t.lo) v = t.lo;
+    if (v > t.hi) v = t.hi;
+    // Snap to the step grid so repeated presses cannot accumulate float drift
+    // into values that read as noise in the log.
+    const float inv = 1.0f / t.step;
+    v = floorf(v * inv + 0.5f) / inv;
+    t.set(v);
+    LOG_INFO("tuner: %s = %.2f  (%s)", t.name, v, t.help);
+}
+
+void tuner_reset() {
+    const Tunable& t = kTunables[g_tune_sel];
+    tune_capture_default(g_tune_sel);
+    t.set(g_tune_default[g_tune_sel]);
+    LOG_INFO("tuner: %s RESET to %.2f (the value it had when you first touched "
+             "it this run; saving grwxr.cfg also restores the file's value)",
+             t.name, g_tune_default[g_tune_sel]);
+}
+
+// Build 97: Numpad +. See VRMirror.h. This is the control for the reversed
+// head roll reported 2026-08-15, not the fix for it.
+void toggle_cam_pose_rot() {
+    const bool next = !headpose::cam_pose_rot();
+    headpose::set_cam_pose_rot(next);
+    LOG_INFO("hotkey: cam_pose_rot = %d (%s)", next ? 1 : 0,
+             next ? "head rotation composed into the camera basis: ROLL now "
+                    "reaches the content, so it should agree with the pose we "
+                    "advertise. The camera will also fight you on yaw and "
+                    "pitch, which is expected and is why this ships off. "
+                    "DIAGNOSTIC only"
+                  : "position-only camera write: the engine keeps its own "
+                    "basis and nothing argues with where you are looking");
 }
 
 }  // namespace vr

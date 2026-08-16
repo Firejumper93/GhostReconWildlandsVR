@@ -115,5 +115,57 @@ void toggle_aim_ads();     // Numpad 3: trigger-also-aims on/off (hip fire)
 // frozen total from the previous one.
 void toggle_cam_pose();    // Numpad 0: camera pose write (first person, stereo)
 
+// Build 97 (user directive, 2026-08-15): "hotkey any cfg command, I am not
+// messing with notepad." This overrides hazard 24, which says tuning belongs in
+// the cfg and hotkeys do not. It is the second time the tester has asked for a
+// setting to be reachable from inside the headset, and hazard 24 was written
+// before the mod had anything worth tuning by feel. The standing rule from here
+// is that any setting a test asks him to change ships with a key.
+//
+// The two open questions of 2026-08-15 evening, one key each:
+//
+//   ipd_scale     world scale, and it has to be converged by eye against a
+//                 known-size object, so it gets a stepper rather than a toggle.
+//                 LOWER is a NARROWER eye baseline, which is LESS parallax,
+//                 which reads as a BIGGER world. Clamped to 0.30..1.50: a stuck
+//                 key must not be able to reach a separation that makes someone
+//                 ill (skeleton rule 5 in spirit, a clamp before it reaches the
+//                 player).
+//   cam_pose_rot  the head-roll control. On makes the content carry roll so it
+//                 agrees with the pose we already advertise to the compositor.
+//                 It costs the camera fight on yaw and pitch, so it is a
+//                 DIAGNOSTIC, not the fix.
+//
+// Keys are the arithmetic row and the tall + key, deliberately: they are
+// physically separated from the digit block, so none of them is adjacent to a
+// key that is live (0 camera pose, 1 barrel aim, 3 ADS, 4 bullet yaw, 7 draw
+// recorder, 8 first person). That is the NUMPAD 5 lesson applied at assignment
+// time instead of after a lost session.
+void step_ipd_scale(int dir);   // Numpad / down (bigger world), Numpad * up
+void toggle_cam_pose_rot();     // Numpad +: head roll into the camera basis
+
+// Build 99: THE TUNER, and it is the answer to "hotkey any cfg command"
+// rather than another three keys.
+//
+// Numpad 0, /, * and + used one key per setting. That does not scale: the next
+// three settings would want six more keys, the numpad is nearly full, and every
+// key added is another thing a blind hand can hit. So: one key selects WHICH
+// value is live, two step it, one resets it.
+//
+//   Insert      cycle the selected setting, logging its name and value
+//   Page Up     step it up
+//   Page Down   step it down
+//   Delete      reset the selected setting to what grwxr.cfg says
+//
+// The six-key island above the arrow cluster, deliberately. It is findable by
+// feel (Home already is, and it lives there), and it is nowhere near the numpad,
+// so nothing here can be hit while reaching for first person or the barrel aim.
+//
+// Adding a setting is one row in kTunables, not a key hunt. Anything reachable
+// through a getter and a setter can go in it.
+void tuner_cycle();
+void tuner_step(int dir);
+void tuner_reset();
+
 }  // namespace vr
 }  // namespace grwxr

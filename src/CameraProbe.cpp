@@ -165,6 +165,10 @@ volatile uint64_t grwxr_wg_roll   = 0;
 volatile uint64_t grwxr_wg_rot    = 0;   // rotations actually written
 volatile uint64_t grwxr_wg_nopos  = 0;   // build 81: no controller position
 volatile uint64_t grwxr_wg_pos    = 0;   // build 81: positions written
+// Build 99: frames the front-hand hold slid the weapon along its barrel. Zero
+// with wgun_grip_two at 0 (the default) or with only one hand on the weapon,
+// so a nonzero value is proof the feature is engaging and not merely armed.
+volatile uint64_t grwxr_wg_grip   = 0;
 
 // Build 68: THE WEAPON PLACEMENT SUBSTITUTION. Research verdict (2026-08-09,
 // docs/RESEARCH-IK-MOTION-CONTROLS-2026-08.md): every closed-engine precedent
@@ -895,6 +899,21 @@ float    g_base[9]     = {};
 float    g_base_pos[3] = {};
 int      g_eye_toggle  = 0;   // flips once per built frame; 0 left, 1 right
 
+// BUILD 98: the frame number g_base / g_base_pos were captured on, 0 = never.
+// Written last in the per-frame capture block with release ordering; read with
+// acquire by base_frame_engine on the present thread. See the long comment
+// there for what this is for.
+std::atomic<uint64_t> g_base_stamp{0};
+
+// BUILD 98 telemetry, so the next headset run grades itself. latch = reads
+// served from the per-frame engine capture, live = reads that fell through to
+// the camera object because the capture was stale. gap is the distance between
+// the two answers at the moment of a latch hit, which IS the jitter amplitude:
+// it read 1.91 m in grwxr-13140.log with the player standing still.
+std::atomic<uint64_t> g_bf_latch{0};
+std::atomic<uint64_t> g_bf_live{0};
+float g_bf_gap_last = 0.0f, g_bf_gap_max = 0.0f;
+
 // BUILD 10b.2 diagnostics: is the engine refreshing the POSITION row of
 // Camera+0x000 every frame, the way build 7 verified for rotation? If it is
 // NOT, each frame's base capture reads back our previous eye-offset write and
@@ -1319,6 +1338,17 @@ std::atomic<float> g_wgun_pos_scale{1.0f};
 std::atomic<float> g_wgun_pos_clamp{1.0f};
 std::atomic<float> g_wgun_pos_smooth{0.35f};
 
+// Build 99: the grip. See CameraProbe.h. All zero = the build 81 behaviour.
+std::atomic<float> g_wgun_grip_fwd{0.0f};
+std::atomic<float> g_wgun_grip_lat{0.0f};
+std::atomic<float> g_wgun_grip_up{0.0f};
+std::atomic<float> g_wgun_grip_two{0.0f};
+// `[VERIFIED, 2026-08-13]` the support hand sits this far along the barrel from
+// the gun root, measured on the ANIMATED skeleton (so it is the engine's own
+// idea of where the front hand belongs), stable to one millimetre over 112
+// samples and cross-checking a prior session's 0.498 m total distance.
+const float kHandguardFwd = 0.481f;
+
 // Build 35: NO CAMERA BLUR (RE-notes "NO CAMERA BLUR, decoded from the
 // community FP mod's cheat table", session 23). The community FP mod ships
 // without the FP body blur; its cheat table's whole mechanism is one byte,
@@ -1541,6 +1571,12 @@ bool write_pose_head(uint64_t cam, const float* H, const float* Q) {
             }
             for (int c = 0; c < 3; ++c) g_diag_prev_cap[c] = g_base_pos[c];
             g_diag_have_prev = true;
+            // BUILD 98: stamp the latch. g_base and g_base_pos have just been
+            // filled from the matrix BEFORE this frame's write, so together
+            // with this stamp they are "the engine's own camera, frame f".
+            // Published last, with release ordering, so a reader that sees the
+            // stamp sees the rows that go with it.
+            g_base_stamp.store(f, std::memory_order_release);
             g_last_frame = f;
             g_eye_toggle ^= 1;
             // Build 13a: the tag carries the XR-space orientation this frame
@@ -3450,7 +3486,8 @@ void snap_drain() {
                                              "calls=%llu lifts=%llu rots=%llu "
                                              "pos=%llu | skip nopose=%llu "
                                              "nobuf=%llu norec=%llu noray=%llu "
-                                             "nopos=%llu badq=%llu | two=%llu tworej=%llu roll=%llu",
+                                             "nopos=%llu badq=%llu | two=%llu tworej=%llu roll=%llu"
+                                             " | grip fwd=%.2f lat=%.2f up=%.2f two=%.2f slid=%llu",
                                              gn >= 0 ? "ARMED" : "idle", gn,
                                              grwxr_wgun_rot ? "ROTATE" : "lift",
                                              g_wgun_dz_cfg.load(
@@ -3469,7 +3506,16 @@ void snap_drain() {
                                              (unsigned long long)grwxr_wg_badq,
                                              (unsigned long long)grwxr_wg_two,
                                              (unsigned long long)grwxr_wg_tworej,
-                                             (unsigned long long)grwxr_wg_roll);
+                                             (unsigned long long)grwxr_wg_roll,
+                                             g_wgun_grip_fwd.load(
+                                                 std::memory_order_relaxed),
+                                             g_wgun_grip_lat.load(
+                                                 std::memory_order_relaxed),
+                                             g_wgun_grip_up.load(
+                                                 std::memory_order_relaxed),
+                                             g_wgun_grip_two.load(
+                                                 std::memory_order_relaxed),
+                                             (unsigned long long)grwxr_wg_grip);
 
                                     // The off-hand measurement used to print
                                     // here. It moved to the top of this tick on
@@ -4422,6 +4468,17 @@ void drain_head_telemetry(int ticks) {
             LOG_INFO("aer: basepos step last=%.4f max=%.4f, vs-write last=%.4f max=%.4f",
                      g_diag_step_last, g_diag_step_max,
                      g_diag_vsw_last, g_diag_vsw_max);
+            // BUILD 98: the gun-origin fix, grading itself. gap is how far the
+            // LIVE camera row is from the frame's engine latch at the moment a
+            // controller publish reads it, which is precisely the jitter that
+            // used to reach the gun. A large gap with latch climbing and live
+            // at or near zero is the fix working: the error exists and nothing
+            // is consuming it. live climbing while the camera write is on means
+            // the latch is going stale and the jitter is back.
+            LOG_INFO("base: latch=%llu live=%llu, live-vs-latch gap last=%.4f max=%.4f",
+                     g_bf_latch.load(std::memory_order_relaxed),
+                     g_bf_live.load(std::memory_order_relaxed),
+                     g_bf_gap_last, g_bf_gap_max);
         } else if (g_calls[kOnCalcMvpProbe].load(std::memory_order_relaxed) == 0 &&
                    !headpose::cam_selector_pose()) {
             // Build 89: name the exact reason. on_calc_mvp is the only other
@@ -4451,6 +4508,115 @@ void reset_head_telemetry() {
     g_head_sel_writes.store(0, std::memory_order_relaxed);
 }
 
+// The live read off the camera object. This IS the old base_frame body,
+// renamed; pos may be wanted without rot, so rot is allowed to be null.
+static bool base_frame_live(float rot[9], float pos[3]);
+static bool base_pos_live(float out[3]);
+
+// -----------------------------------------------------------------------
+// BUILD 98: THE PER-FRAME ENGINE CAMERA, and why base_pos and base_frame stop
+// reading the camera object directly.
+//
+// `[VERIFIED, headset, 2026-08-15]` The tester reported the gun jittering while
+// moving, new since the camera work, and pressing NUMPAD 0 (which turns the
+// camera pose write off) removed it completely. That is the control passing.
+//
+// THE MECHANISM, end to end, all of it in this tree:
+//
+//   grwxr_wgun_apply places the gun at aimtrace::ctrl_pos(), clamped to
+//   wgun_pos_clamp of the engine's own placement (CameraProbe.cpp, the POSITION
+//   block). ctrl_pos is published in VRMirror.cpp as base_frame()'s position
+//   plus the head-local controller offset. base_frame() read Camera+0x000 row 3
+//   LIVE. And since build 89 write_pose_head WRITES that same row, 3.00 times
+//   per frame by the drain's own count, while the engine restores it once.
+//
+// So the origin the weapon is placed from was a row we are ourselves editing
+// mid-frame, sampled from the present thread with no ordering against either
+// writer. Two candidate values live in it: the engine's chase camera and our
+// composed first-person viewpoint.
+//
+// THE AMPLITUDE IS MEASURED, in grwxr-13140.log, with the player standing
+// still: `basepos step last=0.0053, vs-write last=1.9147`. Frame-to-frame
+// camera motion of 5 mm, against 1.91 m between the captured row and the row we
+// wrote. Clamped to 0.60 m and one-poled at 0.35 that is a shake, not a jump,
+// which is exactly what it looked like.
+//
+// THE FIX, and why it is this one:
+//
+// write_pose_head already captures the engine's rows once per frame, BEFORE its
+// own write, into g_base / g_base_pos. That capture is the value every one of
+// these callers actually wants, and it is single valued for the whole frame by
+// construction. Serve it, and fall back to the live read whenever it is stale.
+//
+// Both branches return the ENGINE's camera. When the write is running the latch
+// is fresh; when it is not (menus, first person off, the flat-scope stand-down,
+// NUMPAD 0) nothing writes the row, so the live read is the same value. There
+// is no configuration in which a caller sees our own write any more.
+//
+// SCOPE. Every caller of these two functions is ours: base_frame feeds the five
+// controller publishes in VRMirror.cpp (ctrl_ray, ctrl_pos, ctrl_pos_l,
+// ctrl_up, and wp::set_write) and base_pos feeds WeaponProbe's proximity
+// tables. The camera-write path itself does NOT go through here, it uses g_base
+// and g_base_pos directly, so this cannot disturb first person or the eye
+// offset. This also closes the defect recorded at the end of session 29, where
+// identical weapon handles reported d=0.38 then d=1.72, a uniform 1.35 m step
+// with no object motion.
+//
+// FRESHNESS. One frame of tolerance, not zero: the present thread reads while
+// the engine thread may be part way through the next frame's build, and
+// rejecting that would drop the latch on a frame boundary every time and put
+// the jitter back at a lower rate. One frame of camera motion is the 5 mm the
+// log measured.
+//
+// ORDERING. The stamp is stored with release after the rows are filled and
+// loaded with acquire before they are copied, so a reader that sees frame f
+// sees frame f's rows. The rows themselves stay plain floats, unsynchronized,
+// exactly as documented in CameraProbe.h: a torn read costs centimetres and
+// every caller here tolerates that. No lock, no allocation, rule 8 clean.
+// -----------------------------------------------------------------------
+static bool base_frame_engine(float rot[9], float pos[3]) {
+    const uint64_t stamp = g_base_stamp.load(std::memory_order_acquire);
+    if (stamp) {
+        const uint64_t now = d3d11::frame_count();
+        if (now >= stamp && (now - stamp) <= 1) {
+            float p[3], r[9];
+            memcpy(r, g_base, sizeof(r));
+            memcpy(p, g_base_pos, sizeof(p));
+            // The same sanity gate the live read uses. A latch captured during
+            // a level transition holds the same readable garbage the live row
+            // would, and it must fail the same way rather than silently.
+            const float lim = 1.0e6f;
+            bool ok = p[0] == p[0] && p[1] == p[1] && p[2] == p[2] &&
+                      p[0] > -lim && p[0] < lim &&
+                      p[1] > -lim && p[1] < lim &&
+                      p[2] > -lim && p[2] < lim;
+            for (int i = 0; ok && i < 3; ++i) {
+                const float len2 = r[i * 3 + 0] * r[i * 3 + 0] +
+                                   r[i * 3 + 1] * r[i * 3 + 1] +
+                                   r[i * 3 + 2] * r[i * 3 + 2];
+                if (!(len2 > 0.81f && len2 < 1.21f)) ok = false;
+            }
+            if (ok) {
+                // Telemetry only: how far the live row is from the latch right
+                // now. This is the jitter that used to reach the gun, and
+                // printing it means the next run grades this fix instead of
+                // relying on the tester's eye a second time.
+                float lp[3];
+                if (base_frame_live(nullptr, lp)) {
+                    g_bf_gap_last = dist3(p, lp);
+                    if (g_bf_gap_last > g_bf_gap_max) g_bf_gap_max = g_bf_gap_last;
+                }
+                memcpy(rot, r, sizeof(r));
+                memcpy(pos, p, sizeof(p));
+                g_bf_latch.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+        }
+    }
+    g_bf_live.fetch_add(1, std::memory_order_relaxed);
+    return base_frame_live(rot, pos);
+}
+
 // Build 39.1: see CameraProbe.h.
 //
 // FIXED DEFECT (found before build 39 was ever run): the first version read
@@ -4466,7 +4632,24 @@ void reset_head_telemetry() {
 // on EVERY mode-0 on_calc_mvp call, with no VR precondition, and the engine
 // keeps Camera+0x000's row 3 current every frame. Read that, and say out loud
 // whether the read worked.
+// BUILD 98: the latch first, for the reason in the long comment above
+// base_frame_engine. base_frame_engine falls back to the live read itself, so
+// this keeps every guarantee the comment below describes; the only change is
+// WHICH of two values in the same row is returned while we are writing it.
 bool base_pos(float out[3]) {
+    float rot[9];
+    if (base_frame_engine(rot, out)) return true;
+    // base_frame_engine has already tried the latch and the live read, but it
+    // rejects a frame whose ROTATION rows are not unit, which base_pos never
+    // cared about, and it has no published-copy tail. Keep both by falling
+    // through to the original body, so a caller that used to get an answer
+    // still gets exactly that answer.
+    return base_pos_live(out);
+}
+
+// The live read. Kept as its own function because base_frame_engine falls back
+// to it and because the reasoning below is still the reasoning for it.
+static bool base_pos_live(float out[3]) {
     const uint64_t cam = g_player_cam.load(std::memory_order_relaxed);
     if (cam) {
         __try {
@@ -4499,11 +4682,20 @@ bool base_pos(float out[3]) {
             g_base_pos[2] != 0.0f);
 }
 
+// BUILD 98: the public entry now prefers the per-frame engine latch. See the
+// long comment above base_frame_engine for the headset result that forced this
+// and for why every caller wants the latch.
+bool base_frame(float rot[9], float pos[3]) {
+    return base_frame_engine(rot, pos);
+}
+
 // Build 45: see CameraProbe.h. Same source and sanity rules as base_pos,
 // plus a unit-length check on each rotation row, because a camera object
 // mid-swap can hold a matrix that reads fine and means nothing. POD locals
 // only, so SEH needs no unwinding.
-bool base_frame(float rot[9], float pos[3]) {
+// BUILD 98: renamed from base_frame, and rot may be null when only the position
+// is wanted (base_frame_engine's telemetry read).
+static bool base_frame_live(float rot[9], float pos[3]) {
     const uint64_t cam = g_player_cam.load(std::memory_order_relaxed);
     if (!cam) return false;
     __try {
@@ -4520,6 +4712,7 @@ bool base_frame(float rot[9], float pos[3]) {
             const float c = m[r * 4 + 2];
             const float len2 = a * a + b * b + c * c;
             if (!(len2 > 0.81f && len2 < 1.21f)) return false;
+            if (!rot) continue;
             rot[r * 3 + 0] = a;
             rot[r * 3 + 1] = b;
             rot[r * 3 + 2] = c;
@@ -4679,6 +4872,32 @@ void set_wgun_pos(int on, float scale, float clamp_m, float smooth) {
              "gun-root is placed ON the controller, never further than the "
              "clamp from where the engine put it.",
              want ? "ON" : "off", scale, clamp_m, smooth);
+}
+
+// Build 99: see CameraProbe.h. Clamped, because these reach the player through
+// a long lever arm and skeleton rule 5 says every controller-driven transform
+// gets one. The bounds are generous enough to cover any real weapon (a rifle is
+// under a metre) and tight enough that a stuck key cannot fling the gun.
+void set_wgun_grip(float fwd, float lat, float up, float two) {
+    if (fwd < -0.80f) fwd = -0.80f;
+    if (fwd >  0.80f) fwd =  0.80f;
+    if (lat < -0.40f) lat = -0.40f;
+    if (lat >  0.40f) lat =  0.40f;
+    if (up  < -0.40f) up  = -0.40f;
+    if (up  >  0.40f) up  =  0.40f;
+    if (two <  0.0f)  two =  0.0f;
+    if (two >  1.0f)  two =  1.0f;
+    g_wgun_grip_fwd.store(fwd, std::memory_order_relaxed);
+    g_wgun_grip_lat.store(lat, std::memory_order_relaxed);
+    g_wgun_grip_up.store(up,  std::memory_order_relaxed);
+    g_wgun_grip_two.store(two, std::memory_order_relaxed);
+}
+
+void get_wgun_grip(float* fwd, float* lat, float* up, float* two) {
+    if (fwd) *fwd = g_wgun_grip_fwd.load(std::memory_order_relaxed);
+    if (lat) *lat = g_wgun_grip_lat.load(std::memory_order_relaxed);
+    if (up)  *up  = g_wgun_grip_up.load(std::memory_order_relaxed);
+    if (two) *two = g_wgun_grip_two.load(std::memory_order_relaxed);
 }
 
 void set_wgun_filter(float smooth, float maxstep_deg) {
@@ -4859,6 +5078,12 @@ extern "C" void grwxr_wgun_apply(void* skelp) {
     // -----------------------------------------------------------------------
     const bool want_two = g_wgun_twohand.load(std::memory_order_relaxed) != 0;
     float lpos[3], rpos[3];
+    // Build 99: how much authority the front hand took this call, 0 when it
+    // took none. The POSITION block below uses it so the front-hand grip fades
+    // in and out on exactly the same curve the direction does, instead of on a
+    // second threshold that could disagree with it.
+    float two_w = 0.0f;
+    bool  two_have_l = false;
     if (want_two &&
         aimtrace::ctrl_pos_l(lpos) && aimtrace::ctrl_pos(rpos)) {
         const float v[3] = {lpos[0] - rpos[0],
@@ -4884,6 +5109,8 @@ extern "C" void grwxr_wgun_apply(void* skelp) {
                 if (bn > 0.5f) {                       // both are unit, ~1
                     ray[0] = b[0]/bn; ray[1] = b[1]/bn; ray[2] = b[2]/bn;
                     grwxr_wg_two = grwxr_wg_two + 1;
+                    two_w      = w;                    // build 99
+                    two_have_l = true;
                 }
             } else {
                 grwxr_wg_tworej = grwxr_wg_tworej + 1;
@@ -5086,6 +5313,62 @@ extern "C" void grwxr_wgun_apply(void* skelp) {
     if (!aimtrace::ctrl_pos(cp)) { bump(&grwxr_wg_nopos); return; }
     for (int i = 0; i < 3; ++i)
         if (!isfinite(cp[i])) { bump(&grwxr_wg_nopos); return; }
+
+    // -----------------------------------------------------------------------
+    // BUILD 99: THE GRIP. Where the weapon sits in the hand, and the front-hand
+    // hold. See CameraProbe.h for what each number means.
+    //
+    // Both parts are applied to the TARGET position, before the clamp and the
+    // filter, so everything that already protects this write (the clamp against
+    // the engine's own placement, the one-pole, the generation reset) protects
+    // these too and none of it had to be touched.
+    //
+    // Applied with `desired`, the orientation the gun is being given THIS call,
+    // not the one it currently has. Using the current one would make the offset
+    // lag the weapon by a frame during a fast hand sweep and read as the gun
+    // flexing in the hand.
+    // -----------------------------------------------------------------------
+    {
+        const float gf = g_wgun_grip_fwd.load(std::memory_order_relaxed);
+        const float gl = g_wgun_grip_lat.load(std::memory_order_relaxed);
+        const float gu = g_wgun_grip_up.load(std::memory_order_relaxed);
+        if (gf != 0.0f || gl != 0.0f || gu != 0.0f) {
+            // Model frame: +X lateral, +Y the barrel, +Z up.
+            const float go[3] = {gl, gf, gu};
+            float gw[3];
+            qrot(desired, go, gw);
+            if (isfinite(gw[0]) && isfinite(gw[1]) && isfinite(gw[2])) {
+                cp[0] += gw[0]; cp[1] += gw[1]; cp[2] += gw[2];
+            }
+        }
+
+        // THE FRONT-HAND HOLD. Slide along the barrel until the handguard sits
+        // on the front hand. A translation along the aim axis cannot change
+        // where the weapon points, so this is safe by construction in exactly
+        // the way the roll trim is.
+        const float tw = g_wgun_grip_two.load(std::memory_order_relaxed);
+        if (tw > 0.0f && two_have_l && two_w > 0.0f) {
+            // Where the front hand actually is along the barrel, measured from
+            // the root we are about to place.
+            const float d[3] = {lpos[0] - cp[0], lpos[1] - cp[1], lpos[2] - cp[2]};
+            const float along = d[0]*s_dir[0] + d[1]*s_dir[1] + d[2]*s_dir[2];
+            if (isfinite(along)) {
+                // Error against where the weapon's own handguard is. Positive
+                // means the hand is further out than the handguard, so the
+                // weapon slides forward to meet it.
+                float e = along - kHandguardFwd;
+                // Bound it before it is scaled: a front hand at arm's length or
+                // tucked at the chest must not translate the weapon a metre.
+                if (e >  0.35f) e =  0.35f;
+                if (e < -0.35f) e = -0.35f;
+                const float k = tw * two_w;   // fades with the direction blend
+                cp[0] += k * e * s_dir[0];
+                cp[1] += k * e * s_dir[1];
+                cp[2] += k * e * s_dir[2];
+                grwxr_wg_grip = grwxr_wg_grip + 1;
+            }
+        }
+    }
 
     float bt[4], rt[4];
     if (!read_block(rec + 0x00, bt, sizeof(bt)) ||

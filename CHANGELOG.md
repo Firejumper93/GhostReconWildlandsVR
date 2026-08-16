@@ -5,6 +5,49 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
+## v0.9.0-test1, "Two Hands" (2026-08-15, TECH DEMO, NOT HEADSET-CONFIRMED)
+
+Cut from the `test` branch to demonstrate one capability. **For playing, use
+v0.8.5-alpha.** This build carries every crash fix from v0.8.1 through v0.8.5 but
+has not been tested against the startup crashes still open as issues #2 and #3.
+
+**THE WEAPON IS HELD IN TWO HANDS.** Your rear hand sets where it is, your front
+hand sets where it points, and twisting your wrist rolls it about its own barrel.
+Front-hand authority fades in with hand separation, so bringing your hands together
+degrades to one-handed rather than to a swinging muzzle. Roll and the front-hand
+hold both act along the aim axis, so neither can move your point of aim: that is
+geometry rather than tuning.
+
+**The weapon can sit in your fist.** Earlier builds placed it by the model's origin,
+which is not the grip, so it hung at an offset nothing could correct. `wgun_grip_fwd`,
+`wgun_grip_up` and `wgun_grip_lat` move it in the weapon's own axes.
+`wgun_grip_two` slides it along its barrel until the handguard reaches your front
+hand: 0 off, 1 fully, 0.5 splits the spacing error between your hands. All four
+default to 0, so the build handles exactly like the previous one until you tune it.
+
+**The gun no longer judders while you move.** The weapon is placed relative to the
+game camera's position, and the VR first-person feature writes that same position
+several times per frame, so the weapon was being placed from a value the mod was
+itself editing and landed on one of two answers depending on timing. It now reads a
+copy taken once per frame, before the mod touches anything. First person is
+unchanged; the weapon stopped reading a moving target.
+
+**Tuning from inside the headset.** `Insert` cycles which setting is live, `Page Up`
+and `Page Down` step it, `Delete` resets it, and every press logs what it changes.
+Settings judged by feel while moving cannot honestly be tuned in a text editor with
+the headset off. Shortcuts: `Numpad /` and `Numpad *` for world scale, `Numpad +`
+for the head-roll workaround, `Numpad 0` to toggle the VR camera pose write as a
+one-press diagnostic.
+
+**Barrel aim ships off.** It steered the game's aim onto the barrel, but in this
+engine the aim direction is the camera direction, so it could not settle and was
+retired with evidence rather than tuned down. Bullets still follow your gaze; aim
+down sights to shoot accurately. A different route is identified and is next.
+
+Known, unchanged: no IK arms, no hand presence, no gesture reloads. Head roll may
+read reversed; `Numpad +` is a workaround. World scale may look off; `Numpad /`
+makes the world bigger.
+
 ## v0.8.0-alpha, "The Weapon" (2026-08-10, PACKAGED RELEASE)
 
 **The weapon follows your right controller, in position and rotation, one to one.**

@@ -49,6 +49,22 @@ void publish_fov(float fovy_radians);
 // nothing has been published yet this run.
 float read_fov(float fallback);
 
+// BUILD 118. Engine thread, same proj[2] hook: the live near and far clip
+// planes in metres, read straight out of the perspective builder's arguments.
+// Needed by XR_KHR_composition_layer_depth, whose nearZ/farZ must match the
+// projection the content was rendered with.
+//
+// near_m > far_m MEANS THE ENGINE IS IN REVERSED-Z for this matrix: projbuild
+// (lastrites 0x0D7C0610) implements reversed-Z by swapping these two
+// arguments, so near then maps to NDC 1 and far to NDC 0. Callers must branch
+// on the comparison rather than assume a convention.
+void publish_clip(float near_m, float far_m);
+
+// Render thread. False until the first publish, in which case the outputs are
+// untouched. Engine defaults, for reference only, are near 0.1 and far 1200.0
+// from Camera::Camera; the live values override them per frame.
+bool read_clip(float* near_out, float* far_out);
+
 // BUILD 10b. Render thread: the interpupillary distance in metres, measured
 // each frame from the two located eye positions. Engine thread reads it to
 // size the per-eye camera offset (1 world unit = 1 m, docs/RE-notes.md).
@@ -134,6 +150,67 @@ bool fp_head_anchor();
 void set_fp_head_eye(float meters);
 float fp_head_eye();
 
+// Build 89: route the camera pose write through the `selector` camera target
+// when `on_calc_mvp` is not derived for this binary (cfg key
+// cam_selector_pose, default OFF).
+//
+// write_pose_head is what composes the headset rotation onto the camera, what
+// applies the per-eye IPD offset, and what captures the base transform that
+// first person anchors against. It has exactly one caller, the on_calc_mvp
+// recorder, so on a binary missing that row the headset is mono and the FP
+// toggle does nothing. The selector receives the same camera object and is
+// hooked; whether it runs early enough in the frame for the write to survive
+// is [UNKNOWN] and is what the flag exists to test.
+void set_cam_selector_pose(bool on);
+bool cam_selector_pose();
+
+// Build 90: does the camera write compose the headset rotation onto the
+// camera basis, or does it only move the viewpoint (cfg key cam_pose_rot,
+// default on, so a build that derives on_calc_mvp keeps its designed
+// behaviour without a cfg change).
+//
+// Off is the answer to "the camera fights". Head look already reaches the
+// view through the SetYaw/SetPitch absorb-and-inject path, so composing here
+// is a second authority on one channel; the flat first-person mod writes the
+// pose's fourth row only, for the same reason. With this off the write does
+// nothing but place the viewpoint at the head bone and offset it per eye.
+void set_cam_pose_rot(bool on);
+bool cam_pose_rot();
+
+// Build 91: THE VIEWPOINT PLACEMENT TRIO, ported from this author's own flat
+// first-person mod for the same game, where each has a measured reason behind
+// it. The VR camera write had none of them and took the animated
+// head bone raw, three times a frame.
+//
+// fp_fwd    metres the eyes sit FORWARD of the head joint, which is at the base
+//           of the skull. HORIZONTALIZED, so this frame's pitch never moves
+//           this frame's position, and when the view looks near straight up or
+//           down (where the horizontal forward collapses) the last good forward
+//           is reused rather than dropping the offset and leaving the viewpoint
+//           on the bare joint, inside the head mesh.
+// fp_clamp  metres the viewpoint may stray horizontally from the character
+//           origin, so an animation that whips the head (vault, melee) cannot
+//           whip the view. 0.20 was measured TOO TIGHT: the sprint lean held
+//           the head outside it continuously, and a clamped sustained lean
+//           parks the camera inside the torso.
+// fp_smooth / fp_smooth_z  EMA time constants in ms, horizontal and vertical.
+//           Locomotion bobs the head bone hard. The filter runs in
+//           ORIGIN-RELATIVE space, not world space: a world-space EMA lags a
+//           moving target by tau times velocity, about 0.3 m at sprint, which
+//           puts the camera back inside the torso. The origin carries the whole
+//           locomotion velocity and is already smooth, so filtering only the
+//           bone's deviation from it removes the bob with zero velocity lag,
+//           and teleports pass through instantly because they move the origin
+//           rather than the deviation.
+void set_fp_fwd(float meters);
+float fp_fwd();
+void set_fp_clamp(float meters);
+float fp_clamp();
+void set_fp_smooth(float ms);
+float fp_smooth();
+void set_fp_smooth_z(float ms);
+float fp_smooth_z();
+
 // The player's Head node index inside the rig's pose buffer, resolved on the
 // drain thread (1 Hz binary search over the rig name map) and consumed by the
 // camera write on the engine thread. 0xFFFF means "not resolved": the camera
@@ -163,6 +240,34 @@ bool fs_enabled();
 void set_fs_fov(float radians);
 float fs_fov();
 
+// BUILD 103: the band's LOWER edge, and why it is now a setting.
+//
+// `[VERIFIED, grwxr-29328.log and grwxr-29260.log]` plain ADS on this binary
+// publishes 0.3300 rad, 18.9 degrees. That number falls into a gap between
+// three of our own thresholds and receives no treatment at all:
+//
+//   below mono_scope_fov 0.30   the flat-scope path: camera write skipped,
+//                               content redrawn at scope_display_fov. ADS is
+//                               ABOVE this, so it does not apply.
+//   0.60 .. 1.35                the fullscreen override. ADS is BELOW this,
+//                               so it does not apply either.
+//   result                      an 18.9 degree image drawn at 18.9 degrees of
+//                               a roughly 100 degree display: a small picture
+//                               in the middle of black, head-inert because
+//                               aim injection also stops below 0.65.
+//
+// That is what the tester described as "even basic red dots go into the
+// cinematic flat". Three of our numbers, not an engine behaviour.
+//
+// Lowering this to just above mono_scope_fov routes plain ADS through the
+// fullscreen override, so aiming keeps the world's field of view and behaves
+// like ordinary VR aiming, while magnified optics stay below mono_scope_fov
+// and keep the flat-scope path build 11d verified. The default stays 0.60,
+// exactly the old behaviour, because the value that is RIGHT has to come out
+// of a headset rather than out of this comment.
+void set_fs_fov_lo(float radians);
+float fs_fov_lo();
+
 // BUILD 10b.1: frame-to-eye identity FIFO. The engine pipelines frame builds
 // ahead of their Presents by an unknown (and possibly varying) depth, so the
 // present side must NOT derive the eye of the backbuffer image from frame
@@ -180,12 +285,20 @@ float fs_fov();
 // (10b logs) the error oscillates per refresh: monocular 36 Hz stutter during
 // head rotation, invisible when still (session 13 headset report, the exact
 // discriminator pattern). Prior art: cyberpunk-vr-port "render-pose submit".
-void push_eye_tag(int eye, const float q_xr[4]);  // engine thread, once per
+// BUILD 118-I, fault C instrument: the tag also carries the composed camera
+// base for the frame (CameraProbe's g_base_pos, WITHOUT the per-eye offset)
+// and that frame's guard state, so the present side can measure per-eye base
+// disagreement directly. base may be null; flags bit0 = capture-guard rescue
+// fired, bit2 = first person active.
+void push_eye_tag(int eye, const float q_xr[4], const float base[3],
+                  unsigned char flags);           // engine thread, once per
                                                   // built frame
-int  pop_eye_tag(float q_xr[4], bool* q_ok);      // render thread, once per
-                              // present; -1 if none (no camera write happened
-                              // for this frame: menus, loading; treat the
-                              // image as mono). q_ok false on -1.
+int  pop_eye_tag(float q_xr[4], bool* q_ok,       // render thread, once per
+                 float base_out[3] = nullptr,     // present; -1 if none (no
+                 unsigned char* flags_out = nullptr);
+                              // camera write happened for this frame: menus,
+                              // loading; treat the image as mono). q_ok false
+                              // on -1, and base_out/flags_out are zeroed.
 int  eye_tag_depth();         // diagnostic: current ring occupancy
 
 // BUILD 10b.2 diagnostics: how many pops found a tag vs came up empty (mono).
@@ -193,6 +306,15 @@ int  eye_tag_depth();         // diagnostic: current ring occupancy
 // stereo routing cannot be trusted.
 unsigned long long pops_tagged();
 unsigned long long pops_mono();
+
+// Build 93: pushes dropped for a full ring. Any nonzero value means the eye
+// parity flipped and stayed flipped, because the producer toggles the eye
+// BEFORE it pushes. Never nonzero in any run measured so far.
+unsigned long long tag_drops();
+
+// Build 93: resynchronise the ring at session re-begin, so a headset doff does
+// not leave one stale tag in flight and swap the eyes for the rest of the run.
+void reset_eye_tags();
 
 // Build 19: VR AIM INJECTION accounting. The render thread injects head
 // yaw/pitch deltas into the engine's absolute aim pair (CameraProbe) and

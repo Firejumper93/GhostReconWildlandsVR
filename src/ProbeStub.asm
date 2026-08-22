@@ -65,6 +65,8 @@ EXTERN grwxr_headhide_on    : DWORD    ; 1 = force hide on the matching class
 EXTERN grwxr_headhide_calls : QWORD
 EXTERN grwxr_headhide_forced: QWORD
 EXTERN grwxr_headhide_obj   : QWORD    ; last matching object seen
+EXTERN grwxr_headhide_ring     : QWORD ; BUILD 121: 16 distinct objects
+EXTERN grwxr_headhide_ring_cls : QWORD ; their class method tables
 
 ; Build 67: the gun-root bone write. See CameraProbe.cpp for the evidence.
 EXTERN grwxr_wgun_skel  : QWORD        ; player skeleton to match, 0 = disarmed
@@ -103,6 +105,14 @@ EXTERN grwxr_ray2_orig  : QWORD
 ; Build 55, GetAimOrientation. The ONE stub here that can modify a result.
 EXTERN grwxr_aimq_post : PROC
 EXTERN grwxr_aimq_orig : QWORD
+
+; BUILD 105, the anchor world getters. Same shape as aimq: they RETURN a
+; value into the caller's buffer, so these CALL the original and then
+; post-process, rather than tail-jumping like the observers.
+EXTERN grwxr_aimpt_post   : PROC
+EXTERN grwxr_aimpt_orig   : QWORD
+EXTERN grwxr_muzpt_post   : PROC
+EXTERN grwxr_muzpt_orig   : QWORD
 
 ; Build 56, the ballistic projectile spawn.
 EXTERN grwxr_spawn_pre  : PROC
@@ -264,6 +274,35 @@ grwxr_setpitch_entry ENDP
 ; ---------------------------------------------------------------------------
 grwxr_headhide_entry PROC
     lock inc qword ptr [grwxr_headhide_calls]
+
+    ; BUILD 121 CENSUS. Record every DISTINCT object this setter is called on,
+    ; with its class method table, so we can see whether hands and helmet come
+    ; through here and not just the head. Runs BEFORE the class test on purpose:
+    ; the whole point is to see the objects that do NOT match.
+    ;
+    ; r10/r11/rax are volatile and are not argument registers for
+    ; SetHidden(rcx = this, dl = hidden), so clobbering them is safe. No call,
+    ; no stack, no allocation: rule 8 is unchanged. 16 slots, and once full the
+    ; scan simply stops recording, which is a bounded cost by construction.
+    lea     r10, [grwxr_headhide_ring]
+    xor     r11d, r11d
+hh_scan:
+    cmp     r11d, 16
+    jae     hh_census_done
+    mov     rax, [r10 + r11*8]
+    test    rax, rax
+    jz      hh_census_store
+    cmp     rax, rcx
+    je      hh_census_done
+    inc     r11d
+    jmp     hh_scan
+hh_census_store:
+    mov     [r10 + r11*8], rcx
+    mov     rax, [rcx+8]
+    lea     r10, [grwxr_headhide_ring_cls]
+    mov     [r10 + r11*8], rax
+hh_census_done:
+
     mov     rax, [grwxr_headhide_table]
     test    rax, rax
     jz      hh_pass
@@ -657,6 +696,67 @@ aq_done:
     add     rsp, 0B8h
     ret
 grwxr_aimq_entry ENDP
+
+; ---------------------------------------------------------------------------
+; BUILD 105: the anchor world getters.
+;
+;   float4* f(float4* out /*rcx*/, IBallisticGenerator* iface /*rdx*/)
+;   weapon = rdx - 0x80   (MSVC multiple-inheritance this-adjustment)
+;
+; Cloned from grwxr_aimq_entry above, which is the only proven
+; modify-the-result stub in this file, with ONE addition: rdx is preserved
+; across the original call and handed to the post routine, because the weapon
+; pointer is derived from it and there is no other way to reach the owner
+; gate.
+;
+; Stack safety: after `sub rsp,0B8h` the callee's shadow space overlaps our
+; [rsp+0..0x20), so every slot we use is at 0x40 or above. That is why aimq
+; chose 0x40 and 0x68, and it is why 0x48 is safe here.
+; ---------------------------------------------------------------------------
+grwxr_aimpt_entry PROC
+    sub     rsp, 0B8h
+    mov     [rsp+40h], rcx          ; the caller's output buffer
+    mov     [rsp+48h], rdx          ; the interface pointer (weapon + 0x80)
+
+    mov     r11, [grwxr_aimpt_orig]
+    call    r11
+    mov     [rsp+68h], rax
+
+    mov     rcx, [rsp+40h]
+    test    rcx, rcx
+    jz      ap_done
+    mov     rdx, [rsp+48h]
+    call    grwxr_aimpt_post        ; void post(float4* out, u64 iface)
+    mov     rcx, [rsp+40h]
+    movups  xmm0, xmmword ptr [rcx] ; keep both return conventions in agreement
+ap_done:
+    mov     rax, [rsp+68h]
+    add     rsp, 0B8h
+    ret
+grwxr_aimpt_entry ENDP
+
+; The muzzle twin. Observer only: it never modifies the result, it caches it
+; so the drain line can print the muzzle-to-aim-point distance. Kept in the
+; same shape as its sibling so the two cannot drift apart.
+grwxr_muzpt_entry PROC
+    sub     rsp, 0B8h
+    mov     [rsp+40h], rcx
+    mov     [rsp+48h], rdx
+
+    mov     r11, [grwxr_muzpt_orig]
+    call    r11
+    mov     [rsp+68h], rax
+
+    mov     rcx, [rsp+40h]
+    test    rcx, rcx
+    jz      mp_done
+    mov     rdx, [rsp+48h]
+    call    grwxr_muzpt_post        ; void post(const float4* out, u64 iface)
+mp_done:
+    mov     rax, [rsp+68h]
+    add     rsp, 0B8h
+    ret
+grwxr_muzpt_entry ENDP
 
 ; ---------------------------------------------------------------------------
 ; Build 56: the ballistic projectile spawn (thunk 0x02986B20 -> 0x12458BD0),

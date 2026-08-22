@@ -60,12 +60,27 @@ std::atomic<unsigned long long> g_player_obj{0};
 // fp_eye's 0.85 m origin-to-eye rise.
 std::atomic<bool>         g_fp_head_anchor{true};
 std::atomic<float>        g_fp_head_eye{0.10f};
+// Build 89: OFF by default. It changes who writes the camera pose, so it stays
+// opt-in until the headset says the write survives.
+std::atomic<bool>         g_cam_selector_pose{false};
+// Build 90: composing rotation is the designed behaviour at on_calc_mvp, so
+// this defaults ON. cfg turns it off for the selector stand-in, where a second
+// rotation authority is exactly what makes the camera fight.
+std::atomic<bool>         g_cam_pose_rot{true};
+// Build 91: the placement trio. Defaults are the flat FP mod's tuned values.
+std::atomic<float>        g_fp_fwd{0.07f};
+std::atomic<float>        g_fp_clamp{0.45f};
+std::atomic<float>        g_fp_smooth{40.0f};
+std::atomic<float>        g_fp_smooth_z{120.0f};
 std::atomic<unsigned int> g_head_node{0xFFFFu};
 
 // Build 12a. See HeadPose.h. Enabled by default: fullscreen is the intended
 // mode; Numpad 1 drops back to the windowed view for A/B.
 std::atomic<bool>  g_fs_enabled{true};
 std::atomic<float> g_fs_fov{1.92f};
+// Build 103: the fullscreen band's lower edge. 0.60 is the build 12a value,
+// so the default changes nothing.
+std::atomic<float> g_fs_fov_lo{0.60f};
 
 // Build 10b.1. Eye-tag ring, power-of-two size. 16 slots is far deeper than
 // any real render-ahead queue; a full ring drops the push, and the resulting
@@ -75,9 +90,24 @@ std::atomic<float> g_fs_fov{1.92f};
 // single producer fills the slot BEFORE the release store of g_tag_w, and the
 // single consumer reads it AFTER the acquire load, so the indices order every
 // slot access.
-struct Tag { uint8_t eye; float q[4]; };
+// BUILD 118-I, fault C instrument. The tag also carries the composed camera
+// base this frame was built from, WITHOUT the per-eye offset (CameraProbe's
+// g_base_pos), plus the guard state for that frame. Carrying them here rather
+// than opening a new channel is deliberate: the FIFO already guarantees the
+// fresh and stale eye of a submitted pair are exactly one present apart, so
+// the present side can difference the pair with no extra synchronisation.
+//   flags bit0  the capture-guard rescue fired on this frame
+//   flags bit2  first person was active on this frame
+// (bit1 is reserved for the capture valve, which does not exist in build 117;
+// do not renumber, the drain reads bits 0x03 as the C1 discriminator.)
+// Ring cost: 20 bytes padded to 24, now 37 padded to 40, times 16 slots, so
+// the whole ring goes from 384 to 640 bytes. Nothing to weigh.
+struct Tag { uint8_t eye; float q[4]; float base[3]; uint8_t flags; };
 constexpr uint64_t    kTagRing = 16;
 std::atomic<uint64_t> g_tag_w{0}, g_tag_r{0};
+// Build 93: pushes dropped because the ring was full. Never nonzero in any
+// measured run; a nonzero value means the eyes are swapped from that point on.
+std::atomic<uint64_t> g_tag_drops{0};
 Tag                   g_tags[kTagRing] = {};
 
 }  // namespace
@@ -124,6 +154,30 @@ float read_fov(float fallback) {
     float f;
     memcpy(&f, &bits, sizeof(f));
     return f;
+}
+
+// BUILD 118: the live near and far clip planes, from the same proj[2] hook
+// that publishes the fov. Two independent relaxed slots rather than a struct,
+// matching publish_fov exactly: the reader tolerates a torn pair because a
+// near from frame N with a far from frame N+1 is still a valid, in-range
+// frustum, and a seqlock on the engine thread would cost more than it saves.
+std::atomic<uint32_t> g_near_bits{0}, g_far_bits{0};
+
+void publish_clip(float near_m, float far_m) {
+    uint32_t nb, fb;
+    memcpy(&nb, &near_m, sizeof(nb));
+    memcpy(&fb, &far_m,  sizeof(fb));
+    g_near_bits.store(nb, std::memory_order_relaxed);
+    g_far_bits.store(fb,  std::memory_order_relaxed);
+}
+
+bool read_clip(float* near_out, float* far_out) {
+    const uint32_t nb = g_near_bits.load(std::memory_order_relaxed);
+    const uint32_t fb = g_far_bits.load(std::memory_order_relaxed);
+    if (!nb || !fb) return false;
+    memcpy(near_out, &nb, sizeof(*near_out));
+    memcpy(far_out,  &fb, sizeof(*far_out));
+    return true;
 }
 
 void publish_ipd(float ipd_meters) {
@@ -220,6 +274,54 @@ float fp_head_eye() {
     return g_fp_head_eye.load(std::memory_order_relaxed);
 }
 
+void set_cam_selector_pose(bool on) {
+    g_cam_selector_pose.store(on, std::memory_order_relaxed);
+}
+
+bool cam_selector_pose() {
+    return g_cam_selector_pose.load(std::memory_order_relaxed);
+}
+
+void set_cam_pose_rot(bool on) {
+    g_cam_pose_rot.store(on, std::memory_order_relaxed);
+}
+
+bool cam_pose_rot() {
+    return g_cam_pose_rot.load(std::memory_order_relaxed);
+}
+
+void set_fp_fwd(float meters) {
+    g_fp_fwd.store(meters, std::memory_order_relaxed);
+}
+
+float fp_fwd() {
+    return g_fp_fwd.load(std::memory_order_relaxed);
+}
+
+void set_fp_clamp(float meters) {
+    g_fp_clamp.store(meters, std::memory_order_relaxed);
+}
+
+float fp_clamp() {
+    return g_fp_clamp.load(std::memory_order_relaxed);
+}
+
+void set_fp_smooth(float ms) {
+    g_fp_smooth.store(ms, std::memory_order_relaxed);
+}
+
+float fp_smooth() {
+    return g_fp_smooth.load(std::memory_order_relaxed);
+}
+
+void set_fp_smooth_z(float ms) {
+    g_fp_smooth_z.store(ms, std::memory_order_relaxed);
+}
+
+float fp_smooth_z() {
+    return g_fp_smooth_z.load(std::memory_order_relaxed);
+}
+
 void set_head_node(unsigned int idx) {
     g_head_node.store(idx, std::memory_order_relaxed);
 }
@@ -252,27 +354,61 @@ float fs_fov() {
     return g_fs_fov.load(std::memory_order_relaxed);
 }
 
-void push_eye_tag(int eye, const float q_xr[4]) {
+// Build 103. See HeadPose.h for the measurement that made this a setting.
+void set_fs_fov_lo(float radians) {
+    if (radians < 0.05f) radians = 0.05f;
+    if (radians > 1.30f) radians = 1.30f;   // must stay under the 1.35 ceiling
+    g_fs_fov_lo.store(radians, std::memory_order_relaxed);
+}
+
+float fs_fov_lo() {
+    return g_fs_fov_lo.load(std::memory_order_relaxed);
+}
+
+void push_eye_tag(int eye, const float q_xr[4], const float base[3],
+                  unsigned char flags) {
     const uint64_t w = g_tag_w.load(std::memory_order_relaxed);
-    if (w - g_tag_r.load(std::memory_order_acquire) >= kTagRing) return;
+    if (w - g_tag_r.load(std::memory_order_acquire) >= kTagRing) {
+        // Build 93: COUNT THE DROP. The producer has ALREADY toggled the eye by
+        // the time it gets here, so a dropped push flips the eye parity for the
+        // rest of the run: every later frame is submitted to the wrong eye and
+        // nothing self-corrects. Silently returning made that failure invisible.
+        // Measured on 2026-08-15 (pops tagged 4834 against 4835 frames, depth
+        // never above 1), the ring has never actually overflowed, so this is a
+        // guard rail rather than a fix for an observed loss.
+        g_tag_drops.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     Tag& t = g_tags[w & (kTagRing - 1)];
     t.eye = (uint8_t)eye;
     for (int i = 0; i < 4; ++i) t.q[i] = q_xr[i];
+    // BUILD 118-I: filled before the release store below, like every other
+    // field, so the consumer's acquire load orders these too.
+    for (int i = 0; i < 3; ++i) t.base[i] = base ? base[i] : 0.0f;
+    t.flags = flags;
     g_tag_w.store(w + 1, std::memory_order_release);
 }
 
 std::atomic<uint64_t> g_pops_tagged{0}, g_pops_mono{0};
 
-int pop_eye_tag(float q_xr[4], bool* q_ok) {
+int pop_eye_tag(float q_xr[4], bool* q_ok, float base_out[3],
+                unsigned char* flags_out) {
     const uint64_t r = g_tag_r.load(std::memory_order_relaxed);
     if (g_tag_w.load(std::memory_order_acquire) == r) {
         g_pops_mono.fetch_add(1, std::memory_order_relaxed);
         if (q_ok) *q_ok = false;
+        // BUILD 118-I: a mono pop has no base and no flags. Zero them so a
+        // caller that forgets to check the -1 return cannot read a stale
+        // pair and difference two frames that were never paired.
+        if (base_out)  { base_out[0] = base_out[1] = base_out[2] = 0.0f; }
+        if (flags_out) *flags_out = 0;
         return -1;
     }
     const Tag& t = g_tags[r & (kTagRing - 1)];
     const int e = t.eye;
     for (int i = 0; i < 4; ++i) q_xr[i] = t.q[i];
+    if (base_out)  for (int i = 0; i < 3; ++i) base_out[i] = t.base[i];
+    if (flags_out) *flags_out = t.flags;
     if (q_ok) *q_ok = true;
     g_tag_r.store(r + 1, std::memory_order_release);
     g_pops_tagged.fetch_add(1, std::memory_order_relaxed);
@@ -281,6 +417,32 @@ int pop_eye_tag(float q_xr[4], bool* q_ok) {
 
 unsigned long long pops_tagged() { return g_pops_tagged.load(std::memory_order_relaxed); }
 unsigned long long pops_mono()   { return g_pops_mono.load(std::memory_order_relaxed); }
+unsigned long long tag_drops()   { return g_tag_drops.load(std::memory_order_relaxed); }
+
+// Build 93: RESYNC THE TAG RING WHEN THE SESSION RE-BEGINS.
+//
+// The pop sits after the `!g_active` early return in the present path, so the
+// present that handles STOPPING returns WITHOUT popping, while pushes stop
+// because disable() has cleared g_live. Ring depth is 1 at almost any instant,
+// so a doff and don leaves exactly one stale tag in flight and shifts the
+// pairing by one from then on. That SWAPS THE EYES for the rest of the session,
+// silently, with no counter moving.
+//
+// Called at re-begin rather than at STOPPING on purpose: a straggler push that
+// already passed the g_live check can land after disable() has returned, so
+// clearing at stand-down can be undone by a race that clearing at start-up
+// cannot.
+//
+// This also matters historically. The build 10m ipd_scale sign was calibrated
+// in one session on 2026-07-29, and a doff during that session would itself
+// have inverted the eyes mid-run. The stored sign may be a recording of this
+// bug rather than a property of the geometry, which is a second reason the
+// sign A/B has to be re-run, and a reason it must not be run until this fix is
+// in the deployed build.
+void reset_eye_tags() {
+    g_tag_r.store(g_tag_w.load(std::memory_order_acquire),
+                  std::memory_order_release);
+}
 
 // Build 19: absorbed aim-injection totals, geometric radians (HeadPose.h).
 static std::atomic<float> g_aim_cum_yaw{0.0f};

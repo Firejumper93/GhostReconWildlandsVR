@@ -124,6 +124,29 @@ volatile uint64_t grwxr_headhide_forced = 0;
 volatile uint64_t grwxr_headhide_obj    = 0;
 // Build 34: direct setter calls made on the FP toggle edge (instant hide).
 volatile uint64_t grwxr_headhide_direct = 0;
+
+// BUILD 121: THE HIDER CENSUS.
+//
+// Owner insight: the hider can hide HANDS, not just the head and helmet, and
+// the hands are where the weapon is actually held. So the question stops being
+// "did the head hide" and becomes "what else can this setter reach".
+//
+// Today the stub latches ONE object, the first whose class matches, and the
+// 1 Hz line reports that single pointer. In the 2026-08-20 run it reported the
+// same address for three minutes, which tells us nothing about whether hands
+// ever pass through at all.
+//
+// This records every DISTINCT object pointer the setter is called on, with its
+// class method table beside it. Distinct OBJECTS matter more than distinct
+// CLASSES here: head, helmet and hands are plausibly the same class as
+// separate visuals, so a class-only census would collapse them into one row.
+//
+// Cost: [VERIFIED, headset log grwxr-26616] the setter was called 21 times in
+// a three minute run. A 16-slot linear scan on a path that runs 21 times is
+// free, and the stub still makes no call, touches no stack and allocates
+// nothing, so rule 8 holds exactly as it did before.
+uint64_t grwxr_headhide_ring[16]     = {};   // distinct object pointers
+uint64_t grwxr_headhide_ring_cls[16] = {};   // their class method tables
 void  grwxr_headhide_entry();
 
 // Build 67: THE GUN-ROOT BONE WRITE. `[VERIFIED, headset, log grwxr-18692]`
@@ -155,9 +178,25 @@ volatile uint64_t grwxr_wg_nobuf  = 0;   // [pose+0x178] unreadable or null
 volatile uint64_t grwxr_wg_norec  = 0;   // bone record unreadable
 volatile uint64_t grwxr_wg_noray  = 0;   // no fresh controller ray
 volatile uint64_t grwxr_wg_badq   = 0;   // degenerate quaternion or axis
+// 2026-08-13: two-hand and roll accounting. two = frames the front hand had
+// some authority, tworej = frames the agreement gate refused it, roll = frames
+// a twist was applied. Read together these say whether the feature is actually
+// engaging in play or quietly never firing.
+volatile uint64_t grwxr_wg_two    = 0;
+volatile uint64_t grwxr_wg_tworej = 0;
+volatile uint64_t grwxr_wg_roll   = 0;
 volatile uint64_t grwxr_wg_rot    = 0;   // rotations actually written
 volatile uint64_t grwxr_wg_nopos  = 0;   // build 81: no controller position
 volatile uint64_t grwxr_wg_pos    = 0;   // build 81: positions written
+// Build 99: frames the front-hand hold slid the weapon along its barrel. Zero
+// with wgun_grip_two at 0 (the default) or with only one hand on the weapon,
+// so a nonzero value is proof the feature is engaging and not merely armed.
+volatile uint64_t grwxr_wg_grip   = 0;
+// Build 101: frames the safety clamp actually bit. A high count next to pos
+// means the gun is being held back from where the controller asked for it, and
+// the tester feels that as the weapon refusing to follow his hand. This existed
+// as a silent gate for eighteen builds and cost a tuning session.
+volatile uint64_t grwxr_wg_clamped = 0;
 
 // Build 68: THE WEAPON PLACEMENT SUBSTITUTION. Research verdict (2026-08-09,
 // docs/RESEARCH-IK-MOTION-CONTROLS-2026-08.md): every closed-engine precedent
@@ -233,7 +272,22 @@ struct SavedArgs {
 // Camera struct offsets, docs/RE-notes.md. All are read-only.
 constexpr size_t kOffMode = 0x290;   // int, camera mode/type enum
 constexpr size_t kOffWmo  = 0x2A0;   // Matrix4x4*, worldMatrixOverride
-constexpr size_t kOffFov  = 0x2BC;   // float, base field of view
+// CORRECTED 2026-08-20: +0x2BC is the BASE ASPECT MULTIPLIER, not the fov.
+// [VERIFIED] from projbuild (lastrites 0x0D7C0610), which computes
+//   aspect = Camera[0x2BC] * (viewportW / viewportH)
+// and only then derives the frustum. The real vertical fov in radians, the
+// value actually fed to tan(fov/2), is Camera+0x2B0. This field is read once
+// into a diagnostic and printed in one log line; nothing branches on it, so
+// the mislabel never changed behaviour. Renamed rather than repointed,
+// because the log line's meaning is what was wrong.
+constexpr size_t kOffAspect = 0x2BC; // float, base aspect multiplier
+// Neighbours, [VERIFIED] same listing, recorded so they are not re-derived:
+//   +0x2B0 float  vertical fov, radians (the true fov)
+//   +0x2B4 float  default near clip, initialised to 0.1f at 0x0D7A21D8
+//   +0x2B8 float  far clip
+//   +0x2C0 float  resolution scale
+//   +0x7A4 float  near clip OVERRIDE, used when |value| > 1e-5
+// NOTE: docs previously labelled +0x7A4 as fov. That is refuted; it is near.
 constexpr size_t kOffSkX  = 0x2C4;   // float, projection skew x
 constexpr size_t kOffSkY  = 0x2C8;   // float, projection skew y
 
@@ -253,7 +307,7 @@ CamFields read_camera(uint64_t p) {
         const auto* b = (const uint8_t*)p;
         memcpy(&c.mode, b + kOffMode, sizeof(c.mode));
         memcpy(&c.wmo,  b + kOffWmo,  sizeof(c.wmo));
-        memcpy(&c.fov,  b + kOffFov,  sizeof(c.fov));
+        memcpy(&c.fov,  b + kOffAspect, sizeof(c.fov));
         memcpy(&c.skx,  b + kOffSkX,  sizeof(c.skx));
         memcpy(&c.sky,  b + kOffSkY,  sizeof(c.sky));
         c.valid = true;
@@ -297,6 +351,18 @@ std::atomic<uint32_t> g_rows_used{0};
 // --- build 5: on_calc_mvp argument snapshot and camera matrix dump ----------
 
 constexpr uint64_t kOnCalcMvpProbe = 6;   // index into kTargets
+// Build 87: the OTHER target that receives the camera in rcx. on_calc_mvp is
+// the only writer of g_player_cam, and on the 2026-08-13 build its body could
+// not be re-derived, so that hook does not install and the camera object is
+// never captured. Everything downstream then fails silently and confusingly:
+// base_frame() returns false, so the controller ray never publishes, so the
+// weapon writer skips every call (noray), so no barrel direction is published
+// and barrel aim reports nodir forever. The 2026-08-14 headset run showed
+// exactly that chain: noray=4107, rots=0, pos=0, nodir=4417, frames=0.
+// The selector IS hooked and its rcx is the same camera, already validated by
+// the same read_camera + mode==0 test, so it can supply the pointer until
+// on_calc_mvp is re-derived.
+constexpr uint64_t kSelectorProbe  = 7;   // index into kTargets
 constexpr int      kNumArgs        = 21;  // 4 register + 17 stack
 
 // Build 9: the gameplay projection function, whose 5th argument is the
@@ -822,6 +888,11 @@ std::atomic<uint64_t> g_player_cam{0};
 // Build 15L: rcx captured at the cPlayerComponent::OnInit callee, and the
 // player entity resolved from it on the drain thread.
 std::atomic<uint64_t> g_playercomp{0};
+
+// BUILD 131: every cPlayerComponent seen this session, not just the newest.
+// See the capture site for why the single pointer was the bug. Sized and
+// filled exactly like g_skel_rcx, through the same capture_unique().
+std::atomic<uint64_t> g_pc_tab[kSkelPtrs] = {};
 std::atomic<uint64_t> g_player_entity{0};
 
 // The nine 4x4 matrices, docs/RE-notes.md, contiguous at Camera+0x420,
@@ -875,6 +946,40 @@ uint64_t g_last_frame  = ~0ull;
 float    g_base[9]     = {};
 float    g_base_pos[3] = {};
 int      g_eye_toggle  = 0;   // flips once per built frame; 0 left, 1 right
+// BUILD 125: +1 = the sign every build since 10m has used, -1 = the other one.
+// See the long comment at the offset site. This is the A/B that build 93 said
+// was needed and that no log line can settle.
+std::atomic<int> g_ipd_sign{1};
+
+// BUILD 100: the COMPOSED camera the frame was rendered with, latched once per
+// frame, and the frame number it belongs to.
+//
+// Build 98 latched g_base / g_base_pos instead, and that was the wrong end of
+// the write. Those hold the ENGINE's chase camera, captured BEFORE our write,
+// which in first person sits about 1.7 m up and behind the head. Feeding that
+// to the weapon put the gun 1.7 m high, and when the latch went stale the
+// fallback returned the composed viewpoint instead, so the two values the gun
+// alternated between were still 1.9 m apart. `[VERIFIED, headset, 2026-08-15]`
+// tester on build 99: "THE GUN IS TOO FAR UP AND JUST PHASES IN AND OUT OF
+// REALITY... THE JUTTER IS MUCH WORSE." All three symptoms are that inversion.
+//
+// These hold `out` and `pos` from the bottom of write_pose_head: the rotation
+// the frame is composed with (the engine's own when cam_pose_rot is off, the
+// composed one when it is on) and the viewpoint before the per-eye offset. That
+// is the camera the image is actually rendered from, which is what every
+// consumer of base_frame wants, and it is single valued for the whole frame.
+float g_vr_cam_rot[9] = {};
+float g_vr_cam_pos[3] = {};
+std::atomic<uint64_t> g_vr_cam_stamp{0};
+
+// BUILD 98 telemetry, so the next headset run grades itself. latch = reads
+// served from the per-frame engine capture, live = reads that fell through to
+// the camera object because the capture was stale. gap is the distance between
+// the two answers at the moment of a latch hit, which IS the jitter amplitude:
+// it read 1.91 m in grwxr-13140.log with the player standing still.
+std::atomic<uint64_t> g_bf_latch{0};
+std::atomic<uint64_t> g_bf_live{0};
+float g_bf_gap_last = 0.0f, g_bf_gap_max = 0.0f;
 
 // BUILD 10b.2 diagnostics: is the engine refreshing the POSITION row of
 // Camera+0x000 every frame, the way build 7 verified for rotation? If it is
@@ -885,6 +990,10 @@ int      g_eye_toggle  = 0;   // flips once per built frame; 0 left, 1 right
 //   vs-write ~ 0.03    -> engine rebuilt it: refreshed, offsets are clean.
 // Plain floats, engine thread writes, drain reads racily (diagnostic only).
 float g_diag_written[3]   = {};
+// Build 114: capture pollution guard. rescues = lifetime count,
+// rescue_run = consecutive rescues, capped so it can never stick.
+unsigned long long g_cap_rescues = 0;
+int g_cap_rescue_run = 0;
 bool  g_diag_have_written = false;
 float g_diag_step_last = 0, g_diag_step_max = 0;    // capture vs prev capture
 float g_diag_vsw_last  = 0, g_diag_vsw_max  = 0;    // capture vs last write
@@ -899,6 +1008,9 @@ float dist3(const float* a, const float* b) {
 std::atomic<uint64_t> g_head_writes{0};
 std::atomic<uint64_t> g_head_write_fails{0};
 std::atomic<uint64_t> g_head_frames{0};   // frames on which base was captured
+// Build 89: of those writes, how many came from the selector standing in for
+// an underived on_calc_mvp. Zero on a fully derived build.
+std::atomic<uint64_t> g_head_sel_writes{0};
 
 // BUILD 10b.1: the eye identity of every built frame travels WITH the frame.
 // Build 10b derived it from frame parity at present, assuming the frame built
@@ -907,8 +1019,26 @@ std::atomic<uint64_t> g_head_frames{0};   // frames on which base was captured
 // whenever the phase is odd (user report: stereo "totally unusable"). Now the
 // camera hook alternates its own eye toggle per built frame, offsets the
 // camera toward that eye, and pushes the tag into the HeadPose FIFO; VRMirror
-// pops one tag per present. Eye 0 is the left eye (XR view order), offset
-// -IPD/2 along the camera's right axis; eye 1 is +IPD/2.
+// pops one tag per present.
+//
+// Build 93, CORRECTED: this comment used to say "eye 0 is the left eye, offset
+// -IPD/2 along the camera's right axis; eye 1 is +IPD/2", which is the OPPOSITE
+// of what the code has done since build 10m. The code is
+// `s = g_eye_toggle ? -half : +half`, so eye 0 gets +half. Eye 0 IS the left
+// eye (OpenXR PRIMARY_STEREO view 0, and VRMirror submits index 0 as left), and
+// row 0 IS the camera's right axis, so positive ipd_scale displaces the LEFT
+// eye to the RIGHT, which is geometrically the swapped direction.
+//
+// That is deliberate, not a typo: build 10m folded the sign in after the user's
+// depth verdict landed at -0.50. But it can only be correct if the tag-to-
+// present pairing carries an odd frame shift that cancels it, and 10m measured
+// the COMPOSITE of sign and pairing parity without being able to separate them.
+// Build 89 then moved the toggle and the push to a different point relative to
+// the frame counter bump, which is exactly what can change that parity, and
+// build 93 fixed a doff bug that could have inverted the eyes mid-calibration.
+// So the stored sign is [UNKNOWN] rather than wrong, and it needs re-measuring
+// with the cfg A/B. Nothing is flipped here. NO LOG LINE CAN SETTLE IT: a
+// pairing shift moves no counter we print.
 // Build 15e: is the anchored path actually live? Reported at 1 Hz.
 std::atomic<bool> g_fp_anchored{false};
 
@@ -1245,6 +1375,121 @@ std::atomic<float> g_wgun_smooth{0.25f};
 std::atomic<float> g_wgun_maxstep{5.0f};
 std::atomic<uint32_t> g_wgun_gen{0};
 
+// 2026-08-13: two-handed aim and roll. Both default ON: a weapon you hold with
+// two hands and can twist is the point of the feature, and both degrade to the
+// previous one-handed behaviour on their own when the inputs are not there.
+std::atomic<int>   g_wgun_twohand{1};
+std::atomic<int>   g_wgun_roll{1};
+std::atomic<float> g_wgun_roll_deg{0.0f};   // the unknown gun-up constant
+
+// The separation band over which the front hand takes authority. Below Lo the
+// weapon is aimed as it was before; above Hi the front hand has it entirely.
+//
+// Sized for compressed holds, not for the 0.497 m measured standing. Full
+// authority is kept down to 0.22 m so the front hand never goes soft in a
+// working position. The fade below that is not a preference, it is the point
+// where the geometry stops carrying a direction: error scales as jitter over
+// separation, so at 0.12 m a millimetre of tracking noise is already about
+// half a degree of muzzle, and it diverges as the hands meet.
+constexpr float kTwoHandLo    = 0.12f;   // m
+constexpr float kTwoHandHi    = 0.22f;   // m
+
+// How far the hand-to-hand line may disagree with the rear controller's own
+// forward before the frame is refused. Loose on purpose: it is there to catch
+// tracking pops and an off hand somewhere impossible, not to constrain how the
+// weapon is held.
+constexpr float kTwoHandAgree = 0.35f;   // cos, about 69 degrees
+
+// BUILD 120: the gate is TUNABLE now, and it MEASURES itself.
+//
+// Why: the 2026-08-20 headset run reported two=4028 tworej=9556. The gate
+// refused SEVENTY PERCENT of two-handed frames, which is not a tracking-pop
+// rate, it is a systematic disagreement. A gate written to catch "an off hand
+// somewhere impossible" was instead deciding whether two-handed works at all,
+// and it was hard-coded so the owner could not chase it from the headset.
+//
+// Default is kTwoHandAgree exactly, so this build changes NOTHING until the
+// value is moved. Band is -1.00 to 1.00, which is the full range of a cosine:
+// -1.00 accepts every frame including a fully reversed hold, 1.00 accepts only
+// a perfectly aligned one. Those are the real limits of the quantity, not a
+// guess about what a tester could want. At -1.00 the gate is off, which is a
+// legitimate diagnostic setting: if two-handed becomes reliable there, the
+// gate was the whole problem.
+std::atomic<float> g_wg_two_agree{kTwoHandAgree};
+
+// BUILD 123: WHICH HAND IS IN FRONT IS MEASURED, NOT ASSUMED.
+//
+// The block below was written around "the rear hand is the RIGHT hand and the
+// front hand is the LEFT", which is how a right-handed shooter holds a rifle.
+// `[VERIFIED, log grwxr-29396, 128 samples]` that is inverted for this tester.
+// Of the 11 samples with the hands more than 0.30 m apart, the only ones that
+// can be a two-handed hold at all, the median angle between the hand-to-hand
+// line and the right controller's own aim was 140 degrees, and the five widest
+// read 141, 137, 148, 146 and 147. A front hand cannot sit behind the muzzle.
+// Flipped, those same samples read 39, 43, 32, 34 and 33 degrees, which is an
+// ordinary rifle hold. His RIGHT hand is the front hand.
+//
+// That single sign is the whole reason the gate refused 100% of frames
+// (mean 90 deg, best 81 deg, threshold 70 deg, zero accepted). The gate was
+// never tight. It was reading the barrel backwards, and every plan to widen
+// the threshold would have made it worse, because at 0.00 it lands exactly on
+// the measured mean and would flip between accepting and refusing at 72 Hz.
+//
+// So the direction is taken rear-to-front with the rear hand DETERMINED, by
+// projecting the hand-to-hand line onto the aim the rear controller already
+// publishes and flipping it when it points backwards. This is handedness
+// agnostic: it works for a left-handed and a right-handed hold with no setting,
+// and it cannot make a correct hold worse, because a correct hold never trips
+// the flip. 1 = measure (default), 0 = the pre-123 fixed assumption.
+std::atomic<int> g_wg_two_auto{1};
+volatile uint64_t grwxr_wg_twoflip = 0;   // frames the front hand was the right
+
+std::atomic<uint64_t> g_wg_agree_n{0};       // refused samples
+std::atomic<uint64_t> g_wg_agree_sum_milli{0};   // sum of (agree*1000)+1000
+std::atomic<int32_t>  g_wg_agree_best_milli{-2000};  // best refused, *1000
+std::atomic<int32_t>  g_wg_agree_acc_worst_milli{2000};  // worst ACCEPTED
+
+// Drained at 1 Hz. Reports the gate's own decisions so the threshold can be
+// chosen from measurement. `best` is the closest a REFUSED frame came to
+// passing, `mean` is the average refused cosine, and `acc_worst` is the worst
+// frame that was ACCEPTED. If `best` sits just under the threshold the gate is
+// merely a little tight; if `mean` is far below it, the hold genuinely does
+// not match the rear controller's forward and the fix is elsewhere.
+void two_agree_report(char* out, size_t n) {
+    const uint64_t cnt = g_wg_agree_n.load(std::memory_order_relaxed);
+    const float thr = g_wg_two_agree.load(std::memory_order_relaxed);
+    if (!cnt) {
+        snprintf(out, n, "twoagree: thr=%.2f (%.0f deg), no refusals | "
+                 "auto=%d frontRIGHT=%llu",
+                 thr, acosf(thr < -1.f ? -1.f : (thr > 1.f ? 1.f : thr)) * 57.29578f,
+                 g_wg_two_auto.load(std::memory_order_relaxed),
+                 (unsigned long long)grwxr_wg_twoflip);
+        return;
+    }
+    const float mean = (float)((double)g_wg_agree_sum_milli.load(std::memory_order_relaxed)
+                               / (double)cnt) / 1000.0f - 1.0f;
+    const float best = (float)g_wg_agree_best_milli.load(std::memory_order_relaxed) / 1000.0f;
+    const int32_t aw = g_wg_agree_acc_worst_milli.load(std::memory_order_relaxed);
+    snprintf(out, n,
+             "twoagree: thr=%.2f (%.0f deg) | refused=%llu best=%.2f (%.0f deg) "
+             "mean=%.2f (%.0f deg) | accepted_worst=%.2f | auto=%d frontRIGHT=%llu",
+             thr, acosf(thr) * 57.29578f,
+             (unsigned long long)cnt,
+             best, acosf(best < -1.f ? -1.f : (best > 1.f ? 1.f : best)) * 57.29578f,
+             mean, acosf(mean < -1.f ? -1.f : (mean > 1.f ? 1.f : mean)) * 57.29578f,
+             aw > 1000 ? 1.0f : (float)aw / 1000.0f,
+             g_wg_two_auto.load(std::memory_order_relaxed),
+             (unsigned long long)grwxr_wg_twoflip);
+}
+
+
+// The measurement, so the threshold stops being an argument. Every frame that
+// reaches the gate records its cosine; the drain reports the worst and the
+// mean of the REFUSED ones, which is the number that says how far the gate
+// would have to move to accept his actual hold.
+
+
+
 // Build 81: position, off by default so the verified rotation cannot regress
 // behind it. clamp is the hard cap in metres on how far the gun may sit from
 // the engine's own placement, which bounds every possible tracking failure.
@@ -1253,11 +1498,39 @@ std::atomic<float> g_wgun_pos_scale{1.0f};
 std::atomic<float> g_wgun_pos_clamp{1.0f};
 std::atomic<float> g_wgun_pos_smooth{0.35f};
 
+// Build 99: the grip. See CameraProbe.h. All zero = the build 81 behaviour.
+std::atomic<float> g_wgun_grip_fwd{0.0f};
+std::atomic<float> g_wgun_grip_lat{0.0f};
+std::atomic<float> g_wgun_grip_up{0.0f};
+std::atomic<float> g_wgun_grip_two{0.0f};
+// BUILD 126: bypass the static grip offset for the blob test. Does NOT
+// overwrite the tuned values, so the test costs nothing to undo.
+std::atomic<int>   g_wgun_grip_bypass{0};
+// `[VERIFIED, 2026-08-13]` the support hand sits this far along the barrel from
+// the gun root, measured on the ANIMATED skeleton (so it is the engine's own
+// idea of where the front hand belongs), stable to one millimetre over 112
+// samples and cross-checking a prior session's 0.498 m total distance.
+const float kHandguardFwd = 0.481f;
+
 // Build 35: NO CAMERA BLUR (RE-notes "NO CAMERA BLUR, decoded from the
 // community FP mod's cheat table", session 23). The community FP mod ships
 // without the FP body blur; its cheat table's whole mechanism is one byte,
 // the immediate of `mov sil, 1` forced to 0 inside the function that also
-// compares the uncracked name hash 0x826846F3. Re-derived in our build:
+// compares the name hash 0x826846F3.
+//
+// CRACKED 2026-08-20: 0x826846F3 is zlib crc32("Fake_gunroot"). The engine
+// stores bone names only as CRC32 (they exist as strings nowhere in GRW.exe
+// nor in any of the 29,640 extracted DataPC files), which is why this sat
+// unidentified. So the function we patch is gun-root related, not a generic
+// blur routine, and the same immediate appears in GetGunRootBone
+// (0x14D531BC, `mov r8d, 0x826846F3`) as its fallback bone name.
+//
+// This matters for anti-tamper review: one of the 28 named triggers is
+// GR_sCameraDepthRangeBlurSubComponent_TamperedBlur, and this is a real
+// .text write in the blur subsystem. Whether that trigger can observe this
+// byte is [UNKNOWN] and is under investigation. Do not widen this patch.
+//
+// Re-derived in our build:
 // expected match RVA 0x124DE4CC, patch byte at match+5 (RVA 0x124DE4D1).
 // WRITE-CLASS NOTE, stated honestly: this is our first write inside a real
 // function body rather than an int3-padded thunk slot (same class as the
@@ -1269,11 +1542,145 @@ constexpr const char* kNoBlurSig      =
     "45 89 E6 40 B6 01 E8 ? ? ? ? 3D F3 46 68 82";
 uint8_t* g_noblur_byte = nullptr;
 
+// BUILD 119: THE ENGINE'S OWN CAMERA POSE OFFSET. Data only, no hook.
+//
+// The owner's insight O-5 was that the engine ARBITRATES the camera and we are
+// an unregistered contender. This is the registration. The engine ships a
+// singleton whose whole purpose is "add this to the gameplay camera", and it
+// reads it every frame of normal play:
+//
+//   struct CameraPoseOffset {        // vtable 0x039B6D88, ctor 0x0C1945D0
+//     void*  vtbl;                   // +0x00
+//     float  pos[4];                 // +0x10  init 0     WORLD space
+//     float  quat[4];                // +0x20  init identity, CAMERA-LOCAL
+//     float  fov;                    // +0x30  init 0     radians
+//     uint8  mode;                   // +0x34  init 1     see below
+//   };
+//
+// *** +0x34 IS NOT AN ENABLE FLAG. CORRECTED 2026-08-20. ***
+// [VERIFIED, asm at 0x0C233F18] it selects between two branches:
+//     CMP byte [RAX+0x34],0
+//     JZ  -> MOVAPS XMM0,[RAX+0x10]   ; ZERO  = ABSOLUTE: pose := offset
+//                                     ;   VERBATIM, discarding the game camera
+//            ADDPS  XMM0,[RAX+0x10]   ; NONZERO = additive (ctor default 1)
+//
+// So writing 0 to "turn it off" would SLAM THE CAMERA to whatever pos holds.
+// To stand down, write identity (pos 0, quat 0,0,0,1, fov 0) and LEAVE +0x34
+// ALONE. Never write +0x34 unless you specifically want absolute camera
+// authority, which is a different feature with different risks.
+//
+// THREE MORE THINGS THAT WILL BITE, all [VERIFIED]:
+//  1. pos is WORLD space and is NOT rotated by the camera basis. A headset
+//     head translation must be rotated into world space by the composed
+//     camera orientation first, or leaning goes in a fixed world direction
+//     regardless of which way the player is facing.
+//  2. KEEP pos.w = 0. The add covers all four lanes and the matrix build ORs
+//     the bit pattern of 1.0f into w, so a non-zero w corrupts it rather than
+//     being ignored.
+//  3. The FOV add is CONDITIONALLY DISCARDED: per viewport, if
+//     sceneObject+0x286 != 0 the fov comes from +0x290 instead and the
+//     composed fov is thrown away. That is the same override the scope work
+//     wants to use. Do not build anything load-bearing on offset.fov.
+//
+// LIFETIME: [VERIFIED] the destructor at 0x0C19C124 sets the GLOBAL to NULL.
+// Re-read the pointer every frame; a null deref here is a crash, not a
+// glitch. A pointer that is null or has changed means the object was
+// reconstructed (which also resets pos/quat/fov and forces additive mode),
+// so re-assert. Never cache the OBJECT address across a level load.
+//
+// MODE GATING IS BETTER THAN FEARED: [VERIFIED] this is the ONLY read site,
+// reached only from director mode 1. Modes 0, 2, 3, 4 and 5 take different
+// branches and never touch the offset, so a stale value CANNOT corrupt
+// cutscene, vehicle, drone, photo or menu views through this path. But during
+// a camera BLEND mode 1 falls through and the offset is not applied, so head
+// translation freezes for the blend. Let it freeze; do not compensate.
+//
+// COLLISION ORDER, and it is the opposite of the feared one: [INFERRED,
+// strong] the camera collision solve has already finished when we are called,
+// and the engine never re-solves against our result, so head translation does
+// NOT fight the spring rail and cannot oscillate. The real hazard is that
+// leaning toward a wall puts the eye THROUGH it with no push-back. A
+// mod-side clamp is required; the engine will not provide one.
+//
+// Consumed at 0x0C233EEC inside CameraDirector's mode-1 (normal gameplay)
+// apply path: `cmp byte [rax+0x34],0` then `addps xmm0,[rax+0x10]` and a
+// Hamilton product q_component (x) q_offset, then the result goes through
+// Camera::SetWorldTransform for every live camera.
+//
+// [VERIFIED] It is UNCONTENDED. A scan of every disp32 in .reloc/.link
+// resolving to the global, validated against real instruction boundaries,
+// finds three construction sites and EXACTLY ONE READ. No shipped code ever
+// writes a non-zero value into it.
+//
+// WHY THIS IS DIFFERENT FROM SceneView+0x14D: there, the interesting branch
+// has almost certainly never executed in a shipped game. Here the CONSUMING
+// branch executes 72 times a second because the constructor sets enabled=1.
+// Only the values are zero. Writing them turns `addps xmm0,[rax+0x10]` from
+// adding zero into adding something. No new control flow anywhere.
+//
+// Three further properties that matter:
+//   - the quaternion is applied in the CAMERA'S OWN FRAME, which is exactly
+//     the convention a VR head rotation wants
+//   - NO ALIGNMENT HAZARD: the engine's movaps/addps read ITS OWN aligned
+//     object, unlike Camera+0x2A0 where we supply the movaps source
+//   - capture pollution becomes structurally impossible, because a clean
+//     engine pose stays readable at component+0xE0/+0xF0 at all times
+//
+// HONEST LIMITATION: the consumer runs in the GRAPHICS phase, so this fixes
+// the VIEW and does NOT reach the *AfterCamera bone tasks. Camera-relative
+// arm and head posing still animates against the engine's own camera.
+//
+// The signature anchors the global by its own rip-relative load, so no
+// address is hardcoded. Scanned against the LIVE 2026-08-19 GRW.exe: 1 hit.
+constexpr const char* kCamOffsetSig =
+    "48 8B 05 ? ? ? ? 0F 28 87 E0 00 00 00 0F 28 AF F0 00 00 00 "
+    "F3 0F 10 B7 00 01 00 00 F3 0F 11 75 30 0F 29 44 24 30 "
+    "0F 29 6C 24 20 80 78 34 00 0F 84 ? ? ? ? 0F 58 40 10";
+uint8_t** g_camoff_global = nullptr;   // -> CameraPoseOffset*
+std::atomic<uint64_t> g_camoff_writes{0};
+std::atomic<uint32_t> g_camoff_state{0};   // 0 unresolved, 1 resolved, 2 disabled by engine
+
 // Build 16a diagnostics, written by the camera hook, read by the 1 Hz drain.
 // Plain floats: a torn diagnostic read is harmless.
 float g_head_pos[3]    = {};
 float g_head_dz        = 0.0f;   // head height above the character origin
 bool  g_head_valid     = false;
+
+// Build 91: viewpoint placement state. Engine thread only, same as g_base and
+// g_head_pos above, and written under the same SEH guard.
+//
+// The last non-degenerate HORIZONTAL camera forward. When the view looks near
+// straight up or down the forward row has almost no horizontal part, so the
+// forward eye offset would collapse to zero and leave the viewpoint on the bare
+// head joint, which is inside the skull. Reusing the last good one keeps the
+// eyes clear of it.
+float g_lastfwd[2]     = {};
+bool  g_lastfwd_ok     = false;
+
+// Build 93: THE HEAD ROTATION THE EYE TAG ADVERTISED, latched per frame.
+//
+// The tag is pushed once, at the frame boundary, carrying the Q from the FIRST
+// call of that frame. But headpose::read(H, Q) was re-read on EVERY call, and
+// since build 89 there are about 3 calls per frame from two distinct call sites
+// (measured 2026-08-15: 0x0138D49C at ~1.95/frame and 0x0D7B8DAC at ~0.97).
+// So if the render thread published a new orientation between call 1 and call
+// 3, the camera was composed with a NEWER rotation than the tag advertised, and
+// the compositor then timewarped from a pose the content was never rendered
+// with. That is precisely the error build 13a exists to remove, reintroduced by
+// the higher call rate at the selector site.
+//
+// Latching here is what "frame-idempotent" was always supposed to mean.
+float g_frameH[9]      = {};
+
+// The EMA position filter, held in ORIGIN-RELATIVE space. See HeadPose.h.
+float g_flt[3]         = {};
+bool  g_flt_valid      = false;
+int64_t g_flt_qpc      = 0;
+int64_t g_qpc_freq     = 0;
+
+// Diagnostics for the placement, printed on the fp: line.
+std::atomic<uint64_t> g_fp_clamped{0};   // anchor clamp fired
+std::atomic<uint64_t> g_fp_snaps{0};     // filter reset to raw (jump or NaN)
 std::atomic<uint64_t> g_head_reads{0}, g_head_rejects{0};
 
 bool skel_is_humanoid(uint64_t p) {
@@ -1422,13 +1829,69 @@ bool write_pose_head(uint64_t cam, const float* H, const float* Q) {
     // frame_count() is bumped in the Present hook, so it is stable across the
     // frame build; the calls/frame ratio in the drain log verifies that.
     const uint64_t f = d3d11::frame_count();
+    // Build 100: captured before the block below clears it, so the latch at the
+    // bottom of this function fires on the FIRST call of a frame only. The
+    // selector is entered about three times per frame and the EMA advances on
+    // each, so latching on every call would put a millimetre of per-call wobble
+    // back into the value this exists to make frame-stable.
+    const bool first_of_frame = (f != g_last_frame);
     __try {
         if (f != g_last_frame) {
-            for (int r = 0; r < 3; ++r)
+            // BUILD 114: THE CAPTURE POLLUTION GUARD. Session 37 NEXT item 1,
+            // specced then and never built. This is the jitter fix, and it is
+            // independent of the pin.
+            //
+            // The mod writes the camera, then next frame re-reads the SAME
+            // field to recover the engine's base. About half the time it reads
+            // back its own write because the engine has not restored yet. The
+            // 2026-08-19 20:12 run shows the result as discrete levels rather
+            // than noise: vs-write sat at 0.0000, 1.5470, 1.9397, 2.7867 and
+            // 4.4721. Those are 0x, 1x and 2x the push lever, i.e. the error
+            // COMPOUNDS when a polluted capture is itself written from.
+            //
+            // The tester sees exactly that, and described it before this was
+            // measured: three image positions per eye, "once too far left then
+            // left, and between that a correct image", cycling. Three levels,
+            // mirrored per eye because the eye offset rides on the same base.
+            // It happens standing still, which fits: the race is frame to
+            // frame, not motion driven.
+            //
+            // The guard: if the candidate capture lands within epsilon of our
+            // own last write, the engine has not restored, so keep the
+            // previous frame's base instead of laundering our own output back
+            // in as if it were the engine's.
+            //
+            // Only while the push is active. Session 37 measured healthy
+            // vs-write at 0.027 with FP off, which is not separable from a
+            // polluted read, so guarding there would misfire constantly.
+            //
+            // SAFETY VALVE, and it is deliberate: at most two consecutive
+            // rescues, then the capture is accepted whatever it looks like. A
+            // guard that can hold the base forever would freeze the camera if
+            // the epsilon is ever wrong, which is a worse failure than the one
+            // being fixed. Two builds regressed tonight; this one cannot get
+            // stuck.
+            float cand_pos[3];
+            for (int c = 0; c < 3; ++c) cand_pos[c] = m[12 + c];
+
+            bool polluted = false;
+            if (g_diag_have_written && g_diag_have_prev &&
+                headpose::fp_enabled() && g_cap_rescue_run < 2) {
+                polluted = dist3(cand_pos, g_diag_written) < 0.10f;
+            }
+
+            if (polluted) {
+                ++g_cap_rescue_run;
+                ++g_cap_rescues;
+                // g_base and g_base_pos deliberately keep last frame's values.
+            } else {
+                g_cap_rescue_run = 0;
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c)
+                        g_base[r * 3 + c] = m[r * 4 + c];
                 for (int c = 0; c < 3; ++c)
-                    g_base[r * 3 + c] = m[r * 4 + c];
-            for (int c = 0; c < 3; ++c)
-                g_base_pos[c] = m[12 + c];
+                    g_base_pos[c] = cand_pos[c];
+            }
             if (g_diag_have_prev) {
                 g_diag_step_last = dist3(g_base_pos, g_diag_prev_cap);
                 if (g_diag_step_last > g_diag_step_max) g_diag_step_max = g_diag_step_last;
@@ -1444,7 +1907,21 @@ bool write_pose_head(uint64_t cam, const float* H, const float* Q) {
             // Build 13a: the tag carries the XR-space orientation this frame
             // is being composed with, so the present side can submit the true
             // render pose (see HeadPose.h).
-            headpose::push_eye_tag(g_eye_toggle, Q);
+            // BUILD 118-I: the tag also carries the engine camera base this
+            // frame's write is built from, plus the guard state, so the
+            // present side can measure per-eye base disagreement (fault C
+            // candidate C1) without opening a new channel. g_base_pos, NOT
+            // g_vr_cam_pos: g_vr_cam_pos is stamped at the bottom of
+            // write_pose_head, which runs AFTER this block, so reading it
+            // here would silently hand over the PREVIOUS frame's value.
+            unsigned char tflags = 0;
+            if (polluted)               tflags |= 0x01u;
+            if (headpose::fp_enabled()) tflags |= 0x04u;
+            headpose::push_eye_tag(g_eye_toggle, Q, g_base_pos, tflags);
+            // Build 93: latch the rotation that this frame's tag advertises, so
+            // every later call of the same frame composes with exactly it. See
+            // the comment at g_frameH.
+            memcpy(g_frameH, H, sizeof(g_frameH));
             g_head_frames.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -1474,10 +1951,34 @@ bool write_pose_head(uint64_t cam, const float* H, const float* Q) {
         // roll-less base; engine camera roll (shakes) is dropped while it is
         // active, which is accepted v1 jank. While aim_cum is (0,0), the raw
         // base is used untouched: byte-identical to build 18 behaviour.
+        // Build 90: ROTATION COMPOSE IS OPTIONAL, and off by default at the
+        // selector site.
+        //
+        // The 2026-08-15 run put first person on screen for the first time
+        // since the update and the tester's verdict was that the camera
+        // fights: it answered to both controllers and to the headset at once.
+        // The cause is that composing here puts a SECOND authority on a
+        // channel that already has one. Head look already reaches the view
+        // through the SetYaw/SetPitch absorb-and-inject path, which is why
+        // build 88 feels correct with no camera write at all, and the barrel
+        // aim steers that same channel by design.
+        //
+        // Corroboration from an independent implementation of the same feature
+        // on the same engine (the flat first-person mod, FpCamera.cpp, which
+        // worked on the previous binary): "Pose is READ AND WRITTEN (fourth
+        // row only)". It moves the viewpoint and never touches the basis,
+        // because on flat the mouse owns rotation. Here the headset owns it,
+        // through the setters, and the same reasoning applies.
+        //
+        // With rotation off, this function does exactly two things, both of
+        // them position: put the viewpoint at the head bone, and offset it per
+        // eye. Neither can argue with where you are looking.
+        const bool rot = headpose::cam_pose_rot();
+
         const float* B = g_base;
         float rebuilt[9];
         float cy = 0, cp = 0;
-        if (headpose::aim_cum(&cy, &cp)) {
+        if (rot && headpose::aim_cum(&cy, &cp)) {
             float sp = g_base[5];
             if (sp >  0.9999f) sp =  0.9999f;
             if (sp < -0.9999f) sp = -0.9999f;
@@ -1494,16 +1995,28 @@ bool write_pose_head(uint64_t cam, const float* H, const float* Q) {
         }
 
         float out[9];
-        for (int r = 0; r < 3; ++r) {
-            for (int c = 0; c < 3; ++c) {
-                out[r * 3 + c] = H[r * 3 + 0] * B[0 + c]
-                               + H[r * 3 + 1] * B[3 + c]
-                               + H[r * 3 + 2] * B[6 + c];
+        if (rot) {
+            // Build 93: g_frameH, the LATCHED rotation, not the argument H. The
+            // argument is re-read on every call of the frame and can be newer
+            // than the eye tag says. See the comment at g_frameH.
+            const float* FH = g_frameH;
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    out[r * 3 + c] = FH[r * 3 + 0] * B[0 + c]
+                                   + FH[r * 3 + 1] * B[3 + c]
+                                   + FH[r * 3 + 2] * B[6 + c];
+                }
             }
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c)
+                    m[r * 4 + c] = out[r * 3 + c];
+        } else {
+            // Position-only: the engine keeps its own basis, so the eye offset
+            // rides the ENGINE's right axis rather than a composed one. Row 0
+            // of g_base is that axis, already unit length. Nothing is written
+            // to the rotation rows at all.
+            memcpy(out, g_base, sizeof(out));
         }
-        for (int r = 0; r < 3; ++r)
-            for (int c = 0; c < 3; ++c)
-                m[r * 4 + c] = out[r * 3 + c];
 
         // The eye offset. Row 0 of the composed rotation is the camera's
         // right basis vector in world space (row-vector convention, unit
@@ -1518,7 +2031,30 @@ bool write_pose_head(uint64_t cam, const float* H, const float* Q) {
         // eye routing. The sign is folded in here: positive scale is now the
         // correct-depth direction. (10e's eye-swap null predates fusion and
         // said nothing about this.)
-        const float half = 0.5f * headpose::read_ipd(0.063f) * headpose::ipd_scale();
+        // BUILD 125: THE EYE-SIGN A/B. The one thing no log line can settle.
+        //
+        // The build 93 comment above this function states that positive
+        // ipd_scale displaces the LEFT eye to the RIGHT, "geometrically the
+        // swapped direction", and that the stored sign is [UNKNOWN] rather
+        // than wrong because build 10m measured the COMPOSITE of sign and
+        // frame-pairing parity without being able to separate them. Builds 89
+        // and 93 both moved things that can change that parity.
+        //
+        // Why this is worth a build: REVERSED STEREO FUSES FINE AT TINY
+        // DISPARITY AND HURTS AT LARGE. That is exactly the reported shape.
+        // `[VERIFIED, 479-log sweep]` ipd_scale has only ever been PERSISTED at
+        // 0.50 and 0.90, 1.00 has NEVER been run, and 0.05 is a saturated
+        // hotkey reached in 4.1 seconds, not an optimum. If the sign is
+        // inverted then 0.05 is simply the largest reversed disparity the eyes
+        // will tolerate, and every "world is 20x too big" symptom follows from
+        // running a 3 mm eye separation to get there.
+        //
+        // Live and hotkeyable ON PURPOSE. A cfg edit plus a relaunch cannot
+        // A/B a fusion judgement: the eyes adapt over seconds and the
+        // comparison has to be back to back on the same view. Default +1 is
+        // the pre-125 behaviour exactly.
+        const float half = 0.5f * headpose::read_ipd(0.063f) * headpose::ipd_scale()
+                           * (float)g_ipd_sign.load(std::memory_order_relaxed);
         const float s    = g_eye_toggle ? -half : +half;
         // Build 11c: first-person DEMO. Push the viewpoint forward along the
         // BASE (game camera) forward row, so the offset lands at the
@@ -1546,6 +2082,11 @@ bool write_pose_head(uint64_t cam, const float* H, const float* Q) {
                 // freed or recycled object reads as garbage and is dropped.
                 if (isfinite(o[0]) && isfinite(o[1]) && isfinite(o[2]) &&
                     dist3(o, g_base_pos) < 12.0f) {
+                    // Build 91: keep the CHARACTER ORIGIN before the head bone
+                    // overwrites o below. The clamp measures against it, and
+                    // the EMA filters relative to it, which is the whole reason
+                    // the filter costs no velocity lag.
+                    float orig[3] = {o[0], o[1], o[2]};
                     // Build 16a: THE HEAD BONE takes over from the origin
                     // when it reads back sane. The origin anchor stays as the
                     // fallback on every failure path, so a bad rig, a
@@ -1603,10 +2144,143 @@ bool write_pose_head(uint64_t cam, const float* H, const float* Q) {
                     pos[0] = o[0] + as * g_base[0];
                     pos[1] = o[1] + as * g_base[1];
                     pos[2] = o[2] + as * g_base[2] + rise;  // world up is +Z
+
+                    // Build 91: THE PLACEMENT TRIO. Only meaningful on the head
+                    // bone anchor, which is the animated one; the character
+                    // origin does not bob and is already where the clamp would
+                    // put it. See HeadPose.h for why each of these exists.
+                    if (head_ok) {
+                        // 1. FORWARD EYE OFFSET, horizontalized. The joint is
+                        // at the base of the skull and the eyes are forward of
+                        // it. Horizontalized so this frame's pitch cannot
+                        // translate this frame's position, which would be a
+                        // feedback path between looking down and moving.
+                        const float fwd = headpose::fp_fwd();
+                        if (fwd > 0.0f) {
+                            float dx = g_base[3], dy = g_base[4];
+                            const float l2 = dx * dx + dy * dy;
+                            bool have = false;
+                            if (l2 >= 0.04f) {
+                                const float inv = 1.0f / sqrtf(l2);
+                                dx *= inv;
+                                dy *= inv;
+                                g_lastfwd[0] = dx;
+                                g_lastfwd[1] = dy;
+                                g_lastfwd_ok = true;
+                                have = true;
+                            } else if (g_lastfwd_ok) {
+                                dx   = g_lastfwd[0];
+                                dy   = g_lastfwd[1];
+                                have = true;
+                            }
+                            if (have) {
+                                pos[0] += dx * fwd;
+                                pos[1] += dy * fwd;
+                            }
+                        }
+
+                        // 2. ANCHOR CLAMP against the character ORIGIN, which
+                        // is why orig was kept before the head overwrote o.
+                        const float cl = headpose::fp_clamp();
+                        if (cl > 0.0f) {
+                            const float dx = pos[0] - orig[0];
+                            const float dy = pos[1] - orig[1];
+                            const float d2 = dx * dx + dy * dy;
+                            if (d2 > cl * cl) {
+                                const float k = cl / sqrtf(d2);
+                                pos[0] = orig[0] + dx * k;
+                                pos[1] = orig[1] + dy * k;
+                                g_fp_clamped.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            }
+                        }
+
+                        // 3. EMA FILTER, in origin-relative space. dt from QPC,
+                        // which is lock-free user mode and rule 8 clean. The
+                        // clamp on dt keeps several calls per frame advancing
+                        // the filter consistently rather than in one jump.
+                        const float tau_h = headpose::fp_smooth();
+                        const float tau_z = headpose::fp_smooth_z();
+                        if (tau_h > 0.0f || tau_z > 0.0f) {
+                            if (!g_qpc_freq) {
+                                LARGE_INTEGER qf;
+                                QueryPerformanceFrequency(&qf);
+                                g_qpc_freq = qf.QuadPart;
+                            }
+                            const float rel[3] = {pos[0] - orig[0],
+                                                  pos[1] - orig[1],
+                                                  pos[2] - orig[2]};
+                            LARGE_INTEGER now;
+                            QueryPerformanceCounter(&now);
+                            float dt = 0.0f;
+                            if (g_flt_qpc && g_qpc_freq > 0 &&
+                                now.QuadPart > g_flt_qpc) {
+                                dt = (float)((double)(now.QuadPart - g_flt_qpc)
+                                             * 1000.0 / (double)g_qpc_freq);
+                            }
+                            g_flt_qpc = now.QuadPart;
+                            if (dt > 100.0f) dt = 100.0f;
+                            if (g_flt_valid) {
+                                const float ex = rel[0] - g_flt[0];
+                                const float ey = rel[1] - g_flt[1];
+                                const float ez = rel[2] - g_flt[2];
+                                // A deviation more than 2 m from the filter's
+                                // is not a real pose: the clamp and the
+                                // plausibility gates bound real values under a
+                                // metre. Snap rather than glide across it.
+                                if (ex * ex + ey * ey + ez * ez > 4.0f) {
+                                    g_flt[0] = rel[0];
+                                    g_flt[1] = rel[1];
+                                    g_flt[2] = rel[2];
+                                    g_fp_snaps.fetch_add(
+                                        1, std::memory_order_relaxed);
+                                } else {
+                                    const float ah = tau_h > 0.0f
+                                        ? dt / (tau_h + dt) : 1.0f;
+                                    const float az = tau_z > 0.0f
+                                        ? dt / (tau_z + dt) : 1.0f;
+                                    g_flt[0] += ah * ex;
+                                    g_flt[1] += ah * ey;
+                                    g_flt[2] += az * ez;
+                                }
+                            } else {
+                                g_flt[0]    = rel[0];
+                                g_flt[1]    = rel[1];
+                                g_flt[2]    = rel[2];
+                                g_flt_valid = true;
+                            }
+                            pos[0] = orig[0] + g_flt[0];
+                            pos[1] = orig[1] + g_flt[1];
+                            pos[2] = orig[2] + g_flt[2];
+                        }
+                    } else {
+                        // Build 94: THE HEAD-READ FAILURE PATH.
+                        //
+                        // When the head bone does not read back sane, `rise`
+                        // switches from fp_head_eye (0.10, joint to eyes) to
+                        // fp_eye (0.85, origin to eyes). That is a 0.75 m jump
+                        // in the viewpoint, and the placement trio above is
+                        // skipped entirely, so nothing filters it. Worse, the
+                        // filter state was left VALID, so the return to the head
+                        // anchor then glided in from stale deviation rather than
+                        // snapping to the live head.
+                        //
+                        // rejects has been 0 in every measured session, so this
+                        // has never fired. But the plausibility gate it depends
+                        // on is at half margin in prone (measured 2026-08-15:
+                        // the prone head sits 0.38 m out against a 1.0 m reject
+                        // radius), so it is reachable.
+                        g_flt_valid = false;
+                        g_lastfwd_ok = false;
+                    }
                     anchored = true;
                 }
             }
             if (!anchored) {
+                // Build 91: every stand-down invalidates the position filter,
+                // so resuming snaps to the live head instead of gliding in from
+                // wherever the filter was left.
+                g_flt_valid = false;
                 // Build 11c/11f push, unchanged, including the fp_side
                 // shoulder correction: that offset exists ONLY to undo the
                 // third-person camera hanging off the right shoulder.
@@ -1625,6 +2299,24 @@ bool write_pose_head(uint64_t cam, const float* H, const float* Q) {
             g_diag_written[c] = m[12 + c];
         }
         g_diag_have_written = true;
+
+        // BUILD 100: LATCH THE COMPOSED CAMERA. See the comment at
+        // g_vr_cam_pos for why this and not g_base_pos.
+        //
+        // `pos` WITHOUT the per-eye offset on purpose: the offset alternates
+        // sign every frame, and publishing it would hand every consumer a few
+        // centimetres of left-right shudder at frame rate. `out` is the
+        // rotation this frame is composed with, which is the engine's own when
+        // cam_pose_rot is off and the composed one when it is on, so it is
+        // correct either way with no extra branch.
+        //
+        // Stamped LAST with release ordering, so a reader on the present thread
+        // that sees frame f sees the rows belonging to frame f.
+        if (first_of_frame) {
+            memcpy(g_vr_cam_rot, out, sizeof(g_vr_cam_rot));
+            memcpy(g_vr_cam_pos, pos, sizeof(g_vr_cam_pos));
+            g_vr_cam_stamp.store(f, std::memory_order_release);
+        }
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -1666,13 +2358,114 @@ extern "C" void grwxr_probe_record(uint64_t index, const void* saved_raw,
             // misregistered sky layer slid against the world ("the clouds
             // followed the headset"). 1.35 keeps everything real (world
             // 0.78..0.87, sprint/vehicle ~1.22) and releases the captures.
+            // BUILD 103: the lower edge is a setting now. It was 0.60 here,
+            // and plain ADS publishes 0.3300 rad on this binary, so ADS fell
+            // out of this band, out of the flat-scope path below
+            // mono_scope_fov, and out of head-aim injection below 0.65, and
+            // got drawn at its true 18.9 degrees into a black canvas. See
+            // HeadPose.h at set_fs_fov_lo. Default is still 0.60.
             const float fs = headpose::fs_fov();
             if (headpose::fs_enabled() && fs > 0.0f &&
-                fovy >= 0.60f && fovy <= 1.35f) {
+                fovy >= headpose::fs_fov_lo() && fovy <= 1.35f) {
                 fovy = fs;
                 memcpy(&stack_args[4], &fovy, sizeof(fovy));
             }
             headpose::publish_fov(fovy);
+
+            // BUILD 118: publish the LIVE near and far clip planes.
+            //
+            // [VERIFIED 2026-08-20] proj[2] on this binary is persp2
+            // (lastrites 0x0D7BB920), whose signature is
+            //   persp2(Matrix4x4* outProj, Matrix4x4* outInvProj,
+            //          float near /*xmm2*/, float far /*xmm3*/,
+            //          float fovY /*stack_args[4]*/, float aspect, rect[4])
+            // so near and far are already sitting in the saved register block
+            // this probe receives. No new hook, no new register save, two
+            // loads on a path that is already running.
+            //
+            // WHY IT MATTERS: XR_KHR_composition_layer_depth needs nearZ and
+            // farZ, and the constructor defaults (0.1 near, 1200.0 far, from
+            // Camera::Camera 0x0C4FC070) are only defaults. The engine
+            // overrides near per frame via Camera+0x7A4, and has a one-shot
+            // "far = near + 0.1" sliver mode on Camera+0x7B1 bit 0.
+            //
+            // IT ALSO SETTLES REVERSED-Z WITHOUT A SEARCH. projbuild
+            // (0x0D7C0610) implements reversed-Z by SWAPPING these two
+            // arguments, so near > far here means the engine took that branch
+            // and near maps to NDC 1. Reading it back is the project rule;
+            // assuming the convention is how this class of bug is made.
+            const float near_p = a->xmm2[0];
+            const float far_p  = a->xmm3[0];
+            if (near_p > 0.0f && far_p > 0.0f && near_p != far_p)
+                headpose::publish_clip(near_p, far_p);
+        }
+    }
+
+    // Build 87: FALLBACK CAPTURE OF THE CAMERA OBJECT.
+    //
+    // Only on_calc_mvp writes g_player_cam, and on binaries where that row is
+    // not derived it never installs, leaving the pointer null forever. This
+    // supplies it from the selector instead, which is hooked, whose rcx is the
+    // same camera, and which passes the same read_camera + mode==0 validation.
+    //
+    // Deliberately does NOT touch the camera pose: it only records the
+    // pointer, so base_frame() and the controller ray come back while the
+    // stereo write stays exactly where on_calc_mvp owns it. If on_calc_mvp is
+    // present it runs first and stores the same value, so this is a no-op on
+    // a fully derived build rather than a second writer competing with it.
+    //
+    // Rule 8 clean: one relaxed store on a path that already reads the camera.
+    //
+    // Build 89: THE POSE WRITE MOVES HERE TOO, under cfg cam_selector_pose.
+    //
+    // Build 87 deliberately recorded the pointer and nothing else, on the
+    // reasoning that the stereo write should stay where on_calc_mvp owns it.
+    // The 2026-08-15 headset log showed what that costs: write_pose_head is
+    // called from exactly ONE site, the on_calc_mvp recorder, so on this
+    // binary it never runs. `head compose: idle` for the whole session, and
+    // with it g_base and g_base_pos stay {0,0,0}. That is not a partial loss:
+    //   - FP anchoring tests dist3(head, camera) < 12 m against a camera at
+    //     the origin, so it measures the player's world coordinate (6836 m)
+    //     and never anchors
+    //   - the 11c push fallback adds fp_forward * g_base[3..5], which is zero,
+    //     so the FP toggle moves the viewpoint nowhere at all
+    //   - the per-eye IPD offset is written by the same function, so both eyes
+    //     get the same image and the headset is MONO
+    //
+    // The selector is the only other target with rcx_is_camera, it passes the
+    // same read_camera + mode==0 validation, and it is called ~3 times per
+    // frame; write_pose_head is frame-idempotent, so that rate is fine.
+    //
+    // What is NOT known and only the headset can answer: whether the selector
+    // runs before the engine recomputes the camera pose, in which case our
+    // write is overwritten and this does nothing. That failure is harmless and
+    // self-diagnosing, `aim: aer: basepos step / vs-write` measures it.
+    //
+    // Deferral, not competition: the write is skipped entirely once
+    // on_calc_mvp is seen running, so a build that derives that row keeps the
+    // single writer it was designed around without a cfg change.
+    if (index == kSelectorProbe) {
+        const bool want_pose =
+            headpose::cam_selector_pose() &&
+            g_calls[kOnCalcMvpProbe].load(std::memory_order_relaxed) == 0;
+        if (want_pose || !g_player_cam.load(std::memory_order_relaxed)) {
+            const CamFields cs = read_camera(a->rcx);
+            if (cs.valid && cs.mode == 0) {
+                g_player_cam.store(a->rcx, std::memory_order_relaxed);
+                if (want_pose) {
+                    float H[9], Q[4];
+                    if (headpose::read(H, Q)) {
+                        if (write_pose_head(a->rcx, H, Q)) {
+                            g_head_writes.fetch_add(1, std::memory_order_relaxed);
+                            g_head_sel_writes.fetch_add(1,
+                                                        std::memory_order_relaxed);
+                        } else {
+                            g_head_write_fails.fetch_add(
+                                1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1721,7 +2514,26 @@ extern "C" void grwxr_probe_record(uint64_t index, const void* saved_raw,
     if (index == kPlayerCompProbe) {
         // One-shot-ish: OnInit runs at spawn. Publish the component pointer;
         // the drain thread does the (guarded) [+0x10] read.
+        //
+        // BUILD 131: KEEP THEM ALL, not just the last one.
+        //
+        // A bare store means the LAST cPlayerComponent to initialise becomes
+        // "the player" forever: a squadmate, a respawn, a vehicle transition,
+        // anything. If that pointer's entity is not the one whose skeleton is
+        // in the ring, the owner test `[skel+0x10] == pent` can never match,
+        // no pin is ever taken, and the camera sits on the 11c chase-rig push.
+        // That is cause (a) written down by build 113 and never resolved:
+        // "pent is wrong, so we are comparing against the wrong entity and the
+        // player's skeletons are sitting in the ring unmatched."
+        //
+        // `[VERIFIED, grwxr-27148]` a whole run with first person on where the
+        // ring lookup missed on every sample.
+        //
+        // The donor is the FP mod's resolve_player(), which has always kept a
+        // TABLE of components and scored the candidates. Same author, same
+        // engine, method ported and re-derived here, not copied wholesale.
         g_playercomp.store(a->rcx, std::memory_order_relaxed);
+        capture_unique(g_pc_tab, a->rcx);
     }
     if (index == kSkelPostProbe) {
         capture_unique(g_skel_rcx, a->rcx);
@@ -1862,7 +2674,23 @@ bool install() {
     static_assert(kNumTargets == 11, "kTargets and the entry table must match");
 
     int ok = 0;
+    // Build 91: SKIP UNDERIVED ROWS EXPLICITLY, and say so.
+    //
+    // A row that is {0, 0} on this binary used to fall through to
+    // install(base + 0, base + 0, ...), which ThunkHook correctly refuses
+    // because the byte at the image base is not 0xE9. It failed safe, but it
+    // logged "thunk at <image base> does not start with E9 (found 0x4D)", which
+    // reads like a corrupt hook rather than "this row is not derived on this
+    // build". That message cost real time on 2026-08-14 and again on 08-15.
+    int missing = 0;
     for (int i = 0; i < kNumTargets; ++i) {
+        if (!gb->cam[i].fn || !gb->cam[i].thunk) {
+            ++missing;
+            grwxr_probe_originals[i] = nullptr;
+            LOG_WARN("camera: %s is NOT DERIVED on this build (rule 7): "
+                     "nothing installed for it.", kTargets[i].name);
+            continue;
+        }
         uint8_t* fn = img->base + gb->cam[i].fn;
         grwxr_probe_originals[i] = fn;
         if (g_hooks[i].install(img->base + gb->cam[i].thunk, fn, entries[i],
@@ -1871,7 +2699,22 @@ bool install() {
         }
     }
 
+    // Build 91: `ok > 0` called ONE hook of eleven a success. On the Last Rites
+    // binary that let the mod run a whole session with the camera write site
+    // missing while reporting healthy, which is exactly the silent degradation
+    // the 2026-08-15 session spent hours diagnosing by hand. The flat FP mod
+    // requires ok == want and rolls back otherwise. We do not roll back here,
+    // because ten of these rows carry features that work perfectly well without
+    // the eleventh and refusing all of them would be worse, but the log now
+    // states the shortfall in one line instead of burying it in a count.
     g_any = ok > 0;
+    const int want = kNumTargets - missing;
+    if (ok != want || missing) {
+        LOG_WARN("camera: %d of %d targets hooked, %d row(s) not derived on "
+                 "this build, %d derived row(s) FAILED to install. Features "
+                 "behind the missing rows are OFF, not broken.",
+                 ok, kNumTargets, missing, want - ok);
+    }
     LOG_INFO("camera: %d of %d targets hooked.", ok, kNumTargets);
     if (!g_any) {
         LOG_ERROR("camera: nothing installed. The game runs unmodified.");
@@ -1916,6 +2759,22 @@ bool install() {
                       "RVA 0x%08zX). Head hide OFF, everything else runs.",
                       setter ? "matched at the WRONG address" : "missed",
                       m, (size_t)gb->head_setter_impl);
+            hh_ok = false;
+        }
+        // Build 91: head_table is {0} on binaries where it could not be derived
+        // (the vtable holds no absolute VAs on disk because Denuvo resolves them
+        // at runtime, so a content scan returns zero hits even in the binary
+        // where the answer is known). Without this check the memcpy below reads
+        // img->base + 0x1F0, which is inside the PE HEADER, gets a zero, and
+        // reports "slot +0x1F0 resolves to 0x0 ... NOT the class we analysed".
+        // That is a misdiagnosis of a derivation gap as a class mismatch, and
+        // the 2026-08-15 log shows it verbatim.
+        if (hh_ok && !gb->head_table) {
+            LOG_WARN("hide: head_table is NOT DERIVED on this build (rule 7). "
+                     "Head hide OFF. This is a missing address, not a class "
+                     "mismatch: the on-disk vtable carries no absolute VAs "
+                     "because Denuvo resolves them at runtime, so it needs a "
+                     "runtime census rather than a scan.");
             hh_ok = false;
         }
         auto slotfn = sig::find_unique(*img, kHeadSlotFnSig, &m);
@@ -2005,6 +2864,70 @@ bool install() {
     } else if (!safe) {
         LOG_INFO("wnode: SetWorldTransform not derived for this binary. The "
                  "weapon placement override is OFF (rule 7).");
+    }
+
+    // BUILD 119: resolve the engine's CameraPoseOffset singleton. Read only
+    // here; nothing is written unless cfg cam_offset arms it. The global is
+    // recovered from the consuming instruction's own rip-relative
+    // displacement, so no address is hardcoded and a game update that moves
+    // the code moves the anchor with it.
+    {
+        size_t m = 0;
+        auto hit = sig::find_unique(*img, kCamOffsetSig, &m);
+        if (!hit) {
+            LOG_ERROR("camoff: CameraPoseOffset signature %s (matches=%zu). "
+                      "The engine-offset camera route is OFF; everything else "
+                      "runs normally (rule 7).", m ? "AMBIGUOUS" : "missed", m);
+        } else {
+            // 48 8B 05 <disp32> : mov rax,[rip+disp32]; next insn is at +7.
+            int32_t disp = 0;
+            memcpy(&disp, *hit + 3, sizeof(disp));
+            uint8_t* global = *hit + 7 + disp;
+            g_camoff_global = (uint8_t**)global;
+            uint8_t* obj = nullptr;
+            __try {
+                obj = *g_camoff_global;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                obj = nullptr;
+                g_camoff_global = nullptr;
+            }
+            // SAFETY GATE, and it is not optional. The GLOBAL at 0x04BBB2D0
+            // lives inside the section that also carries Denuvo's genuine
+            // flag (0x046C2E70). Writing a zero into that flag turns on the
+            // game's own sabotage, which includes SKIPPING SAVES ENTIRELY.
+            // See the ANTI-TAMPER section of docs/RE-notes.md.
+            //
+            // What we write is the OBJECT, which the constructor heap
+            // allocates, not the pointer slot. That is correct by
+            // construction, but "correct by construction" is exactly the kind
+            // of reasoning that stops being true after a game patch moves an
+            // allocator. So prove it every run instead of assuming it: if the
+            // object address lands inside any section of the game module, we
+            // have misread the indirection and MUST NOT arm.
+            bool obj_in_module = false;
+            if (obj) {
+                const uint8_t* lo = img->base;
+                const uint8_t* hi = img->base + img->size;
+                obj_in_module = (obj >= lo && obj < hi);
+            }
+            if (obj_in_module) {
+                g_camoff_global = nullptr;
+                g_camoff_state.store(3, std::memory_order_relaxed);
+                LOG_ERROR("camoff: object %p is INSIDE the game module "
+                          "(base %p, size 0x%zX). That means the pointer "
+                          "indirection was misread, and writing it would be a "
+                          "write into the module image, which is where the "
+                          "anti-tamper genuine flag lives. ROUTE DISABLED.",
+                          (void*)obj, (void*)img->base, (size_t)img->size);
+            } else {
+                LOG_INFO("camoff: CameraPoseOffset global at RVA 0x%08zX, "
+                         "object %p%s (off-module, heap: safe to write). "
+                         "Read only until cfg cam_offset=1 arms it.",
+                         (size_t)(global - img->base), (void*)obj,
+                         obj ? "" : " null this early, re-resolved per frame");
+                g_camoff_state.store(1, std::memory_order_relaxed);
+            }
+        }
     }
 
     // Build 35: the no-camera-blur byte. See the constants block for the
@@ -2150,9 +3073,77 @@ constexpr int kLockSwitchTicks = 3;   // consecutive clear wins before a switch
 // snapshot as soon as the recorder fills one, and every 20 seconds re-arms the
 // snapshot and dumps the matrices. Independent of the survey throttle below so
 // neither starves the other.
+void drain_head_telemetry(int ticks);   // build 91, defined below
+
 void snap_drain() {
     static int ticks = 0;
     ++ticks;
+
+    // Build 91: FIRST, before any early return. The "player entity is live"
+    // branch below ends in an unconditional return, which silently killed this
+    // telemetry for the whole of every session once the entity latched.
+    drain_head_telemetry(ticks);
+
+    // BUILD 119: THE TAMPER CANARY. A 4-byte READ. Nothing is written.
+    //
+    // The game ships an anti-tamper apparatus whose responses are all
+    // GAMEPLAY SABOTAGE dressed as bugs: player damage, weapon spread
+    // randomisation, permanent night, broken revives, exploding loot, and
+    // most importantly trigger ID 7, which is WHEN_GENUINE and skips
+    // GR_MissionManager_SaveData entirely. Not genuine means NO SAVE.
+    //
+    // [VERIFIED 2026-08-20, live exe] The flag is the dword at RVA
+    // 0x046C2E70. 1 = GENUINE, 0 = TAMPERED, established from branch
+    // polarity across all 16 trigger sites (WHEN_GENUINE compiles to
+    // cmp reg,1/jne; WHEN_TAMPERED to test reg,reg/jne).
+    //
+    // [VERIFIED] In the shipped image the flag has exactly ONE writer, at
+    // 0x0E0AC01A, and it is unreachable dead code: its guard is
+    // `if (time(NULL) == 0)`, its only entry thunk has zero call sites, and
+    // the value it writes is 0x0BADBABE, which is neither 0 nor 1 and would
+    // disable both paths. So in retail the flag reads 1 forever and every
+    // sabotage is dead code.
+    //
+    // [UNKNOWN] whether Denuvo's runtime layer, which executes from memory
+    // outside every loaded module and cannot be read statically, writes it.
+    // That is exactly why this canary exists. A read cannot cause what it
+    // detects, and it converts a deliberately-deniable failure mode into one
+    // log line.
+    //
+    // THE STANDING SYMPTOM RULE: before calling any blur, softness, weapon
+    // inaccuracy, wrong ammo count, unexplained damage, stuck night or failed
+    // save a mod bug, read this line first, then rename dxgi.dll and repeat.
+    {
+        static uint32_t s_last = 0xFFFFFFFFu;
+        const uint8_t* img = (const uint8_t*)GetModuleHandleW(nullptr);
+        uint32_t g = 0xFFFFFFFFu;
+        if (img) {
+            __try {
+                g = *(const volatile uint32_t*)(img + 0x046C2E70);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                g = 0xFFFFFFFFu;
+            }
+        }
+        // Log on change, and once at startup. A steady 1 is the boring,
+        // correct answer and does not deserve a line every second.
+        if (g != s_last) {
+            s_last = g;
+            if (g == 1u) {
+                LOG_INFO("tamper: canary=1 GENUINE (anti-tamper sabotage is "
+                         "inactive; every WHEN_TAMPERED response is dead code)");
+            } else if (g == 0u) {
+                LOG_ERROR("tamper: canary=0 TAMPERED. THE GAME'S OWN SABOTAGE "
+                          "IS ACTIVE: weapon spread, player damage, forced "
+                          "night, broken revives, AND SAVING IS SKIPPED. "
+                          "Quit, rename dxgi.dll, and verify game files.");
+            } else {
+                LOG_ERROR("tamper: canary=0x%08X, neither 0 nor 1. Either the "
+                          "offset moved with a game patch (re-pin RVA "
+                          "0x046C2E70) or the flag was poisoned. Treat any "
+                          "odd gameplay as suspect until this reads 1.", g);
+            }
+        }
+    }
 
     // Build 11a diagnostic: the live published fov, once per second. This is
     // the number the scaling blit places the content with, and the dataset
@@ -2160,7 +3151,24 @@ void snap_drain() {
     // class and read the values off these lines.
     {
         const float f = headpose::read_fov(0.0f);
-        if (f > 0.0f) LOG_INFO("fov: %.4f rad (%.1f deg)", f, f * 57.29578f);
+        if (f > 0.0f) {
+            // BUILD 118: near/far ride the fov line rather than opening a new
+            // one. They answer two questions at once: the real clip planes for
+            // the depth layer, and whether this build is running reversed-Z
+            // (near > far, because projbuild implements it by swapping the
+            // arguments). Both were previously assumed from constructor
+            // defaults, which the engine overrides per frame.
+            float np = 0.0f, fp = 0.0f;
+            if (headpose::read_clip(&np, &fp)) {
+                LOG_INFO("fov: %.4f rad (%.1f deg) | near=%.4f far=%.1f %s",
+                         f, f * 57.29578f, np, fp,
+                         np > fp ? "REVERSED-Z (near maps to NDC 1)"
+                                 : "normal Z (near maps to NDC 0)");
+            } else {
+                LOG_INFO("fov: %.4f rad (%.1f deg) | near/far not published yet",
+                         f, f * 57.29578f);
+            }
+        }
     }
 
     if (g_snap_state.load(std::memory_order_acquire) == 2) {
@@ -2666,17 +3674,75 @@ void snap_drain() {
         // cluster of skeleton instances (body + gear), so take the cluster
         // member nearest the camera. No alignment, no distance guessing, no
         // toggle needed: NPCs are structurally excluded.
-        if (const uint64_t pc = g_playercomp.load(std::memory_order_relaxed)) {
-            uint64_t ent = 0;
-            if (read_block(pc + 0x10, &ent, sizeof(ent)) &&
-                ent > 0x10000 && !(ent & 7)) {
+        // BUILD 131: pick the player entity that actually OWNS A BODY IN THE
+        // RING, instead of trusting whichever component initialised last.
+        //
+        // Every candidate component is turned into an entity, and an entity is
+        // only accepted if the ring holds a skeleton it owns whose rig
+        // contains a Head bone. The Head-bone test is what separates the BODY
+        // from the gear rigs: one character is a cluster of skeleton
+        // instances, and only the body has a head. A candidate that fails is
+        // not the player no matter how recently it initialised.
+        //
+        // If nothing resolves this tick, the previous entity is KEPT. Losing
+        // the pin is what puts the camera on the chase rig, so the pin is only
+        // ever replaced, never cleared, by this path.
+        {
+            uint64_t best_ent = 0, best_skel = 0;
+            uint32_t best_node = 0xFFFFu;
+            for (int i = 0; i < kSkelPtrs && !best_ent; ++i) {
+                const uint64_t pc = g_pc_tab[i].load(std::memory_order_relaxed);
+                if (!pc) continue;
+                uint64_t ent = 0;
+                if (!read_block(pc + 0x10, &ent, sizeof(ent)) ||
+                    ent <= 0x10000 || (ent & 7))
+                    continue;
+                for (uint32_t r = 0; r < kRingSize; ++r) {
+                    const uint64_t p =
+                        g_skel_ring[r].load(std::memory_order_relaxed);
+                    if (!p) continue;
+                    uint64_t own = 0;
+                    if (!read_block(p + 0x10, &own, sizeof(own)) || own != ent)
+                        continue;
+                    uint64_t rig = 0;
+                    if (!read_block(p + 0x220, &rig, sizeof(rig)) ||
+                        rig < 0x10000 || (rig & 7))
+                        continue;
+                    const int node = rig_find_node(rig, 0x07C159A2u);
+                    if (node < 0) continue;   // gear rig, no Head: not the body
+                    best_ent  = ent;
+                    best_skel = p;
+                    best_node = (uint32_t)node;
+                    break;
+                }
+            }
+            if (best_ent) {
                 const uint64_t was =
-                    g_player_entity.exchange(ent, std::memory_order_relaxed);
-                if (was != ent)
-                    LOG_INFO("fp: player ENTITY 0x%012llX (from "
-                             "cPlayerComponent 0x%012llX)",
-                             (unsigned long long)ent,
-                             (unsigned long long)pc);
+                    g_player_entity.exchange(best_ent, std::memory_order_relaxed);
+                headpose::set_player_obj(best_skel);
+                headpose::set_head_node(best_node);
+                if (was != best_ent)
+                    LOG_INFO("fp: player ENTITY 0x%012llX PINNED, body "
+                             "skeleton 0x%012llX, Head node %u (chosen from "
+                             "the component table because it owns a rig with "
+                             "a head, build 131)",
+                             (unsigned long long)best_ent,
+                             (unsigned long long)best_skel, best_node);
+            } else if (const uint64_t pc =
+                           g_playercomp.load(std::memory_order_relaxed)) {
+                // Nothing in the ring this tick. Keep whatever is pinned and
+                // publish the entity only, exactly as before this build.
+                uint64_t ent = 0;
+                if (read_block(pc + 0x10, &ent, sizeof(ent)) &&
+                    ent > 0x10000 && !(ent & 7)) {
+                    const uint64_t was = g_player_entity.exchange(
+                        ent, std::memory_order_relaxed);
+                    if (was != ent)
+                        LOG_INFO("fp: player ENTITY 0x%012llX (from "
+                                 "cPlayerComponent 0x%012llX)",
+                                 (unsigned long long)ent,
+                                 (unsigned long long)pc);
+                }
             }
         }
         const uint64_t pent = g_player_entity.load(std::memory_order_relaxed);
@@ -2707,6 +3773,208 @@ void snap_drain() {
             }
             if (bestp) {
                 headpose::set_player_obj(bestp);
+
+                // -----------------------------------------------------------
+                // BUILD 116: ARM THE GUN-ROOT WRITE FROM HERE, EVERY TICK.
+                //
+                // This block used to live ~320 lines below, inside the
+                // (ticks % 5) == 2 hand census, inside `if (wpn)`, five levels
+                // down. It had no business being there. Arming acts on the
+                // PLAYER rig's gun-root bone, resolved from the PLAYER rig's
+                // own name map; it reads nothing from the hand census and
+                // nothing from the weapon census. Sitting there made arming a
+                // three-way coincidence on a single 1 Hz tick:
+                //
+                //   1. bestp live. g_skel_ring is 128 entries of
+                //      SkeletonPostUpdate rcx, written ~144 times a second PER
+                //      SKELETON, so the player's body is evicted within
+                //      seconds. Measured window: 1 to 5 s per entity latch,
+                //      in good runs and bad alike.
+                //   2. (ticks % 5) == 2. One tick in five, for no reason.
+                //   3. g_wskel_cand already non-zero. A separate warm-up that
+                //      the gun-root write does not depend on.
+                //
+                // Both 2026-08-20 failures are [VERIFIED] in the logs and they
+                // fail on DIFFERENT conditions, which is what proves the nest
+                // is the defect rather than any one gate:
+                //
+                //   grwxr-18852 (115.2): bestp live 00:03:02..00:03:05, i.e.
+                //     ticks%5 = 3,4,0,1. The next (ticks%5)==2 tick was
+                //     00:03:06 and bestp had died. MISSED BY ONE TICK.
+                //   grwxr-18668 (115): hit the (ticks%5)==2 tick at
+                //     23:47:19.645, but that same tick logged `wskel: no pick`.
+                //     The census picked at 23:47:20.655. MISSED ON COND 3.
+                //
+                // Every run that DID arm armed EXACTLY ONCE (5700, 3768,
+                // 11324: one `wgun: ARMED` line each). A lottery win, not a
+                // mechanism. Here only condition 1 remains.
+                //
+                // The bone index is still re-resolved from this rig's name map
+                // on every tick and never cached across ticks, so a rig that
+                // does not carry the bone DISARMS rather than writing a wrong
+                // one, and a rig swap (respawn, outfit, vehicle) self-corrects
+                // within one second. Skeleton pointer is published LAST,
+                // exactly as before: the asm stub reads it first and treats
+                // zero as disarmed, so a half-published state can never write.
+                //
+                // Rule 8 is unaffected: this is the 1 Hz init/drain thread,
+                // not Present and not a per-draw hook.
+                // -----------------------------------------------------------
+                if (g_wgun_hook.installed()) {
+                    uint64_t arm_rig = 0;
+                    int      gn      = -1;
+                    if (g_wgun_on.load(std::memory_order_relaxed) &&
+                        read_block(bestp + 0x220, &arm_rig, sizeof(arm_rig)) &&
+                        arm_rig > 0x10000 && !(arm_rig & 7))
+                        gn = rig_find_node(
+                            arm_rig,
+                            g_wgun_hash.load(std::memory_order_relaxed));
+                    if (gn >= 0) {
+                        const float dz =
+                            g_wgun_dz_cfg.load(std::memory_order_relaxed);
+                        memcpy(&grwxr_wgun_dz, &dz, sizeof(grwxr_wgun_dz));
+                        grwxr_wgun_node = (uint32_t)gn;
+                        grwxr_wgun_skel = bestp;          // published LAST
+                    } else {
+                        grwxr_wgun_skel = 0;
+                    }
+
+                    // Log cadence: every state change, plus the old 1-in-5
+                    // beat so the counter row keeps the shape logreport.py's
+                    // v_wgun window and the owner's eye already know. Without
+                    // the change gate this line would go from 1-in-5 to every
+                    // tick and bury the rest of the log.
+                    static int      s_arm_node = -2;
+                    static uint64_t s_arm_skel = 1;
+                    const bool changed = (gn != s_arm_node) ||
+                                         (grwxr_wgun_skel != s_arm_skel);
+                    s_arm_node = gn;
+                    s_arm_skel = grwxr_wgun_skel;
+                    if (changed || (ticks % 5) == 2)
+                        LOG_INFO("wgun: %s node=%d %s dz=%.2f "
+                                 "calls=%llu lifts=%llu rots=%llu "
+                                 "pos=%llu | skip nopose=%llu "
+                                 "nobuf=%llu norec=%llu noray=%llu "
+                                 "nopos=%llu badq=%llu | two=%llu tworej=%llu "
+                                 "roll=%llu | grip fwd=%.2f lat=%.2f up=%.2f "
+                                 "two=%.2f slid=%llu clamped=%llu/%.2fm",
+                                 gn >= 0 ? "ARMED" : "idle", gn,
+                                 grwxr_wgun_rot ? "ROTATE" : "lift",
+                                 g_wgun_dz_cfg.load(std::memory_order_relaxed),
+                                 (unsigned long long)grwxr_wgun_calls,
+                                 (unsigned long long)grwxr_wgun_writes,
+                                 (unsigned long long)grwxr_wg_rot,
+                                 (unsigned long long)grwxr_wg_pos,
+                                 (unsigned long long)grwxr_wg_nopose,
+                                 (unsigned long long)grwxr_wg_nobuf,
+                                 (unsigned long long)grwxr_wg_norec,
+                                 (unsigned long long)grwxr_wg_noray,
+                                 (unsigned long long)grwxr_wg_nopos,
+                                 (unsigned long long)grwxr_wg_badq,
+                                 (unsigned long long)grwxr_wg_two,
+                                 (unsigned long long)grwxr_wg_tworej,
+                                 (unsigned long long)grwxr_wg_roll,
+                                 g_wgun_grip_fwd.load(
+                                     std::memory_order_relaxed),
+                                 g_wgun_grip_lat.load(
+                                     std::memory_order_relaxed),
+                                 g_wgun_grip_up.load(
+                                     std::memory_order_relaxed),
+                                 g_wgun_grip_two.load(
+                                     std::memory_order_relaxed),
+                                 (unsigned long long)grwxr_wg_grip,
+                                 (unsigned long long)grwxr_wg_clamped,
+                                 g_wgun_pos_clamp.load(
+                                     std::memory_order_relaxed));
+                    // BUILD 120: the gate's own numbers, on their own line, so
+                    // the two-hand threshold is chosen by measurement.
+                    char ta[300];
+                    two_agree_report(ta, sizeof(ta));
+                    LOG_INFO("%s", ta);
+                }
+
+                // -----------------------------------------------------------
+                // 2026-08-13: THE OFF-HAND MEASUREMENT, corrected.
+                //
+                // The first version of this lived at the top of
+                // grwxr_wgun_apply and its numbers were unusable. The reason
+                // is worth keeping: PublishAttachments is entered TWICE PER
+                // FRAME for the player skeleton (measured live at 145.6
+                // samples/s on a 72 Hz engine, and independently recorded in
+                // the build 77 ledger as 144 writes/s), and nothing re-solves
+                // the pose between the two entries. So on entry 2 the bone we
+                // read back is OUR OWN entry-1 write, and the measurement was
+                // "the animated hand relative to where WE put the gun", which
+                // is circular. Because the publish is last-write-wins and the
+                // logger samples at 1 Hz, it read the contaminated entry
+                // almost every time.
+                //
+                // Here instead: the init thread, read only, and reachable with
+                // wgun = 0, where the mod writes the weapon bone at all. Then
+                // the weapon frame IS the animation's.
+                //
+                // The gun-root node is resolved locally by name hash on this
+                // rig. It deliberately does NOT use grwxr_wgun_node, which is
+                // only ever assigned while wgun is armed and otherwise holds
+                // 0, the rig ROOT: reading it here would silently measure the
+                // hand against the wrong bone entirely.
+                //
+                // Node 10 FakeGunRoot_Gameplay is the live mount (build 78
+                // armed node 8 for 50 s and the gun did not move), and its +Y
+                // is the barrel (build 79, dot 0.999 over 14 ADS samples).
+                //
+                // Two hands are measured. LeftHand is the animated skeleton
+                // hand. Prop_LeftHand is a rig bone whose name says the engine
+                // authored it as a prop attachment point; if the engine holds
+                // a support-hand point, that bone is it, and it should read far
+                // steadier than the animated one.
+                // -----------------------------------------------------------
+                {
+                    uint64_t org = 0;
+                    if (read_block(bestp + 0x220, &org, sizeof(org)) &&
+                        org > 0x10000 && !(org & 7)) {
+                        const int nG = rig_find_node(org, 0x08B4DDD5u);  // FakeGunRoot_Gameplay
+                        float gr[3], ax[3], ay[3], az[3];
+                        if (nG >= 0 &&
+                            read_bone_world(bestp, (unsigned int)nG, gr) &&
+                            read_bone_world_axes(bestp, (unsigned int)nG,
+                                                 ax, ay, az)) {
+                            struct Probe { uint32_t hash; const char* name; };
+                            static const Probe kProbes[] = {
+                                {0xB675F36Cu, "LeftHand"},
+                                {0x85562B5Cu, "Prop_LeftHand"},
+                            };
+                            for (const Probe& pr : kProbes) {
+                                const int nd = rig_find_node(org, pr.hash);
+                                float p[3];
+                                if (nd < 0 ||
+                                    !read_bone_world(bestp, (unsigned int)nd, p))
+                                    continue;
+                                const float d[3] = {p[0] - gr[0],
+                                                    p[1] - gr[1],
+                                                    p[2] - gr[2]};
+                                // +Y is the barrel, so Y is distance along it.
+                                const float along = d[0]*ay[0] + d[1]*ay[1] + d[2]*ay[2];
+                                const float lat   = d[0]*ax[0] + d[1]*ax[1] + d[2]*ax[2];
+                                const float vert  = d[0]*az[0] + d[1]*az[1] + d[2]*az[2];
+                                const float dist  = sqrtf(d[0]*d[0] + d[1]*d[1] +
+                                                          d[2]*d[2]);
+                                // This tick reads the pose off the engine's own
+                                // thread without its lock, so a torn read is
+                                // possible. Drop the impossible ones rather
+                                // than logging a number nobody can trust.
+                                if (!isfinite(along) || !isfinite(lat) ||
+                                    !isfinite(vert) || !(dist < 3.0f))
+                                    continue;
+                                LOG_INFO("ohand: %-13s vs gun-root: along-barrel="
+                                         "%+.3f lateral=%+.3f vertical=%+.3f "
+                                         "dist=%.3f m (node %d)",
+                                         pr.name, along, lat, vert, dist, nd);
+                            }
+                        }
+                    }
+                }
+
                 // Build 16a: resolve the Head node index for THIS skeleton's
                 // rig. Cheap (a binary search over a sorted map) and re-done
                 // every tick, so a respawn, an outfit change or any other
@@ -2935,54 +4203,13 @@ void snap_drain() {
                                     }
                                 }
 
-                                // Build 67: arm (or disarm) the gun-root
-                                // write from this same verified tick. The
-                                // node index is resolved from the rig's own
-                                // name map rather than hardcoded, so a rig
-                                // change disarms instead of writing a wrong
-                                // bone. Skeleton pointer is published LAST:
-                                // the stub reads it first and treats zero as
-                                // disarmed, so a half-published state can
-                                // never write.
-                                if (g_wgun_hook.installed()) {
-                                    const int gn = g_wgun_on.load(
-                                        std::memory_order_relaxed)
-                                        ? rig_find_node(rg,
-                                              g_wgun_hash.load(
-                                                  std::memory_order_relaxed))
-                                        : -1;
-                                    if (gn >= 0) {
-                                        const float dz = g_wgun_dz_cfg.load(
-                                            std::memory_order_relaxed);
-                                        memcpy(&grwxr_wgun_dz, &dz,
-                                               sizeof(grwxr_wgun_dz));
-                                        grwxr_wgun_node = (uint32_t)gn;
-                                        grwxr_wgun_skel = bestp;
-                                    } else {
-                                        grwxr_wgun_skel = 0;
-                                    }
-                                    LOG_INFO("wgun: %s node=%d %s dz=%.2f "
-                                             "calls=%llu lifts=%llu rots=%llu "
-                                             "pos=%llu | skip nopose=%llu "
-                                             "nobuf=%llu norec=%llu noray=%llu "
-                                             "nopos=%llu badq=%llu",
-                                             gn >= 0 ? "ARMED" : "idle", gn,
-                                             grwxr_wgun_rot ? "ROTATE" : "lift",
-                                             g_wgun_dz_cfg.load(
-                                                 std::memory_order_relaxed),
-                                             (unsigned long long)
-                                                 grwxr_wgun_calls,
-                                             (unsigned long long)
-                                                 grwxr_wgun_writes,
-                                             (unsigned long long)grwxr_wg_rot,
-                                             (unsigned long long)grwxr_wg_pos,
-                                             (unsigned long long)grwxr_wg_nopose,
-                                             (unsigned long long)grwxr_wg_nobuf,
-                                             (unsigned long long)grwxr_wg_norec,
-                                             (unsigned long long)grwxr_wg_noray,
-                                             (unsigned long long)grwxr_wg_nopos,
-                                             (unsigned long long)grwxr_wg_badq);
-                                }
+                                // BUILD 116: the gun-root arm block that lived here moved
+                                // to the top of this tick, to the bestp latch. It never
+                                // belonged inside the hand census: arming acts on the
+                                // PLAYER rig's gun-root bone and reads nothing from either
+                                // census. Sitting here made it a three-way coincidence on a
+                                // single 1 Hz tick, and every run that ever armed armed
+                                // EXACTLY ONCE. See docs/DESIGN-motion-controls.md.
                             }
                         }
                     }
@@ -3014,12 +4241,19 @@ void snap_drain() {
                 // which is exactly how a wrong node index would present.
                 if ((ticks % 2) == 0 && g_head_valid)
                     LOG_INFO("fp: HEAD world=(%.2f %.2f %.2f) dz=%+.2fm "
-                             "reads=%llu rejects=%llu",
+                             "reads=%llu rejects=%llu | place fwd=%.2f "
+                             "clamp=%.2f(%llu) ema=%.0f/%.0fms snaps=%llu",
                              g_head_pos[0], g_head_pos[1], g_head_pos[2],
                              g_head_dz,
                              (unsigned long long)g_head_reads.load(
                                  std::memory_order_relaxed),
                              (unsigned long long)g_head_rejects.load(
+                                 std::memory_order_relaxed),
+                             headpose::fp_fwd(), headpose::fp_clamp(),
+                             (unsigned long long)g_fp_clamped.load(
+                                 std::memory_order_relaxed),
+                             headpose::fp_smooth(), headpose::fp_smooth_z(),
+                             (unsigned long long)g_fp_snaps.load(
                                  std::memory_order_relaxed));
                 else if ((ticks % 10) == 3 && headpose::fp_head_anchor() &&
                          headpose::fp_enabled())
@@ -3035,7 +4269,102 @@ void snap_drain() {
                          "0x%012llX (holding 0x%012llX)",
                          (unsigned long long)pent,
                          (unsigned long long)headpose::player_obj());
+
+                // BUILD 113: RING PROBE. LOG ONLY, no behaviour change.
+                //
+                // The whole jitter chain hangs off this branch being taken:
+                // no ring member owned by pent means no pin, no pin means no
+                // anchor, no anchor means the 11c push lever, and the lever is
+                // what the capture race swings. Same DLL anchored fine on
+                // 2026-08-16, so this is state dependent, not a code
+                // regression.
+                //
+                // Two candidate causes and they need different fixes:
+                //   (a) pent is wrong, so we are comparing against the wrong
+                //       entity and the player's skeletons are sitting in the
+                //       ring unmatched.
+                //   (b) the ring genuinely holds no player skeleton.
+                // Printing what the ring actually contains separates them in
+                // one line: if a single owner dominates and it is NOT pent,
+                // that is (a) and the answer is probably that owner.
+                //
+                // Drain thread, throttled to this same 1-in-10 tick, so rule 8
+                // is satisfied. Reads are guarded exactly like the selection
+                // loop above.
+                uint64_t seen[4] = {0, 0, 0, 0};
+                uint32_t hits[4] = {0, 0, 0, 0};
+                int      distinct = 0;
+                int      live = 0, unread = 0;
+                for (uint32_t i = 0; i < kRingSize; ++i) {
+                    const uint64_t p =
+                        g_skel_ring[i].load(std::memory_order_relaxed);
+                    if (!p) continue;
+                    ++live;
+                    uint64_t own = 0;
+                    if (!read_block(p + 0x10, &own, sizeof(own))) {
+                        ++unread;
+                        continue;
+                    }
+                    int k = 0;
+                    for (; k < distinct; ++k)
+                        if (seen[k] == own) { ++hits[k]; break; }
+                    if (k == distinct && distinct < 4) {
+                        seen[distinct] = own;
+                        hits[distinct] = 1;
+                        ++distinct;
+                    }
+                }
+                LOG_INFO("fp: RING PROBE live=%d unread=%d distinct=%d%s | "
+                         "owners: %012llX x%u, %012llX x%u, %012llX x%u, "
+                         "%012llX x%u | pent=%012llX playercomp=%012llX",
+                         live, unread, distinct,
+                         distinct >= 4 ? " (capped)" : "",
+                         (unsigned long long)seen[0], hits[0],
+                         (unsigned long long)seen[1], hits[1],
+                         (unsigned long long)seen[2], hits[2],
+                         (unsigned long long)seen[3], hits[3],
+                         (unsigned long long)pent,
+                         (unsigned long long)g_playercomp.load(
+                             std::memory_order_relaxed));
             }
+            // BUILD 130: THE ONE LINE THAT DECIDES WHERE THE CAMERA IS, and
+            // until now it was printed only inside the branch that is not
+            // being taken.
+            //
+            // `[VERIFIED, log grwxr-27148, build 129b]` the owner ran with
+            // first person confirmed on (`hide: FORCING (fp on)`) and reported
+            // the camera still jumping. The log cannot say whether the camera
+            // was anchored to his head or had fallen back to the 11c chase-rig
+            // push, because BOTH status lines (`camera ANCHORED...` at the top
+            // of this block, and `fp: HEAD world=...`) sit inside the
+            // ring-member-FOUND branch, and every sample in that run took the
+            // NOT-found branch. `fp: HEAD world` printed 0 times in a 2 minute
+            // run with the anchor supposedly live.
+            //
+            // The anchor itself does NOT need the ring: it runs off the HELD
+            // pin (`headpose::player_obj()`) and the published head node, both
+            // of which survive eviction. So the camera may well be anchored
+            // while this diagnostic says nothing at all. That ambiguity is the
+            // reason Fault A has stayed open across ten builds, and it costs
+            // three lines to end.
+            //
+            // Printed every 5th tick, drain thread, rule 8 safe.
+            if ((ticks % 5) == 0)
+                LOG_INFO("fp: ANCHOR %s | head node=%u reads=%llu rejects=%llu "
+                         "dz=%+.2fm | pin=%012llX ring=%s",
+                         g_fp_anchored.load(std::memory_order_relaxed)
+                             ? "HEAD BONE (anchored)"
+                             : "11c push (NOT anchored, camera rides the "
+                               "third-person rig)",
+                         headpose::head_node(),
+                         (unsigned long long)g_head_reads.load(
+                             std::memory_order_relaxed),
+                         (unsigned long long)g_head_rejects.load(
+                             std::memory_order_relaxed),
+                         g_head_dz,
+                         (unsigned long long)headpose::player_obj(),
+                         g_head_valid ? "head live" : "head NOT read");
+
             // The heuristic pin and the identity diagnostics below exist
             // only to guess what we now know exactly, so skip the rest of
             // the drain tick while the entity is live.
@@ -3047,9 +4376,36 @@ void snap_drain() {
         const bool fp_now = headpose::fp_enabled();
         if (fp_now && !s_prev_fp) {
             s_want_acquire = true;
-            headpose::set_player_obj(0);
+            // BUILD 130b: DO NOT ZERO THE PIN HERE. Zeroing it is what has
+            // been putting the camera on the third-person rig every time
+            // first person is switched on.
+            //
+            // The chain: this cleared the pin, and re-acquisition then needs
+            // the 128-entry skeleton ring to still hold a member owned by the
+            // player entity. `[VERIFIED, logs grwxr-27148 and grwxr-25296]`
+            // that lookup fails on EVERY sample once the world populates
+            // ("fp: pin(entity) no ring member for entity ..."), because the
+            // ring is a FIFO of all skeletons and the player's is evicted by
+            // the other 127. So the pin stayed 0, the anchored path is gated
+            // behind `if (player_obj())`, and the camera fell through to the
+            // 11c push, which rides the chase rig and swings with it.
+            //
+            // The owner has reported the camera jumping in first person for
+            // weeks, and the head bone was never the problem: node 59 resolves
+            // every run. This one assignment is what disarmed the anchor at
+            // the exact moment first person was requested.
+            //
+            // Acquisition is still armed, so a better pin replaces this one as
+            // soon as the ring offers it. Keeping the old pin cannot be worse
+            // than keeping none: the anchored path already sanity-checks the
+            // object every frame (finite, and within 12 m of the camera) and
+            // falls back to the push by itself if the pin has gone stale.
             s_have_last = false;
-            LOG_INFO("fp: pin cleared, acquisition armed by FP toggle");
+            LOG_INFO("fp: acquisition armed by FP toggle, pin %012llX KEPT "
+                     "live until a better one is found (build 130b: clearing "
+                     "it here is what dropped the camera onto the "
+                     "third-person rig)",
+                     (unsigned long long)headpose::player_obj());
         }
         s_prev_fp = fp_now;
         if (pin_fov >= 0.65f) {
@@ -3873,35 +5229,260 @@ void snap_drain() {
         }
     }
 
-    // Build 8: liveness of the head compose, once per 10 s. A nonzero fail
-    // count means the SEH guard fired. The calls/frame ratio verifies the
-    // frame-idempotence assumption: ~2.0 means frame_count() is stable across
-    // both per-frame calls, as designed.
+    (void)0;  // Build 91: the head-compose telemetry moved to the TOP of this
+              // function. See the note there. This tail is now empty.
+}
+
+// Build 91: THE TELEMETRY WAS ONLY EVER PRINTED FROM MENUS.
+//
+// This block used to sit at the END of snap_drain(). The "player entity is
+// live" branch above ends in an unconditional `return`, so from the moment the
+// player entity latches, which is a few seconds into any session, this never
+// ran again. Every `head compose` and `aer` line in every log we have was
+// therefore sampled BEFORE gameplay, and in the 2026-08-15 run the last one is
+// at 03:35:32 while the first person the tester graded starts at 03:36:2x.
+//
+// That is how three sessions were graded on menu telemetry, including the
+// vs-write reading that was quoted as evidence about whether the engine
+// refreshes the camera row during play. It does not answer that question and
+// never did.
+//
+// It is now called from the top of snap_drain(), before any early return. It
+// only reads counters, so it has no dependency on the rest of the tick.
+void drain_head_telemetry(int ticks) {
     if ((ticks % 10) == 0) {
         const unsigned long long w  = g_head_writes.load(std::memory_order_relaxed);
         const unsigned long long fr = g_head_frames.load(std::memory_order_relaxed);
         const unsigned long long fl = g_head_write_fails.load(std::memory_order_relaxed);
+        const unsigned long long sw =
+            g_head_sel_writes.load(std::memory_order_relaxed);
         if (fr) {
-            LOG_INFO("head compose: %llu writes over %llu frames (%.2f calls/frame), %llu failed",
-                     w, fr, (double)w / (double)fr, fl);
+            LOG_INFO("head compose: %llu writes over %llu frames (%.2f calls/frame), %llu failed, source %s",
+                     w, fr, (double)w / (double)fr, fl,
+                     sw ? "SELECTOR (build 89 stand-in)" : "on_calc_mvp");
             // Build 10b.1: the ring occupancy IS the build-to-present pipeline
             // depth, the number parity-based eye matching guessed wrong.
-            LOG_INFO("aer: pipeline depth %d, pops tagged=%llu mono=%llu",
+            // Build 93: depth oscillates 0 to 1 every frame by construction
+            // (the pop precedes the push within one Present cycle), so neither
+            // value is a symptom. drops is the one that matters: any nonzero
+            // value means the eye parity flipped and stayed flipped.
+            LOG_INFO("aer: pipeline depth %d, pops tagged=%llu mono=%llu drops=%llu",
                      headpose::eye_tag_depth(),
-                     headpose::pops_tagged(), headpose::pops_mono());
+                     headpose::pops_tagged(), headpose::pops_mono(),
+                     headpose::tag_drops());
             // Build 10b.2: vs-write ~0 means the engine is NOT refreshing the
             // position row and our eye offsets are compounding (see the
             // comment at g_diag_written). step is capture-to-capture motion.
-            LOG_INFO("aer: basepos step last=%.4f max=%.4f, vs-write last=%.4f max=%.4f",
+            LOG_INFO("aer: basepos step last=%.4f max=%.4f, vs-write last=%.4f max=%.4f, cap rescues=%llu",
                      g_diag_step_last, g_diag_step_max,
-                     g_diag_vsw_last, g_diag_vsw_max);
+                     g_diag_vsw_last, g_diag_vsw_max, g_cap_rescues);
+            // BUILD 98: the gun-origin fix, grading itself. gap is how far the
+            // LIVE camera row is from the frame's engine latch at the moment a
+            // controller publish reads it, which is precisely the jitter that
+            // used to reach the gun. A large gap with latch climbing and live
+            // at or near zero is the fix working: the error exists and nothing
+            // is consuming it. live climbing while the camera write is on means
+            // the latch is going stale and the jitter is back.
+            LOG_INFO("base: latch=%llu live=%llu, live-vs-latch gap last=%.4f max=%.4f",
+                     g_bf_latch.load(std::memory_order_relaxed),
+                     g_bf_live.load(std::memory_order_relaxed),
+                     g_bf_gap_last, g_bf_gap_max);
+        } else if (g_calls[kOnCalcMvpProbe].load(std::memory_order_relaxed) == 0 &&
+                   !headpose::cam_selector_pose()) {
+            // Build 89: name the exact reason. on_calc_mvp is the only other
+            // caller of write_pose_head, and on this binary its row is not
+            // derived, so with the stand-in off there is nobody to compose:
+            // no first person and no stereo separation.
+            LOG_INFO("head compose: idle, and on_calc_mvp is NOT hooked "
+                     "(0 calls). Nothing can write the camera pose: FP is a "
+                     "no-op and both eyes get the same image. Set "
+                     "cam_selector_pose = 1 in grwxr.cfg to route it through "
+                     "the selector.");
         } else {
             LOG_INFO("head compose: idle (no head pose published; camera untouched)");
+        }
+        if (!fr) {
+            // BUILD 109: SAY WHAT IS MISSING AND WHY.
+            //
+            // The aer: and base: families are printed inside the branch
+            // above, so when the camera pose write is off they do not
+            // appear AT ALL. Three subsystems telemetry gated behind a
+            // fourth subsystem counter, and the failure is silent:
+            // `[VERIFIED]` a reader of grwxr-31412.log concluded build
+            // 100 had never been graded, because it grepped for
+            // "base: latch" and found nothing. It had been graded, in a
+            // different run, and passed.
+            //
+            // ABSENCE MUST NEVER LOOK LIKE A RESULT. A family that is
+            // suppressed says so, names itself, and names the switch
+            // that would bring it back.
+            LOG_INFO("aer/base: SUPPRESSED this tick, not absent. Both "
+                     "families print only while the camera pose write is "
+                     "running, and it composed 0 frames. cam_selector_pose "
+                     "= %d. Turn it on (or press Numpad 0) and the "
+                     "stereo-pipeline and gun-origin telemetry come back.",
+                     headpose::cam_selector_pose() ? 1 : 0);
         }
     }
 }
 
 }  // namespace
+
+// Build 96: see CameraProbe.h. Plain relaxed stores on counters that are only
+// ever incremented elsewhere and only ever read by the drain, so a torn or
+// slightly stale read is harmless and no lock is needed. Safe from any thread.
+void reset_head_telemetry() {
+    g_head_writes.store(0, std::memory_order_relaxed);
+    g_head_write_fails.store(0, std::memory_order_relaxed);
+    g_head_frames.store(0, std::memory_order_relaxed);
+    g_head_sel_writes.store(0, std::memory_order_relaxed);
+}
+
+// The live read off the camera object. This IS the old base_frame body,
+// renamed; pos may be wanted without rot, so rot is allowed to be null.
+static bool base_frame_live(float rot[9], float pos[3]);
+static bool base_pos_live(float out[3]);
+
+// -----------------------------------------------------------------------
+// BUILD 100 CORRECTION, READ THIS FIRST.
+//
+// Build 98 latched the wrong value and made the symptom worse rather than
+// better. It served `g_base_pos`, which is the ENGINE's chase camera captured
+// BEFORE our write. In first person that sits about 1.7 m up and behind the
+// head, so the weapon was placed from an origin 1.7 m high, and whenever the
+// latch went stale the fallback returned the composed viewpoint instead, so the
+// gun still alternated between two values 1.9 m apart.
+//
+// `[VERIFIED, headset, 2026-08-15]` tester on build 99: "THE GUN IS TOO FAR UP
+// AND JUST PHASES IN AND OUT OF REALITY... THE JUTTER IS MUCH WORSE." Gun too
+// high, gun flickering between two places, and judder worse than before are all
+// three the same inversion.
+//
+// What every consumer of these two functions wants is THE CAMERA THE FRAME WAS
+// RENDERED FROM, because they place hands and weapons relative to the player's
+// eyes. That is `pos` at the bottom of write_pose_head, not `g_base_pos` at the
+// top of it. Build 100 latches that instead, and the reasoning below about
+// frame-stability, freshness and ordering is unchanged and still correct.
+//
+// The lesson worth keeping: the frame-stability argument was right and the
+// SOURCE VALUE was wrong, and a build that is right about the mechanism and
+// wrong about the input looks exactly like a build that is wrong about both.
+// -----------------------------------------------------------------------
+//
+// BUILD 98: THE PER-FRAME CAMERA, and why base_pos and base_frame stop
+// reading the camera object directly.
+//
+// `[VERIFIED, headset, 2026-08-15]` The tester reported the gun jittering while
+// moving, new since the camera work, and pressing NUMPAD 0 (which turns the
+// camera pose write off) removed it completely. That is the control passing.
+//
+// THE MECHANISM, end to end, all of it in this tree:
+//
+//   grwxr_wgun_apply places the gun at aimtrace::ctrl_pos(), clamped to
+//   wgun_pos_clamp of the engine's own placement (CameraProbe.cpp, the POSITION
+//   block). ctrl_pos is published in VRMirror.cpp as base_frame()'s position
+//   plus the head-local controller offset. base_frame() read Camera+0x000 row 3
+//   LIVE. And since build 89 write_pose_head WRITES that same row, 3.00 times
+//   per frame by the drain's own count, while the engine restores it once.
+//
+// So the origin the weapon is placed from was a row we are ourselves editing
+// mid-frame, sampled from the present thread with no ordering against either
+// writer. Two candidate values live in it: the engine's chase camera and our
+// composed first-person viewpoint.
+//
+// THE AMPLITUDE IS MEASURED, in grwxr-13140.log, with the player standing
+// still: `basepos step last=0.0053, vs-write last=1.9147`. Frame-to-frame
+// camera motion of 5 mm, against 1.91 m between the captured row and the row we
+// wrote. Clamped to 0.60 m and one-poled at 0.35 that is a shake, not a jump,
+// which is exactly what it looked like.
+//
+// THE FIX, and why it is this one:
+//
+// write_pose_head already captures the engine's rows once per frame, BEFORE its
+// own write, into g_base / g_base_pos. That capture is the value every one of
+// these callers actually wants, and it is single valued for the whole frame by
+// construction. Serve it, and fall back to the live read whenever it is stale.
+//
+// Both branches return the ENGINE's camera. When the write is running the latch
+// is fresh; when it is not (menus, first person off, the flat-scope stand-down,
+// NUMPAD 0) nothing writes the row, so the live read is the same value. There
+// is no configuration in which a caller sees our own write any more.
+//
+// SCOPE. Every caller of these two functions is ours: base_frame feeds the five
+// controller publishes in VRMirror.cpp (ctrl_ray, ctrl_pos, ctrl_pos_l,
+// ctrl_up, and wp::set_write) and base_pos feeds WeaponProbe's proximity
+// tables. The camera-write path itself does NOT go through here, it uses g_base
+// and g_base_pos directly, so this cannot disturb first person or the eye
+// offset. This also closes the defect recorded at the end of session 29, where
+// identical weapon handles reported d=0.38 then d=1.72, a uniform 1.35 m step
+// with no object motion.
+//
+// FRESHNESS. One frame of tolerance, not zero: the present thread reads while
+// the engine thread may be part way through the next frame's build, and
+// rejecting that would drop the latch on a frame boundary every time and put
+// the jitter back at a lower rate. One frame of camera motion is the 5 mm the
+// log measured.
+//
+// ORDERING. The stamp is stored with release after the rows are filled and
+// loaded with acquire before they are copied, so a reader that sees frame f
+// sees frame f's rows. The rows themselves stay plain floats, unsynchronized,
+// exactly as documented in CameraProbe.h: a torn read costs centimetres and
+// every caller here tolerates that. No lock, no allocation, rule 8 clean.
+// -----------------------------------------------------------------------
+static bool base_frame_engine(float rot[9], float pos[3]) {
+    const uint64_t stamp = g_vr_cam_stamp.load(std::memory_order_acquire);
+    if (stamp) {
+        const uint64_t now = d3d11::frame_count();
+        if (now >= stamp && (now - stamp) <= 1) {
+            float p[3], r[9];
+            memcpy(r, g_vr_cam_rot, sizeof(r));
+            memcpy(p, g_vr_cam_pos, sizeof(p));
+            // The same sanity gate the live read uses. A latch captured during
+            // a level transition holds the same readable garbage the live row
+            // would, and it must fail the same way rather than silently.
+            const float lim = 1.0e6f;
+            bool ok = p[0] == p[0] && p[1] == p[1] && p[2] == p[2] &&
+                      p[0] > -lim && p[0] < lim &&
+                      p[1] > -lim && p[1] < lim &&
+                      p[2] > -lim && p[2] < lim;
+            for (int i = 0; ok && i < 3; ++i) {
+                const float len2 = r[i * 3 + 0] * r[i * 3 + 0] +
+                                   r[i * 3 + 1] * r[i * 3 + 1] +
+                                   r[i * 3 + 2] * r[i * 3 + 2];
+                if (!(len2 > 0.81f && len2 < 1.21f)) ok = false;
+            }
+            if (ok) {
+                // Telemetry only: how far the live row is from the latch right
+                // now. This is the jitter that used to reach the gun, and
+                // printing it means the next run grades this fix instead of
+                // relying on the tester's eye a second time.
+                //
+                // BUILD 102: SAMPLED, 1 call in 64. This telemetry did a SECOND
+                // full camera read plus a square root on EVERY call, and its
+                // busiest consumer runs at ~13,500 calls a second, so it was
+                // paying for about 13,500 redundant camera reads a second to
+                // feed one log line printed once every ten seconds. The line
+                // graded builds 98 and 100 correctly off six samples a run; it
+                // does not need thirteen thousand a second.
+                static uint32_t s_gap_tick = 0;
+                if ((++s_gap_tick & 63u) == 0) {
+                    float lp[3];
+                    if (base_frame_live(nullptr, lp)) {
+                        g_bf_gap_last = dist3(p, lp);
+                        if (g_bf_gap_last > g_bf_gap_max)
+                            g_bf_gap_max = g_bf_gap_last;
+                    }
+                }
+                memcpy(rot, r, sizeof(r));
+                memcpy(pos, p, sizeof(p));
+                g_bf_latch.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+        }
+    }
+    g_bf_live.fetch_add(1, std::memory_order_relaxed);
+    return base_frame_live(rot, pos);
+}
 
 // Build 39.1: see CameraProbe.h.
 //
@@ -3918,7 +5499,24 @@ void snap_drain() {
 // on EVERY mode-0 on_calc_mvp call, with no VR precondition, and the engine
 // keeps Camera+0x000's row 3 current every frame. Read that, and say out loud
 // whether the read worked.
+// BUILD 98: the latch first, for the reason in the long comment above
+// base_frame_engine. base_frame_engine falls back to the live read itself, so
+// this keeps every guarantee the comment below describes; the only change is
+// WHICH of two values in the same row is returned while we are writing it.
 bool base_pos(float out[3]) {
+    float rot[9];
+    if (base_frame_engine(rot, out)) return true;
+    // base_frame_engine has already tried the latch and the live read, but it
+    // rejects a frame whose ROTATION rows are not unit, which base_pos never
+    // cared about, and it has no published-copy tail. Keep both by falling
+    // through to the original body, so a caller that used to get an answer
+    // still gets exactly that answer.
+    return base_pos_live(out);
+}
+
+// The live read. Kept as its own function because base_frame_engine falls back
+// to it and because the reasoning below is still the reasoning for it.
+static bool base_pos_live(float out[3]) {
     const uint64_t cam = g_player_cam.load(std::memory_order_relaxed);
     if (cam) {
         __try {
@@ -3951,11 +5549,20 @@ bool base_pos(float out[3]) {
             g_base_pos[2] != 0.0f);
 }
 
+// BUILD 98: the public entry now prefers the per-frame engine latch. See the
+// long comment above base_frame_engine for the headset result that forced this
+// and for why every caller wants the latch.
+bool base_frame(float rot[9], float pos[3]) {
+    return base_frame_engine(rot, pos);
+}
+
 // Build 45: see CameraProbe.h. Same source and sanity rules as base_pos,
 // plus a unit-length check on each rotation row, because a camera object
 // mid-swap can hold a matrix that reads fine and means nothing. POD locals
 // only, so SEH needs no unwinding.
-bool base_frame(float rot[9], float pos[3]) {
+// BUILD 98: renamed from base_frame, and rot may be null when only the position
+// is wanted (base_frame_engine's telemetry read).
+static bool base_frame_live(float rot[9], float pos[3]) {
     const uint64_t cam = g_player_cam.load(std::memory_order_relaxed);
     if (!cam) return false;
     __try {
@@ -3972,6 +5579,7 @@ bool base_frame(float rot[9], float pos[3]) {
             const float c = m[r * 4 + 2];
             const float len2 = a * a + b * b + c * c;
             if (!(len2 > 0.81f && len2 < 1.21f)) return false;
+            if (!rot) continue;
             rot[r * 3 + 0] = a;
             rot[r * 3 + 1] = b;
             rot[r * 3 + 2] = c;
@@ -4133,6 +5741,37 @@ void set_wgun_pos(int on, float scale, float clamp_m, float smooth) {
              want ? "ON" : "off", scale, clamp_m, smooth);
 }
 
+// Build 99: see CameraProbe.h. Clamped, because these reach the player through
+// a long lever arm and skeleton rule 5 says every controller-driven transform
+// gets one. The bounds are generous enough to cover any real weapon (a rifle is
+// under a metre) and tight enough that a stuck key cannot fling the gun.
+// BUILD 101: the rails were set by guesswork and they were too tight. The
+// tester ran wgun_grip_up into +0.40 and pressed Page Up THIRTY-ONE more times
+// against a wall the log recorded as a flat line. `[USER DIRECTIVE]` do not cap
+// a tuning range this conservatively. 2.00 m is past anything a rifle-in-hand
+// offset can need and still finite, which is all a rail is for.
+void set_wgun_grip(float fwd, float lat, float up, float two) {
+    if (fwd < -2.00f) fwd = -2.00f;
+    if (fwd >  2.00f) fwd =  2.00f;
+    if (lat < -2.00f) lat = -2.00f;
+    if (lat >  2.00f) lat =  2.00f;
+    if (up  < -2.00f) up  = -2.00f;
+    if (up  >  2.00f) up  =  2.00f;
+    if (two <  0.0f)  two =  0.0f;
+    if (two >  1.0f)  two =  1.0f;
+    g_wgun_grip_fwd.store(fwd, std::memory_order_relaxed);
+    g_wgun_grip_lat.store(lat, std::memory_order_relaxed);
+    g_wgun_grip_up.store(up,  std::memory_order_relaxed);
+    g_wgun_grip_two.store(two, std::memory_order_relaxed);
+}
+
+void get_wgun_grip(float* fwd, float* lat, float* up, float* two) {
+    if (fwd) *fwd = g_wgun_grip_fwd.load(std::memory_order_relaxed);
+    if (lat) *lat = g_wgun_grip_lat.load(std::memory_order_relaxed);
+    if (up)  *up  = g_wgun_grip_up.load(std::memory_order_relaxed);
+    if (two) *two = g_wgun_grip_two.load(std::memory_order_relaxed);
+}
+
 void set_wgun_filter(float smooth, float maxstep_deg) {
     if (smooth < 0.01f) smooth = 0.01f;
     if (smooth > 1.00f) smooth = 1.00f;
@@ -4140,6 +5779,63 @@ void set_wgun_filter(float smooth, float maxstep_deg) {
     if (maxstep_deg > 90.0f) maxstep_deg = 90.0f;
     g_wgun_smooth.store(smooth, std::memory_order_relaxed);
     g_wgun_maxstep.store(maxstep_deg, std::memory_order_relaxed);
+}
+
+// 2026-08-13: two-handed aim and barrel roll. Bumping the generation counter on
+// a change reseeds both the direction and the roll filters from the live value,
+// so flipping either at runtime cannot make the weapon slew out of stale state.
+// BUILD 120: the two-hand agreement gate, live from the tuner.
+void  set_wgun_two_agree(float v) {
+    if (v < -1.0f) v = -1.0f;
+    if (v >  1.0f) v =  1.0f;
+    g_wg_two_agree.store(v, std::memory_order_relaxed);
+}
+float get_wgun_two_agree() { return g_wg_two_agree.load(std::memory_order_relaxed); }
+
+// BUILD 123: measure which hand is in front instead of assuming the left one.
+// Bumps the generation counter for the same reason set_wgun_twohand does: the
+// change can reverse the target direction, and the filter must reseed rather
+// than slew the weapon through 180 degrees at the rate cap.
+void set_wgun_two_auto(int on) {
+    const int want = on ? 1 : 0;
+    if (g_wg_two_auto.exchange(want, std::memory_order_relaxed) != want)
+        g_wgun_gen.fetch_add(1, std::memory_order_relaxed);
+}
+int  get_wgun_two_auto() { return g_wg_two_auto.load(std::memory_order_relaxed); }
+
+// BUILD 125: the eye-sign A/B. See the long comment at the offset site.
+// Anything other than a negative value means +1, so a garbled cfg cannot land
+// on zero and collapse the stereo to mono without saying so.
+void set_wgun_grip_bypass(int on) {
+    g_wgun_grip_bypass.store(on ? 1 : 0, std::memory_order_relaxed);
+}
+int  get_wgun_grip_bypass() { return g_wgun_grip_bypass.load(std::memory_order_relaxed); }
+
+void set_ipd_sign(int s) {
+    g_ipd_sign.store(s < 0 ? -1 : 1, std::memory_order_relaxed);
+}
+int  get_ipd_sign() { return g_ipd_sign.load(std::memory_order_relaxed); }
+
+// BUILD 124: restart the weapon direction and roll filters from the live value.
+// Anything that can REVERSE the target direction must call this, or the one-pole
+// will slew the weapon through 180 degrees at the 5 deg per call rate cap
+// instead of snapping to the new target. Swapping handedness does exactly that,
+// because it changes which controller the weapon pivots on.
+void reseed_wgun() { g_wgun_gen.fetch_add(1, std::memory_order_relaxed); }
+
+void set_wgun_twohand(int on) {
+    const int want = on ? 1 : 0;
+    if (g_wgun_twohand.exchange(want, std::memory_order_relaxed) != want)
+        g_wgun_gen.fetch_add(1, std::memory_order_relaxed);
+}
+
+void set_wgun_roll(int on, float trim_deg) {
+    if (trim_deg < -180.0f) trim_deg = -180.0f;
+    if (trim_deg >  180.0f) trim_deg =  180.0f;
+    g_wgun_roll_deg.store(trim_deg, std::memory_order_relaxed);
+    const int want = on ? 1 : 0;
+    if (g_wgun_roll.exchange(want, std::memory_order_relaxed) != want)
+        g_wgun_gen.fetch_add(1, std::memory_order_relaxed);
 }
 
 // BUILD 78: cycle the gun-root bone from a key, same rationale as build 76's
@@ -4218,11 +5914,12 @@ extern "C" void grwxr_wgun_apply(void* skelp) {
     for (int i = 0; i < 4; ++i)
         if (!isfinite(bq[i]) || !isfinite(rq[i])) { bump(&grwxr_wg_badq); return; }
 
+    // 2026-08-12: the controller ray is acquired BELOW, after the off-hand
+    // measurement, not here. The measurement needs only the skeleton, and
+    // gating it behind the ray cost a whole test session: the controllers went
+    // untracked, every call bailed at noray, and the measurement never ran
+    // even though the animated hands were readable the entire time.
     float ray[3];
-    if (!aimtrace::ctrl_ray(ray)) { bump(&grwxr_wg_noray); return; }
-    const float rl = sqrtf(ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]);
-    if (!(rl > 1e-6f)) { bump(&grwxr_wg_noray); return; }
-    ray[0] /= rl; ray[1] /= rl; ray[2] /= rl;
 
     // The root quaternion carries a uniform scale in w (offline note), so it is
     // normalised before use exactly as read_bone_world does.
@@ -4254,6 +5951,113 @@ extern "C" void grwxr_wgun_apply(void* skelp) {
                            worldQ[2]*worldQ[2] + worldQ[3]*worldQ[3]);
     if (!(wn > 1e-6f)) { bump(&grwxr_wg_badq); return; }
     for (int i = 0; i < 4; ++i) worldQ[i] /= wn;
+
+    // The off-hand measurement was taken here until 2026-08-13. It is gone
+    // because it could not be trusted from this site: this function is entered
+    // twice per frame with no re-solve in between, so on the second entry the
+    // bone read above is our own first-entry write and the measurement was
+    // measuring us. It now lives on the init-thread census tick, where it can
+    // run with wgun = 0 and see the animation instead.
+    if (!aimtrace::ctrl_ray(ray)) { bump(&grwxr_wg_noray); return; }
+    const float rl = sqrtf(ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]);
+    if (!(rl > 1e-6f)) { bump(&grwxr_wg_noray); return; }
+    ray[0] /= rl; ray[1] /= rl; ray[2] /= rl;
+
+    // -----------------------------------------------------------------------
+    // 2026-08-13: TWO-HANDED AIM. The rear hand is the pivot and says WHERE the
+    // weapon is; the front hand says WHERE IT POINTS. That is how a long gun is
+    // actually held, and it is what the tester asked for.
+    //
+    // The direction becomes the line from the rear hand to the front hand.
+    // Everything downstream is untouched: this only replaces the target
+    // direction fed to the same shortest-arc rotation that has been confirmed
+    // working. We never rebuild the weapon's basis. Build 68 did, had to guess
+    // the axis order, and put the rifle sideways in a tester's screenshot.
+    //
+    // THE FAILURE MODE THIS HAS TO SURVIVE: a direction between two points gets
+    // noisier as the points converge, roughly as (tracking jitter / separation).
+    // Bring your hands together and small tremor swings the muzzle wildly. So
+    // authority fades out smoothly with separation instead of switching off at
+    // a threshold: below kTwoHandLo it IS the old one-handed behaviour, above
+    // kTwoHandHi the front hand has it entirely, and in between it crossfades.
+    // The failure mode is therefore "the feature quietly stops", never a jump.
+    //
+    // The band sits well clear of real use. Measured 2026-08-13 on the animated
+    // skeleton: the support hand sits 0.481 m along the barrel from the gun
+    // root, 0.497 m away in total, stable to ONE MILLIMETRE over 112 samples.
+    // At half a metre, 1-2 mm of tracking jitter is about a tenth of a degree.
+    // -----------------------------------------------------------------------
+    const bool want_two = g_wgun_twohand.load(std::memory_order_relaxed) != 0;
+    float lpos[3], rpos[3];
+    // Build 99: how much authority the front hand took this call, 0 when it
+    // took none. The POSITION block below uses it so the front-hand grip fades
+    // in and out on exactly the same curve the direction does, instead of on a
+    // second threshold that could disagree with it.
+    float two_w = 0.0f;
+    bool  two_have_l = false;
+    // BUILD 123: set when the front hand turned out to be the RIGHT one, which
+    // is also the hand the gun root is anchored to. The handguard slide below
+    // measures the front hand's distance ALONG the barrel from that same root,
+    // so with both on one controller it would measure ~0, read that as a
+    // -0.48 m error against kHandguardFwd, and drag the weapon half a metre
+    // backwards. It stands down instead. Correcting the ANCHOR to the rear
+    // hand is the next build's single change, not this one's.
+    bool  two_front_is_right = false;
+    if (want_two &&
+        aimtrace::ctrl_pos_l(lpos) && aimtrace::ctrl_pos(rpos)) {
+        const float v[3] = {lpos[0] - rpos[0],
+                            lpos[1] - rpos[1],
+                            lpos[2] - rpos[2]};
+        const float sep = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+        if (sep > kTwoHandLo && isfinite(sep)) {
+            float th[3] = {v[0]/sep, v[1]/sep, v[2]/sep};
+            // Agreement gate: if the hand-to-hand line disagrees wildly with
+            // the rear controller's own forward, something is wrong (a
+            // tracking pop, the off hand behind the shoulder, a controller
+            // located to the floor). Refuse the frame rather than swing the
+            // weapon through the player.
+            float agree = th[0]*ray[0] + th[1]*ray[1] + th[2]*ray[2];
+            // BUILD 123: the line is rear-to-front, and which hand that makes
+            // the front one is measured. See the long comment at g_wg_two_auto.
+            // Only the SIGN is corrected here; the magnitude, and therefore
+            // every decision the gate makes below, is untouched.
+            if (g_wg_two_auto.load(std::memory_order_relaxed) && agree < 0.0f) {
+                th[0] = -th[0]; th[1] = -th[1]; th[2] = -th[2];
+                agree = -agree;
+                two_front_is_right = true;
+                grwxr_wg_twoflip = grwxr_wg_twoflip + 1;
+            }
+            // BUILD 120: measure every frame that reaches the gate, so the
+            // threshold is chosen from his actual hold instead of argued
+            // about. Relaxed atomics only, no logging, rule 8 clean.
+            const int32_t am = (int32_t)(agree * 1000.0f);
+            if (agree > g_wg_two_agree.load(std::memory_order_relaxed)) {
+                const int32_t accw = g_wg_agree_acc_worst_milli.load(std::memory_order_relaxed);
+                if (am < accw) g_wg_agree_acc_worst_milli.store(am, std::memory_order_relaxed);
+                float w = (sep - kTwoHandLo) / (kTwoHandHi - kTwoHandLo);
+                if (w > 1.0f) w = 1.0f;
+                w = w * w * (3.0f - 2.0f * w);        // smoothstep
+                float b[3] = {ray[0] + w * (th[0] - ray[0]),
+                              ray[1] + w * (th[1] - ray[1]),
+                              ray[2] + w * (th[2] - ray[2])};
+                const float bn = sqrtf(b[0]*b[0] + b[1]*b[1] + b[2]*b[2]);
+                if (bn > 0.5f) {                       // both are unit, ~1
+                    ray[0] = b[0]/bn; ray[1] = b[1]/bn; ray[2] = b[2]/bn;
+                    grwxr_wg_two = grwxr_wg_two + 1;
+                    two_w      = w;                    // build 99
+                    two_have_l = true;
+                }
+            } else {
+                grwxr_wg_tworej = grwxr_wg_tworej + 1;
+                // BUILD 120: how far off was it, really?
+                g_wg_agree_n.fetch_add(1, std::memory_order_relaxed);
+                g_wg_agree_sum_milli.fetch_add((uint64_t)(am + 1000),
+                                               std::memory_order_relaxed);
+                int32_t b = g_wg_agree_best_milli.load(std::memory_order_relaxed);
+                if (am > b) g_wg_agree_best_milli.store(am, std::memory_order_relaxed);
+            }
+        }
+    }
 
     // FILTER. One-pole toward the ray, with a hard per-call angular cap. At
     // ~144 calls per second a 5 degree cap is 720 deg/s, far faster than a
@@ -4287,6 +6091,20 @@ extern "C" void grwxr_wgun_apply(void* skelp) {
         }
     }
 
+    // BUILD 84: publish the barrel direction for the aim side.
+    //
+    // Here, and not earlier: s_dir is the two-hand blend AND the filter AND the
+    // rate limit, and the swing below sets the bone's +Y onto exactly this
+    // vector. So this is the one direction in the process that is the barrel by
+    // construction rather than by argument. Anything that aims off ctrl_ray
+    // instead is aiming off an unfiltered input the gun does not follow.
+    //
+    // A plain store of three floats plus a counter bump: no lock, no clock, no
+    // allocation, which is what rule 8 requires of a path entered twice per
+    // frame. It is published BEFORE the swing can bail on a degenerate 180,
+    // because the aim wants the target direction, not the write's success.
+    aimtrace::set_barrel_dir(s_dir, true);
+
     // Where the barrel points right now: the bone's +Y in world space.
     const float ey[3] = {0, 1, 0};
     float fwd[3];
@@ -4312,6 +6130,95 @@ extern "C" void grwxr_wgun_apply(void* skelp) {
 
     float desired[4];
     qmul(sw, worldQ, desired);               // swing applied in WORLD space
+
+    // -----------------------------------------------------------------------
+    // 2026-08-13: ROLL, the Z axis. Twisting your wrist now twists the gun.
+    //
+    // It could not happen before and that was structural, not an oversight: the
+    // swing above is the SHORTEST ARC between two directions, which by
+    // definition carries no twist about the axis, and rolling your wrist does
+    // not change where the controller points, so nothing downstream ever saw
+    // it. Roll therefore has to be added, not extracted.
+    //
+    // It is added as a separate rotation about s_dir, the same filtered
+    // direction the barrel was just aligned to. After the swing the gun's +Y IS
+    // s_dir, and a rotation about an axis fixes that axis exactly, so ROLL
+    // CANNOT DISTURB AIM. That is algebra, not tuning: no trim value, filter
+    // setting or tracking dropout can make this bleed into where the gun
+    // points.
+    //
+    // The angle is measured between the gun's up and the controller's up, both
+    // projected onto the plane normal to the barrel. Left-multiplied in world
+    // space, exactly like the swing, so the confirmed-working block above is
+    // composed onto rather than modified.
+    //
+    // Which way is "up" on a weapon model is NOT known. +Y is the barrel is
+    // verified; nothing states which of the remaining axes is up. So this is
+    // correct up to a constant, and wgun_roll_deg is that constant, converged
+    // once by eye in the headset. Halo MCC VR ships exactly the same trim for
+    // exactly the same reason.
+    // -----------------------------------------------------------------------
+    if (g_wgun_roll.load(std::memory_order_relaxed) != 0) {
+        float cu[3];
+        if (aimtrace::ctrl_up(cu)) {
+            const float t[3] = {s_dir[0], s_dir[1], s_dir[2]};
+            // The gun's own up, after the swing: rotate model +Z by desired.
+            const float ez[3] = {0.0f, 0.0f, 1.0f};
+            float gu[3];
+            qrot(desired, ez, gu);
+            // Project both onto the plane normal to the barrel.
+            const float gd = gu[0]*t[0] + gu[1]*t[1] + gu[2]*t[2];
+            const float cd = cu[0]*t[0] + cu[1]*t[1] + cu[2]*t[2];
+            float gp[3] = {gu[0] - gd*t[0], gu[1] - gd*t[1], gu[2] - gd*t[2]};
+            float cp[3] = {cu[0] - cd*t[0], cu[1] - cd*t[1], cu[2] - cd*t[2]};
+            const float gn2 = sqrtf(gp[0]*gp[0] + gp[1]*gp[1] + gp[2]*gp[2]);
+            const float cn2 = sqrtf(cp[0]*cp[0] + cp[1]*cp[1] + cp[2]*cp[2]);
+            // Near-parallel to the barrel the projection vanishes and the
+            // angle is pure noise. Skip rather than feed the filter garbage.
+            if (gn2 > 0.10f && cn2 > 0.10f) {
+                gp[0] /= gn2; gp[1] /= gn2; gp[2] /= gn2;
+                cp[0] /= cn2; cp[1] /= cn2; cp[2] /= cn2;
+                const float dot = gp[0]*cp[0] + gp[1]*cp[1] + gp[2]*cp[2];
+                const float cr[3] = {gp[1]*cp[2] - gp[2]*cp[1],
+                                     gp[2]*cp[0] - gp[0]*cp[2],
+                                     gp[0]*cp[1] - gp[1]*cp[0]};
+                const float sgn = cr[0]*t[0] + cr[1]*t[1] + cr[2]*t[2];
+                float theta = atan2f(sgn, dot) +
+                              g_wgun_roll_deg.load(std::memory_order_relaxed) *
+                                  0.01745329f;
+
+                // Filter the ANGLE, wrapped. Lerping a raw angle across the
+                // +-180 seam spins the gun the long way round; one-poling the
+                // up VECTOR instead would break its perpendicularity to the
+                // barrel and leak roll back into aim.
+                static float s_roll = 0.0f;
+                static uint32_t s_rgen = 0xFFFFFFFFu;
+                if (gen != s_rgen) { s_rgen = gen; s_roll = theta; }
+                float d = theta - s_roll;
+                while (d >  3.14159265f) d -= 6.28318531f;
+                while (d < -3.14159265f) d += 6.28318531f;
+                const float ralpha = g_wgun_smooth.load(std::memory_order_relaxed);
+                const float rcap =
+                    g_wgun_maxstep.load(std::memory_order_relaxed) * 0.01745329f;
+                float step = ralpha * d;
+                if (step >  rcap) step =  rcap;
+                if (step < -rcap) step = -rcap;
+                s_roll += step;
+
+                const float h = 0.5f * s_roll;
+                const float sh = sinf(h);
+                const float tw[4] = {t[0]*sh, t[1]*sh, t[2]*sh, cosf(h)};
+                float rolled[4];
+                qmul(tw, desired, rolled);
+                const float rn2 = sqrtf(rolled[0]*rolled[0] + rolled[1]*rolled[1] +
+                                        rolled[2]*rolled[2] + rolled[3]*rolled[3]);
+                if (rn2 > 1e-6f) {
+                    for (int i = 0; i < 4; ++i) desired[i] = rolled[i] / rn2;
+                    grwxr_wg_roll = grwxr_wg_roll + 1;
+                }
+            }
+        }
+    }
 
     // Back to model space: modelQ = conj(rootQ) * desiredWorldQ.
     const float conj[4] = {-rx, -ry, -rz, rw};
@@ -4348,6 +6255,94 @@ extern "C" void grwxr_wgun_apply(void* skelp) {
     for (int i = 0; i < 3; ++i)
         if (!isfinite(cp[i])) { bump(&grwxr_wg_nopos); return; }
 
+    // -----------------------------------------------------------------------
+    // BUILD 99: THE GRIP. Where the weapon sits in the hand, and the front-hand
+    // hold. See CameraProbe.h for what each number means.
+    //
+    // Both parts are applied to the TARGET position, before the clamp and the
+    // filter, so everything that already protects this write (the clamp against
+    // the engine's own placement, the one-pole, the generation reset) protects
+    // these too and none of it had to be touched.
+    //
+    // Applied with `desired`, the orientation the gun is being given THIS call,
+    // not the one it currently has. Using the current one would make the offset
+    // lag the weapon by a frame during a fast hand sweep and read as the gun
+    // flexing in the hand.
+    // -----------------------------------------------------------------------
+    // BUILD 101: kept outside the block, because the clamp below has to know
+    // about it. See the long comment at the clamp.
+    float grip_w[3] = {0.0f, 0.0f, 0.0f};
+    {
+        // BUILD 126: GRIP BYPASS, the "park the gun on the blob" test.
+        //
+        // Owner's idea, and it is the right one: the hand markers are the only
+        // part of this mod ever headset-confirmed as tracking correctly
+        // ("tracks incredibly well", build 42). They are therefore ground truth
+        // for where the mod believes the hand is.
+        //
+        // What makes them a real instrument here is the step they DO NOT take.
+        // The marker goes ctrl_pos minus head_pos, into head-local, and
+        // straight to the screen (VRMirror.cpp:1626-1631). The gun anchor takes
+        // those same two steps and then ONE MORE: the (lx, lf, lu) swizzle
+        // mapped through camera::base_frame into engine world space
+        // (VRMirror.cpp:1752-1764). **That third step has never been validated
+        // by anything.** The marker cannot validate it, because it never runs
+        // it. The comment claiming the gun uses "the hand-marker verified
+        // route" is only true of the first half.
+        //
+        // The ENGINE drawing the weapon is the independent reference the
+        // markers cannot be: we hand it a world position and it renders there.
+        // So "does the gun sit on the blob" tests exactly the unvalidated step,
+        // visually, with no log and no ambiguity.
+        //
+        // The static grip offset has to be out of the way for that to mean
+        // anything: the tester's fwd=-0.32 up=+0.40 is a deliberate 0.512 m
+        // displacement, so today the gun is SUPPOSED to miss the blob. This
+        // bypasses the offset for the duration of the test WITHOUT overwriting
+        // his tuned values, so nothing has to be typed back in afterwards.
+        const bool bypass = g_wgun_grip_bypass.load(std::memory_order_relaxed) != 0;
+        const float gf = bypass ? 0.0f : g_wgun_grip_fwd.load(std::memory_order_relaxed);
+        const float gl = bypass ? 0.0f : g_wgun_grip_lat.load(std::memory_order_relaxed);
+        const float gu = bypass ? 0.0f : g_wgun_grip_up.load(std::memory_order_relaxed);
+        if (gf != 0.0f || gl != 0.0f || gu != 0.0f) {
+            // Model frame: +X lateral, +Y the barrel, +Z up.
+            const float go[3] = {gl, gf, gu};
+            float gw[3];
+            qrot(desired, go, gw);
+            if (isfinite(gw[0]) && isfinite(gw[1]) && isfinite(gw[2])) {
+                cp[0] += gw[0]; cp[1] += gw[1]; cp[2] += gw[2];
+                grip_w[0] = gw[0]; grip_w[1] = gw[1]; grip_w[2] = gw[2];
+            }
+        }
+
+        // THE FRONT-HAND HOLD. Slide along the barrel until the handguard sits
+        // on the front hand. A translation along the aim axis cannot change
+        // where the weapon points, so this is safe by construction in exactly
+        // the way the roll trim is.
+        const float tw = g_wgun_grip_two.load(std::memory_order_relaxed);
+        if (tw > 0.0f && two_have_l && two_w > 0.0f && !two_front_is_right) {
+            // Where the front hand actually is along the barrel, measured from
+            // the root we are about to place.
+            const float d[3] = {lpos[0] - cp[0], lpos[1] - cp[1], lpos[2] - cp[2]};
+            const float along = d[0]*s_dir[0] + d[1]*s_dir[1] + d[2]*s_dir[2];
+            if (isfinite(along)) {
+                // Error against where the weapon's own handguard is. Positive
+                // means the hand is further out than the handguard, so the
+                // weapon slides forward to meet it.
+                float e = along - kHandguardFwd;
+                // Bound it before it is scaled: a front hand at arm's length or
+                // tucked at the chest must not translate the weapon a metre.
+                if (e >  0.35f) e =  0.35f;
+                if (e < -0.35f) e = -0.35f;
+                const float k = tw * two_w;   // fades with the direction blend
+                cp[0] += k * e * s_dir[0];
+                cp[1] += k * e * s_dir[1];
+                cp[2] += k * e * s_dir[2];
+                grwxr_wg_grip = grwxr_wg_grip + 1;
+            }
+        }
+    }
+
     float bt[4], rt[4];
     if (!read_block(rec + 0x00, bt, sizeof(bt)) ||
         !read_block(pose + 0x00, rt, sizeof(rt))) {
@@ -4375,14 +6370,38 @@ extern "C" void grwxr_wgun_apply(void* skelp) {
     // dropout or a bad recenter then misplaces the gun by at most this much
     // instead of throwing it across the map, which is the difference between
     // "that looks off" and "the session is over".
+    //
+    // BUILD 101, AND THIS IS THE ONE BEHAVIOURAL CHANGE IN THE BUILD. The clamp
+    // used to measure from the engine's placement alone, so a DELIBERATE static
+    // grip offset spent the safety budget before the player's hand had moved at
+    // all. `[VERIFIED, log grwxr-29328]` the tester settled on fwd=-0.32 and
+    // up=+0.40, a 0.512 m offset against a 0.60 m clamp: 85% of the rail gone,
+    // and every real hand movement then railed instantly. That reads in the
+    // headset as the gun refusing to follow, which is exactly what a safety
+    // clamp is NOT supposed to do to a value the player chose on purpose.
+    //
+    // So the anchor is the engine's placement SHIFTED BY THE SAME STATIC GRIP
+    // OFFSET. The clamp still bounds the thing it was written to bound, which is
+    // how far tracking may throw the weapon from where the engine believes it
+    // is, and it no longer bounds the tester's own trim. The front-hand slide
+    // stays INSIDE the budget deliberately: it is driven by the left controller,
+    // so it is exactly the kind of input the rail exists to survive, and it is
+    // already bounded to +-0.35 m of its own.
     const float lim = g_wgun_pos_clamp.load(std::memory_order_relaxed);
-    float dv[3] = {want[0] - engw[0], want[1] - engw[1], want[2] - engw[2]};
+    const float anch[3] = {engw[0] + grip_w[0],
+                           engw[1] + grip_w[1],
+                           engw[2] + grip_w[2]};
+    float dv[3] = {want[0] - anch[0], want[1] - anch[1], want[2] - anch[2]};
     const float dl = sqrtf(dv[0]*dv[0] + dv[1]*dv[1] + dv[2]*dv[2]);
     if (dl > lim && dl > 1e-6f) {
         const float k = lim / dl;
-        want[0] = engw[0] + dv[0] * k;
-        want[1] = engw[1] + dv[1] * k;
-        want[2] = engw[2] + dv[2] * k;
+        want[0] = anch[0] + dv[0] * k;
+        want[1] = anch[1] + dv[1] * k;
+        want[2] = anch[2] + dv[2] * k;
+        // Measurement rule 1: a gate that can suppress an effect gets its own
+        // counter. This one silently ate a tuning session because nothing
+        // counted it.
+        grwxr_wg_clamped = grwxr_wg_clamped + 1;
     }
 
     // One-pole in WORLD space, reset on the same generation counter the
@@ -4516,6 +6535,34 @@ void drain() {
                      (unsigned long long)grwxr_headhide_direct,
                      (unsigned long long)grwxr_headhide_obj);
         }
+        // BUILD 121: the census, printed ONCE when it stops growing, so a
+        // three minute run does not repeat the same table 18 times. The head
+        // object is marked so the other rows can be read as "everything else
+        // this setter can reach", which is where hands would appear.
+        {
+            static int  s_last_n = -1;
+            static int  s_stable = 0;
+            int n = 0;
+            for (int i = 0; i < 16; ++i) if (grwxr_headhide_ring[i]) ++n;
+            if (n != s_last_n) { s_last_n = n; s_stable = 0; }
+            else if (n > 0 && s_stable >= 0 && ++s_stable == 3) {
+                LOG_INFO("hide census: %d distinct object(s) reached this "
+                         "setter. Rows marked HEAD matched the verified head "
+                         "class; the rest are other visuals on the same "
+                         "route, which is where hands and helmet would be.", n);
+                for (int i = 0; i < 16 && grwxr_headhide_ring[i]; ++i) {
+                    const bool is_head =
+                        grwxr_headhide_table &&
+                        grwxr_headhide_ring_cls[i] == grwxr_headhide_table;
+                    LOG_INFO("hide census:   [%2d] obj=0x%012llX cls=0x%012llX%s",
+                             i,
+                             (unsigned long long)grwxr_headhide_ring[i],
+                             (unsigned long long)grwxr_headhide_ring_cls[i],
+                             is_head ? "   <<< HEAD (the class we force)" : "");
+                }
+                s_stable = -1;   // printed; do not print again
+            }
+        }
     }
 
     static uint32_t last_rows = 0;
@@ -4538,7 +6585,7 @@ void drain() {
     }
     if (rows) {
         LOG_INFO("  probe caller     calls      camera             mode  wmo    "
-                 "camFOV   skewX    skewY    | xmm1 range        xmm2 range        "
+                 "camASPCT skewX    skewY    | xmm1 range        xmm2 range        "
                  "xmm3 range        arg5 range");
         for (uint32_t i = 0; i < rows; ++i) {
             Row& r = g_rows[i];

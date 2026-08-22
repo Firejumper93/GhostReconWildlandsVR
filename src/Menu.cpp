@@ -1,6 +1,10 @@
 #include "Menu.h"
 #include "D3D11Hook.h"
+#include "GameBuild.h"   // build 86: the pin, shown first on the Status page
+#include "HeadPose.h"    // build 128: the panel polls the controller itself
 #include "Log.h"
+#include "Presets.h"     // build 129: whole configs on the numpad digits
+#include "VRMirror.h"    // build 86: live barrel-aim state for the panel
 
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
@@ -28,9 +32,53 @@ ID3D11ShaderResourceView* g_srv = nullptr;
 
 std::atomic<bool> g_ready{false};
 std::atomic<bool> g_open{false};
+// BUILD 127: set when the panel is opened, consumed by the next draw to focus
+// the window once. See the comment at SetNextWindowFocus.
+std::atomic<bool> g_focus_pending{false};
 
 // Pointer, written by the VR side each frame, read by render().
 std::atomic<bool>  g_ptr_hit{false};
+// BUILD 122: GAMEPAD NAV STATE. The panel had NavEnableGamepad set since it
+// was written, but nothing ever fed it a single gamepad key, and set_pointer
+// (the controller-ray route) has ZERO callers. So the panel opened and could
+// not be operated at all from inside a headset, which is where it is meant to
+// be used. Reported by the owner: "the tuner opens but doesnt have a way to
+// use it with the thumbsticks".
+//
+// Fed from XInputMerge, which already sees the merged Touch + pad state, so
+// this works with the Touch sticks and with a physical pad without either
+// knowing about the other.
+std::atomic<float> g_nav_lx{0.0f};   // -1..1, left stick
+std::atomic<float> g_nav_ly{0.0f};
+std::atomic<uint16_t> g_nav_btn{0};  // XInput button mask
+// BUILD 127: proof of life for the nav feed. If nothing polls XInput while the
+// panel is open, set_nav is never called and the panel is dead in exactly the
+// same way as the missing-flag bug was. The header shows this so the panel
+// diagnoses itself instead of looking identically broken for two causes.
+std::atomic<unsigned> g_nav_feeds{0};
+
+// BUILD 128: WHAT THE PANEL ACTUALLY NAVIGATED ON THIS FRAME.
+//
+// Written by render() and read by draw_ui() a few lines later, on the same
+// render thread and nowhere else, so these are plain fields on purpose: no
+// atomics, no ordering to reason about.
+//
+// The reason they exist is that build 122 and 127 both routed nav through the
+// XInputGetState detour, and that detour runs ONLY while the GAME chooses to
+// poll XInput. If the game stops polling (its own menu up, focus lost, paused)
+// the panel goes dead and looks broken for a reason that has nothing to do with
+// the panel. Build 128 makes the panel poll headpose::touch_pad() itself, which
+// the mod already refreshes every frame from its own OpenXR pass, and merges the
+// game's pad state in on top so a physical pad still works. The header names
+// which source supplied the numbers, so one look settles it.
+struct NavShown {
+    float    lx = 0.0f, ly = 0.0f;
+    uint16_t btn = 0;
+    bool     own = false;   // our own OpenXR poll was live this frame
+    bool     xin = false;   // the game's XInput detour has ever fed us
+};
+NavShown g_nav_shown;
+
 std::atomic<float> g_ptr_u{0.5f};
 std::atomic<float> g_ptr_v{0.5f};
 std::atomic<bool>  g_ptr_down{false};
@@ -88,9 +136,31 @@ struct Setting {
 };
 
 Setting g_set[] = {
+    {"wgun_grip_bypass", "Park the gun on your hand (test)",
+     "Puts the gun exactly where the mod thinks your hand is, ignoring the grip "
+     "offset that normally holds it away from you. Turn on Show hand markers "
+     "too, then look at the orange dot on your shooting hand. THE QUESTION IS "
+     "SIMPLE: does the gun sit on the dot, or somewhere else? The markers are "
+     "the one part of this mod confirmed to track correctly, so if the gun is "
+     "not on the dot, the fault is in how the mod converts your hand position "
+     "into the game world, which nothing has ever checked. Your grip settings "
+     "are kept and come straight back when you turn this off.",
+     0.0f, 0.0f, 1.0f, true, 0.0f, false},
+
+    {"ipd_swap", "Swap the eyes  <<< TRY THIS FIRST",
+     "Which eye gets which viewpoint. ON is the swapped one. This is the only "
+     "setting no log can decide, so it has to be judged by eye. Stand still, "
+     "look at something a few metres away, and turn this on and off a few "
+     "times. One of the two has real depth and one is flat. If the swapped one "
+     "is right, put Stereo strength back to 1.00 and the world stops looking "
+     "far too large.",
+     0.0f, 0.0f, 1.0f, true, 0.0f, false},
+
     {"ipd_scale", "Stereo strength (IPD scale)",
-     "How far apart the two eye viewpoints sit. 1.00 is your measured IPD. "
-     "Lower it if depth feels exaggerated or uncomfortable.",
+     "How far apart the two eye viewpoints sit. 1.00 is your real IPD and is "
+     "what a correct build should run at. You are currently on 0.05, which is "
+     "eyes 3 mm apart: almost no depth, and it makes the world read about 20 "
+     "times too large. If Swap the eyes fixes fusion, bring this back to 1.00.",
      1.00f, -2.0f, 2.0f, false, 1.00f, false},
 
     {"fullscreen_fov", "World field of view (radians)",
@@ -122,6 +192,90 @@ Setting g_set[] = {
      "leaves the game's own setting alone. 1 pairs the two eyes more tightly "
      "in time; put it back to 0 if it costs frame rate.",
      0.0f, 0.0f, 4.0f, false, 0.0f, false},
+
+    // Build 86: the weapon and aim rows. These are the settings a headset test
+    // actually needs to change, and until now every one of them required
+    // taking the headset off and editing grwxr.cfg in a text editor. That is
+    // a large part of why the two-handed hold and the barrel aim have both
+    // sat built-but-untested across several sessions.
+    {"aim_barrel", "Bullets follow the barrel",
+     "0 off. 1 steers only while you hold the fire trigger. 2 keeps the gun's "
+     "aim live all the time, which is the one that behaves like a real weapon, "
+     "because a real gun is already pointing where it points before you pull. "
+     "Needs the motion-controlled weapon switched on.",
+     0.0f, 0.0f, 2.0f, false, 0.0f, false},
+
+    {"wgun_twohand", "Two-handed hold",
+     "Your rear hand sets where the gun is, your front hand sets where it "
+     "points, like a real rifle. Off means the rear hand alone aims it.",
+     1.0f, 0.0f, 1.0f, true, 1.0f, false},
+
+    {"wgun_grip_two", "Front hand grip",
+     "How much your FRONT hand actually holds the weapon. At 0 your left hand "
+     "only points and the handguard never reaches it, which is why a rifle can "
+     "feel one-handed. At 1 the handguard lands in your left hand. 0.5 splits "
+     "the difference. This cannot move your point of aim, so it is safe to "
+     "sweep while you look at the gun.",
+     0.0f, 0.0f, 1.0f, false, 0.0f, false},
+
+    {"main_hand", "Shooting hand",
+     "Which hand holds the grip and pulls the trigger. 1 is right, 0 is left. "
+     "Everything else follows from this: which controller the weapon pivots "
+     "on, which trigger aims down sights, and which trigger fires. Your last "
+     "run pulled the LEFT trigger 19 times and the right one once, so aim down "
+     "sights and fire were both watching the wrong hand and neither ever "
+     "engaged.",
+     1.0f, 0.0f, 1.0f, true, 1.0f, false},
+
+    {"wgun_two_auto", "Find the front hand",
+     "Works out which of your hands is nearer the muzzle instead of assuming "
+     "it is your left. Your last recorded run measured your RIGHT hand in "
+     "front, which pointed the barrel behind you and made the two-hand gate "
+     "refuse every single frame. Leave this on unless the gun points the wrong "
+     "way, in which case turn it off and say so.",
+     1.0f, 0.0f, 1.0f, true, 1.0f, false},
+
+    {"wgun_two_agree", "Two-hand gate",
+     "How closely the line between your two hands must agree with your right "
+     "controller before the front hand is allowed to help. Leave this at 0.35. "
+     "The refusals in your last run were the barrel pointing backwards, not a "
+     "tight gate, and Find the front hand is the fix for that. Lowering this "
+     "to 0.00 is the worst setting available: it sits exactly on the measured "
+     "average, so it would accept and refuse alternately at 72 Hz.",
+     0.35f, -1.0f, 1.0f, false, 0.35f, false},
+
+    {"wgun_pos_clamp", "Gun reach (metres)",
+     "How far the gun may travel from its resting anchor before it stops "
+     "following your hand. Raise it if the gun feels tethered and will not "
+     "come up to your eye; lower it if it wanders too far.",
+     0.60f, 0.10f, 2.00f, false, 0.60f, false},
+
+    {"wgun_pos_scale", "Gun travel scale",
+     "Multiplies how far the gun moves for a given hand movement. 1.0 is "
+     "one-to-one with your real hand. Below 1 damps it, above 1 exaggerates.",
+     1.0f, 0.25f, 2.0f, false, 1.0f, false},
+
+    {"wgun_roll_deg", "Gun roll trim (degrees)",
+     "Rotates the weapon about its own barrel. Use this if the gun is canted "
+     "or upside down; the usual corrections are 90 or 180.",
+     0.0f, -180.0f, 180.0f, false, 0.0f, false},
+
+    {"aim_ads", "Trigger also aims down sights",
+     "OFF gives you real hip fire, with aiming moved to the left trigger where "
+     "the game normally puts it. ON is the older behaviour where a half pull "
+     "raises the sights, which means every shot goes through ADS.",
+     0.0f, 0.0f, 1.0f, true, 0.0f, false},
+
+    // BUILD 129: this row exists because Numpad 0 became a preset slot and
+    // this is what Numpad 0 did. Build 96 put it on a key because the A/B has
+    // to be run WHILE walking; the panel can be opened while walking too.
+    {"cam_selector_pose", "Write the camera pose",
+     "The control for the gun jitter. OFF makes the camera row single valued "
+     "again, which is what build 88 ran on. WARNING: OFF also turns off first "
+     "person and stereo separation, so the view changes a lot. If the jitter "
+     "goes with it, the camera write is the cause; if it stays, the write is "
+     "exonerated.",
+     0.0f, 0.0f, 1.0f, true, 0.0f, false},
 };
 constexpr int kSettingCount = (int)(sizeof(g_set) / sizeof(g_set[0]));
 
@@ -266,6 +420,68 @@ void draw_settings_page() {
     ImGui::TextDisabled(any_dirty ? "unsaved changes" : "in sync with the file");
 }
 
+// BUILD 129: whole configs, one numpad digit each. See Presets.h.
+//
+// The page exists for the two things a keypress cannot do: show WHICH config
+// is loaded (a spoken name is gone the moment it is said) and reach past the
+// first ten (the bank pager is what turns ten keys into a hundred configs).
+void draw_presets_page() {
+    const int n     = presets::count();
+    const int banks = presets::bank_count();
+    const int b     = presets::bank();
+
+    if (n == 0) {
+        ImGui::TextWrapped(
+            "No presets found. Put WHOLE copies of grwxr.cfg into "
+            "GRWVR\\presets\\ and name them 01-something.cfg. They sort by "
+            "name and the numpad digits load them: 1 is the first in the bank, "
+            "0 is the tenth.");
+        if (ImGui::Button("Look again", ImVec2(200, 0))) presets::rescan();
+        return;
+    }
+
+    ImGui::TextWrapped(
+        "A numpad digit loads a whole config and says its name out loud. "
+        "1 to 9 then 0 are the ten slots in the current bank.");
+    ImGui::TextDisabled(
+        "A preset overwrites grwxr.cfg, which is what keeps the live state "
+        "readable in one file. Your cfg is backed up once, before the first "
+        "load of each session.");
+    ImGui::Separator();
+
+    const char* cur = presets::current();
+    ImGui::Text("Loaded: ");
+    ImGui::SameLine();
+    if (cur) ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.40f, 1.0f), "%s", cur);
+    else     ImGui::TextDisabled("nothing yet this session");
+
+    ImGui::Text("Bank %d of %d   (%d preset%s on disk)", b + 1, banks, n,
+                n == 1 ? "" : "s");
+    if (banks > 1) {
+        ImGui::SameLine();
+        if (ImGui::Button("Prev bank", ImVec2(120, 0))) presets::bank_step(-1);
+        ImGui::SameLine();
+        if (ImGui::Button("Next bank", ImVec2(120, 0))) presets::bank_step(+1);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Rescan", ImVec2(100, 0))) presets::rescan();
+    ImGui::Separator();
+
+    // Key 1 first and key 0 last, in the order the digits read.
+    for (int k = 1; k <= 10; ++k) {
+        const int slot = (k == 10) ? 0 : k;
+        const char* nm = presets::name_of_slot(slot);
+        ImGui::PushID(slot);
+        if (!nm) ImGui::BeginDisabled();
+        char label[160];
+        snprintf(label, sizeof(label), "Numpad %d   %s", slot,
+                 nm ? nm : "(empty)");
+        if (ImGui::Button(label, ImVec2(420, 0))) presets::load_slot(slot);
+        if (!nm) ImGui::EndDisabled();
+        ImGui::PopID();
+    }
+}
+
 void draw_captures_page() {
     ImGui::TextWrapped(
         "Each capture says whether it can run right now, and what it is doing "
@@ -316,6 +532,67 @@ void draw_captures_page() {
 }
 
 void draw_status_page() {
+    // Build 86: the game-build pin, first, because every other line on this
+    // page is meaningless if the mod did not recognise the exe. After the
+    // 2026-08-13 update this was the difference between "the feature does not
+    // work" and "nothing installed at all", and that distinction previously
+    // lived only in the log.
+    const auto* gb = gamebuild::get();
+    if (gb) {
+        ImGui::Text("Game build       : %s  (recognised)", gb->name);
+    } else {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                           "Game build       : NOT RECOGNISED");
+        ImGui::TextWrapped(
+            "The game has been updated to a binary this mod has not been "
+            "taught yet, so nothing that depends on engine addresses has "
+            "installed and the game is running unmodified. Nothing below "
+            "will do anything until that is fixed.");
+        ImGui::Separator();
+    }
+
+    // Anti-cheat, read from the process rather than assumed. Ubisoft removed
+    // EasyAntiCheat in the 2026-08-13 update; this is the one place that can
+    // confirm it from inside, which is stronger than any external check.
+    ImGui::Text("EasyAntiCheat    : %s",
+                GetModuleHandleW(L"EasyAntiCheat_x64.dll") ? "LOADED"
+                                                           : "not loaded");
+    ImGui::Separator();
+
+    // Barrel aim. The three questions a test has to answer, in order: did the
+    // loop run at all, did it use the real barrel or fall back to the raw
+    // controller ray, and is the error converging toward zero.
+    const vr::BarrelStatus b = vr::barrel_status();
+    const char* mode = b.mode == 2 ? "2 (always on)"
+                     : b.mode == 1 ? "1 (only while firing)"
+                                   : "0 (off)";
+    ImGui::Text("Bullets follow   : %s", mode);
+    if (b.mode != 0) {
+        const char* src = b.src == 1 ? "the real barrel"
+                        : b.src == 2 ? "CONTROLLER RAY (fallback)"
+                                     : "nothing yet";
+        ImGui::Text("  steering from  : %s", src);
+        ImGui::Text("  frames driven  : %u", b.frames);
+        ImGui::Text("  last error     : yaw %+.2f  pitch %+.2f deg",
+                    b.err_yaw_deg, b.err_pitch_deg);
+        if (b.nodir || b.noview || b.overcap) {
+            ImGui::Text("  skipped        : no-direction %u  no-view %u  "
+                        "over-limit %u", b.nodir, b.noview, b.overcap);
+        }
+        if (b.src == 2) {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                "The motion-controlled weapon is not publishing a barrel, so "
+                "this is steering off the raw controller ray. Turn the weapon "
+                "on, or this is not testing what you think it is.");
+        }
+        if (b.frames == 0) {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                "Armed, but it has never actually driven the aim. That is a "
+                "different problem from it running and not helping.");
+        }
+    }
+    ImGui::Separator();
+
     const auto& st = d3d11::state();
     ImGui::Text("Frames presented : %llu", st.frames);
     ImGui::Text("Backbuffer       : %u x %u  (format %d)", st.width, st.height, (int)st.format);
@@ -331,6 +608,12 @@ void draw_ui() {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->Pos);
     ImGui::SetNextWindowSize(vp->Size);
+    // BUILD 127: ImGui nav is inert with no focused window (io.NavActive
+    // requires g.NavWindow), and nothing here ever focused one. Requested on
+    // the OPEN EDGE only, so it cannot steal focus back every frame and pin the
+    // cursor to the first row while he is trying to move down the list.
+    if (g_focus_pending.exchange(false, std::memory_order_relaxed))
+        ImGui::SetNextWindowFocus();
     ImGui::Begin("GRW-XR", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
@@ -339,9 +622,31 @@ void draw_ui() {
     ImGui::TextUnformatted("GRW-XR tester panel");
     ImGui::SameLine();
     ImGui::TextDisabled("| F1 closes");
+
+    // BUILD 127/128: the controller-input readout. Moving numbers and a dead
+    // panel means the fault is in ImGui nav; no numbers means nothing is
+    // reaching the panel at all. Those had identical symptoms from inside a
+    // headset and cost a whole test cycle to tell apart. Build 128 adds which
+    // of the two sources supplied them.
+    {
+        const NavShown& n = g_nav_shown;
+        if (!n.own && !n.xin) {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
+                               "NO CONTROLLER INPUT REACHING THE PANEL");
+        } else {
+            ImGui::TextDisabled("stick %+.2f %+.2f  buttons %04X", n.lx, n.ly,
+                                (unsigned)n.btn);
+        }
+        ImGui::TextDisabled("source: own poll %s | game XInput %s (%u)",
+                            n.own ? "LIVE" : "dead",
+                            n.xin ? "live" : "dead",
+                            g_nav_feeds.load(std::memory_order_relaxed));
+        ImGui::TextDisabled("left stick moves, A selects, B backs out");
+    }
     ImGui::Separator();
 
     if (ImGui::BeginTabBar("tabs")) {
+        if (ImGui::BeginTabItem("Presets"))  { draw_presets_page();  ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Settings")) { draw_settings_page(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Captures")) { draw_captures_page(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Status"))   { draw_status_page();   ImGui::EndTabItem(); }
@@ -387,12 +692,28 @@ bool init(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     // NEVER let ImGui write its own ini. It would land beside the game exe,
-    // and the project rules' default rule is that we place nothing in the install
+    // and the project's default rule is that we place nothing in the install
     // except the proxy and the GRWVR folder.
     io.IniFilename  = nullptr;
     io.LogFilename  = nullptr;
     io.DisplaySize  = ImVec2((float)kMenuW, (float)kMenuH);
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    // BUILD 127: AND THIS LINE, WITHOUT WHICH THE ONE ABOVE DOES NOTHING.
+    //
+    // imgui.cpp:12767 computes
+    //   nav_gamepad_active = (ConfigFlags & NavEnableGamepad)
+    //                     && (BackendFlags & HasGamepad);
+    // and gates ALL gamepad navigation on it. Build 122 set the config flag and
+    // wired a full key feed from XInputMerge, and this flag was never set
+    // anywhere in the tree, so nav_gamepad_active was permanently false and
+    // every event fed was discarded. The panel drew, the sticks did nothing.
+    //
+    // This is normally set by a platform backend. There isn't one here: the mod
+    // uses imgui_impl_dx11 alone and drives input itself, so nothing was ever
+    // going to set it for us. Build 122 fixed "the flag is set but nothing
+    // feeds it" and left "something feeds it but the other flag is not set",
+    // which is the same bug one layer down.
+    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
     // The panel is read at arm's length through a headset lens, not on a
     // monitor at 60 cm. Everything is scaled up accordingly.
     ImGui::StyleColorsDark();
@@ -435,10 +756,22 @@ bool is_open() { return g_open.load(std::memory_order_acquire); }
 void set_open(bool on) {
     if (g_open.exchange(on) == on) return;
     if (on) g_want_reload.store(true);   // always show what the file really says
+    // BUILD 127: focus the window on open, or gamepad nav has no NavWindow to
+    // act on and does nothing at all.
+    if (on) g_focus_pending.store(true, std::memory_order_relaxed);
     note("menu: panel %s", on ? "opened" : "closed");
 }
 
 bool toggle() { const bool want = !is_open(); set_open(want); return want; }
+
+// BUILD 122: called from XInputMerge with the MERGED pad state, so Touch
+// sticks and a physical pad both drive the panel. Three relaxed stores.
+void set_nav(float lx, float ly, unsigned short buttons) {
+    g_nav_feeds.fetch_add(1, std::memory_order_relaxed);
+    g_nav_lx.store(lx, std::memory_order_relaxed);
+    g_nav_ly.store(ly, std::memory_order_relaxed);
+    g_nav_btn.store(buttons, std::memory_order_relaxed);
+}
 
 void set_pointer(bool hit, float u, float v, bool pressed) {
     g_ptr_hit.store(hit, std::memory_order_relaxed);
@@ -468,6 +801,51 @@ ID3D11ShaderResourceView* render() {
         io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);   // park it, do not leave it hovering
     }
     io.AddMouseButtonEvent(0, g_ptr_down.load(std::memory_order_relaxed));
+
+    // BUILD 122: gamepad navigation. ImGui's nav wants discrete key events,
+    // so the analog stick is thresholded into d-pad style presses and the
+    // held state is re-sent every frame, which is what makes key-repeat work
+    // for holding a direction to run a slider along its range.
+    {
+        // BUILD 128: OUR OWN POLL FIRST, THE GAME'S PAD SECOND.
+        //
+        // headpose::touch_pad() is six relaxed atomic loads of a snapshot the
+        // OpenXR pass republishes every frame, so it is rule-8 safe in Present
+        // and, unlike the XInput detour, it does not stop existing when the
+        // game stops polling. The game's merged pad state is OR'd/max'd in on
+        // top so a physical pad, and anything the detour adds, still works.
+        float    lx = g_nav_lx.load(std::memory_order_relaxed);
+        float    ly = g_nav_ly.load(std::memory_order_relaxed);
+        uint16_t b  = g_nav_btn.load(std::memory_order_relaxed);
+
+        uint32_t obtn = 0;
+        float    oax[6] = {};
+        const bool own = headpose::touch_pad(&obtn, oax);
+        if (own) {
+            // Per axis the larger magnitude wins, the same rule XInputMerge
+            // uses, so neither source can pull the other back toward zero.
+            if ((oax[0] < 0 ? -oax[0] : oax[0]) > (lx < 0 ? -lx : lx)) lx = oax[0];
+            if ((oax[1] < 0 ? -oax[1] : oax[1]) > (ly < 0 ? -ly : ly)) ly = oax[1];
+            b |= (uint16_t)obtn;
+        }
+        g_nav_shown.lx  = lx;
+        g_nav_shown.ly  = ly;
+        g_nav_shown.btn = b;
+        g_nav_shown.own = own;
+        g_nav_shown.xin = g_nav_feeds.load(std::memory_order_relaxed) != 0;
+
+        const float kDead = 0.45f;   // generous: a headset tester is not
+                                     // aiming, and a low deadzone makes a
+                                     // slider crawl on stick drift
+        io.AddKeyEvent(ImGuiKey_GamepadDpadLeft,  lx < -kDead || (b & 0x0004));
+        io.AddKeyEvent(ImGuiKey_GamepadDpadRight, lx >  kDead || (b & 0x0008));
+        io.AddKeyEvent(ImGuiKey_GamepadDpadUp,    ly >  kDead || (b & 0x0001));
+        io.AddKeyEvent(ImGuiKey_GamepadDpadDown,  ly < -kDead || (b & 0x0002));
+        // A activates and B backs out, the console convention the tester
+        // already has in his hands. On Touch these are the face buttons.
+        io.AddKeyEvent(ImGuiKey_GamepadFaceDown,  (b & 0x1000) != 0);   // A
+        io.AddKeyEvent(ImGuiKey_GamepadFaceRight, (b & 0x2000) != 0);   // B
+    }
 
     ImGui_ImplDX11_NewFrame();
     ImGui::NewFrame();

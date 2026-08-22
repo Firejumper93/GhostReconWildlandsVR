@@ -39,7 +39,9 @@
 #include "WeaponDraw.h"
 #include "WeaponProbe.h"
 #include "AimTrace.h"
+#include "Voice.h"
 #include "Menu.h"
+#include "Presets.h"
 
 // Forward every export of the real dxgi.dll to dxgi_real.dll.
 // deploy.bat places a copy of C:\Windows\System32\dxgi.dll as dxgi_real.dll
@@ -238,6 +240,12 @@ DWORD WINAPI init_thread(LPVOID) {
     LOG_INFO("");
     LOG_INFO("build 50: installing the aim-reader census (log-only)");
     grwxr::aimtrace::install();
+    // Build 105: separate call on purpose. install() above returns early on
+    // cfg aim_probes=0, and these two hooks must not share that fate.
+    grwxr::aimtrace::install_aimpoint();
+    // Build 107: spoken test instructions. Its own thread and its own COM
+    // apartment, so nothing here can reach the render path (rule 8).
+    grwxr::voice::init();
 
     LOG_INFO("phase 2: installing D3D11 Present hook");
     if (!grwxr::d3d11::install()) {
@@ -245,6 +253,11 @@ DWORD WINAPI init_thread(LPVOID) {
         return 0;
     }
     LOG_INFO("phase 2 hook installed. Waiting for the first Present.");
+
+    // Build 129: take the preset inventory now, so the log names what the
+    // digit keys will do BEFORE the first one is pressed. A key whose effect
+    // is only discoverable by pressing it is the failure mode Numpad 5 taught.
+    grwxr::presets::init();
 
     // Present deliberately writes no log lines. Drain its findings here, on our
     // own thread, and report liveness periodically without touching the hot path.
@@ -269,7 +282,10 @@ DWORD WINAPI init_thread(LPVOID) {
         // failure the panel exists to remove, and it is worse when the cause is
         // ours.
         {
-            static bool f1_prev = false, np4_prev = false, np5_prev = false;
+            static bool f1_prev = false, np4_prev = false, kend_prev = false;
+            static bool ndiv_prev = false, nmul_prev = false, nadd_prev = false;
+            static bool kins_prev = false, kpgu_prev = false;
+            static bool kpgd_prev = false, kdel_prev = false;
             for (int slice = 0; slice < 20; ++slice) {
                 Sleep(50);
                 const bool f1 = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
@@ -283,14 +299,147 @@ DWORD WINAPI init_thread(LPVOID) {
                 // made a "nothing happened" report take a log dig to explain.
                 // Retire the key with its feature; give it to the question we
                 // are actually asking.
-                const bool np4 = (GetAsyncKeyState(VK_NUMPAD4) & 0x8000) != 0;
-                if (np4 && !np4_prev) grwxr::aimtrace::cycle_bullet_yaw();
-                np4_prev = np4;
+                // BUILD 104: RETIRED, for the second time and for a better
+                // reason. This key armed the spawn-direction write with NO cfg
+                // key of its own: one press bent the value that seeds a round,
+                // by up to 20 degrees, with nothing but aim_probes between a
+                // stray keypress and a live shot-direction experiment.
+                //
+                // `[VERIFIED, 2026-08-15]` the object it writes into is a
+                // TrailFX, the cosmetic bullet trail, so it cannot move a shot
+                // in any case. It is a hotkey that arms a retracted lever, and
+                // this build is going to testers. Rule 6: revert failed
+                // experiments rather than leaving dormant switches in the tree.
+                //
+                // cfg bullet_yaw_deg still reaches the same code for research;
+                // it just cannot be reached by feel from inside a headset.
+                (void)np4_prev;
 
-                // Build 78: step the gun-root bone (off / node 8 / node 10).
-                const bool np5 = (GetAsyncKeyState(VK_NUMPAD5) & 0x8000) != 0;
-                if (np5 && !np5_prev) grwxr::camera::cycle_wgun();
-                np5_prev = np5;
+                // Build 93: NUMPAD 5 IS RETIRED, for the same reason NUMPAD 4
+                // was retired in build 82, and rule 6 (revert failed
+                // experiments rather than leaving dormant switches).
+                //
+                // It cycled the gun-root bone through off / node 8 / node 10 /
+                // rotate, a build 78 A/B that is long settled: the mount is
+                // node 10 and the mode is 3, both headset-verified, and node 8
+                // was measured to do nothing at all. Three of the four
+                // positions this key could select were retired states, and one
+                // of them silently disarms the headline feature of the mod.
+                //
+                // It did exactly that on 2026-08-15. Five presses landed inside
+                // one second at 04:27:19 while the tester was working the keys
+                // around it, the cycle stopped on mode 0, and the weapon writer
+                // sat disarmed for the rest of the session: `wgun: idle
+                // node=-1`, rots frozen at 2164 while calls climbed past
+                // 690,000. It presented as "the rotation and control from the
+                // front hand is gone" and read as a regression in that day's
+                // camera work, which it was not. The only feedback the mod gave
+                // was a log line, and the tester was wearing a headset.
+                //
+                // NUMPAD 5 also sits in the middle of the block he uses
+                // constantly: 1 cycles barrel aim, 3 toggles ADS, 4 cycles
+                // bullet yaw, 8 toggles first person. cfg `wgun` still selects
+                // the mode for anyone who wants the old A/B, and it hot-reloads
+                // in about a second, so nothing is actually lost here.
+
+                // BUILD 129 (owner directive, 2026-08-22): THE WHOLE DIGIT ROW
+                // LOADS WHOLE CONFIGS. "now we can hot reload whole CFG's and
+                // map them to 10 keys via the numpad. We can test over 100
+                // configs in a single session now."
+                //
+                // What the digits used to do, and where each went. Nothing is
+                // lost and nothing is left dormant (rule 6): every one of them
+                // already had, or now has, a row in the F1 panel, which as of
+                // build 128 is driveable from the headset.
+                //
+                //   1  cycle_aim_barrel      -> Settings row "Bullets follow
+                //                               the barrel" (aim_barrel)
+                //   3  toggle_aim_ads        -> Settings row "Trigger also
+                //                               aims down sights" (aim_ads)
+                //   0  toggle_cam_pose       -> Settings row added in this
+                //                               build (cam_selector_pose)
+                //   7  weapon draw census    -> Captures row, already there
+                //   8  first person toggle   -> Captures row, already there.
+                //                               Its RECENTER half is not lost:
+                //                               Home has always recentered on
+                //                               its own (VRMirror.cpp), and
+                //                               this build adds Space too.
+                //   9  eye sign swap         -> Settings row "Swap the eyes",
+                //                               put there by build 125b
+                //
+                // Why a whole config and not one more setting: build 99's note
+                // says one key per setting does not scale, and answered it with
+                // a tuner that selects WHICH setting is live. That still moves
+                // one value at a time, and "does this feel right" is a
+                // judgement about a COMBINATION of values. Ten keys times ten
+                // banks is a hundred combinations in one session.
+                //
+                // The keys only queue (Presets.h): the load happens in pump()
+                // below, on this thread, because it is file I/O.
+                {
+                    static bool np_prev[10] = {};
+                    static const int vk[10] = {
+                        VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3,
+                        VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7,
+                        VK_NUMPAD8, VK_NUMPAD9};
+                    for (int d = 0; d < 10; ++d) {
+                        const bool down = (GetAsyncKeyState(vk[d]) & 0x8000) != 0;
+                        if (down && !np_prev[d]) grwxr::presets::load_slot(d);
+                        np_prev[d] = down;
+                    }
+                }
+                grwxr::presets::pump();
+
+                // Build 97 (user directive): the settings an open test asks him
+                // to change are reachable from inside the headset. The
+                // arithmetic row and the tall + key, because none of them
+                // borders a live digit key. See VRMirror.h.
+                const bool ndiv = (GetAsyncKeyState(VK_DIVIDE) & 0x8000) != 0;
+                if (ndiv && !ndiv_prev) grwxr::vr::step_ipd_scale(-1);
+                ndiv_prev = ndiv;
+
+                const bool nmul = (GetAsyncKeyState(VK_MULTIPLY) & 0x8000) != 0;
+                if (nmul && !nmul_prev) grwxr::vr::step_ipd_scale(+1);
+                nmul_prev = nmul;
+
+                const bool nadd = (GetAsyncKeyState(VK_ADD) & 0x8000) != 0;
+                if (nadd && !nadd_prev) grwxr::vr::toggle_cam_pose_rot();
+                nadd_prev = nadd;
+
+                // Build 99: THE TUNER. One key selects, two step, one resets,
+                // so no future setting ever needs another key. The six-key
+                // island above the arrows: findable by feel, and nowhere near
+                // the numpad, so nothing here can be hit while reaching for
+                // first person or the barrel aim. See VRMirror.h.
+                const bool kins = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
+                if (kins && !kins_prev) grwxr::vr::tuner_cycle();
+                kins_prev = kins;
+
+                // Build 101: Shift makes a step ten times bigger, because the
+                // tester spent thirty-one presses against a rail and should not
+                // have had to spend fifteen to reach it either.
+                const int tmul =
+                    (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ? 10 : 1;
+
+                const bool kpgu = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
+                if (kpgu && !kpgu_prev) grwxr::vr::tuner_step(+1, tmul);
+                kpgu_prev = kpgu;
+
+                const bool kpgd = (GetAsyncKeyState(VK_NEXT) & 0x8000) != 0;
+                if (kpgd && !kpgd_prev) grwxr::vr::tuner_step(-1, tmul);
+                kpgd_prev = kpgd;
+
+                // Build 107: End starts a GUIDED, SPOKEN test run. It is the
+                // bottom-middle key of the same six-key island as the tuner,
+                // so it is findable by feel, and it is the only key in that
+                // island that was still free.
+                const bool kend = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
+                if (kend && !kend_prev) grwxr::aimtrace::guide_start();
+                kend_prev = kend;
+
+                const bool kdel = (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
+                if (kdel && !kdel_prev) grwxr::vr::tuner_reset();
+                kdel_prev = kdel;
             }
         }
         grwxr::d3d11::drain_capture_log();
@@ -308,6 +457,7 @@ DWORD WINAPI init_thread(LPVOID) {
         grwxr::factory::drain();
         grwxr::wp::drain();
         grwxr::aimtrace::drain();
+        grwxr::aimtrace::drain_aimpoint();
 
         // Bring OpenXR up once the device exists, on OUR thread, not the render
         // thread. Session creation is slow and allocates; it must not happen

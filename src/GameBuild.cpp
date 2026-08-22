@@ -46,6 +46,7 @@ constexpr Build kSteam = {
     "48 83 EC 08 44 0F B6 DA 49 89 C9 38 51 68 74 ? 44 0F B7 51 4A",
     0, 0,                         // PublishAttachments NOT derived here
     0, 0,                         // SetWorldTransform NOT derived here
+    0, 0, 0, 0,                   // build 105 anchor getters NOT derived here
 };
 
 constexpr Build kStore = {
@@ -77,6 +78,7 @@ constexpr Build kStore = {
     "48 83 EC 08 44 0F B6 DA 49 89 C9 38 51 68 74 ? 44 0F B7 51 4A",
     0, 0,                         // PublishAttachments NOT derived here
     0, 0,                         // SetWorldTransform NOT derived here
+    0, 0, 0, 0,                   // build 105 anchor getters NOT derived here
 };
 
 // The 2026-08 "Last Rites" update. Steam and Ubisoft Connect ship the SAME
@@ -118,9 +120,162 @@ constexpr Build kUpdate2026 = {
     "48 83 EC 08 44 0F B6 DA 49 89 CA 38 51 68 74 ? 0F B7 41 4A 85 C0 74 ?",
     0x018A03B0, 0x0F090D00,       // Skeleton::PublishAttachments thunk + impl
     0x017E1770, 0x0EAB1C60,       // TransformNode::SetWorldTransform thunk + impl
+    0, 0, 0, 0,                   // build 105 anchor getters NOT derived here
 };
 
-const Build* kKnown[] = {&kSteam, &kStore, &kUpdate2026};
+// The 2026-08-13 "Last Rites" update (Ubisoft also stripped EasyAntiCheat in
+// it; Denuvo and all 32 anti-tamper trigger blobs are untouched, so nothing
+// about hazard handling changes).
+//
+// HOW THESE WERE DERIVED, 2026-08-14. tools/store_port.py fingerprints each
+// function in a SOURCE binary (wildcarding rel32 targets, rip-relative disps
+// and image-range immediates), then re-finds it in the target. Every row below
+// reproduced its source RVA as a positive control before its target hit was
+// accepted, so a bad seed shows up as a control failure and never as a silent
+// wrong address (project RE rule 2).
+//
+// Two passes were needed. Pass 1 seeded from the 2023 Steam pin and carried 16
+// bodies. The nine misses were all bodies RECOMPILED since 2023, which no
+// fingerprint taken from 2023 bytes can match at any length; pass 2 reseeded
+// those from kUpdate2026 (nine days older, same recompile) and carried five
+// more. tools/scratch_lastrites_port.py holds pass 2.
+//
+// Four values were derived independently from BOTH source binaries and agreed:
+// noblur_match, getpitch_slot and the two Ansel slots. That is a check on the
+// method itself, not just on those rows.
+//
+// TWO ROWS ARE 0 AND THEIR CONSUMERS MUST INSTALL NOTHING (rule 7):
+//   cam[6] on_calc_mvp, spawn_thunk/impl
+//
+// CORRECTED 2026-08-16, twice over. This block said FOUR rows, and it said
+// the bodies were 'recompiled past a 40-insn fingerprint'. Both are wrong.
+//
+// It is TWO rows. head_table was derived (see the retraction below) and the
+// count was never updated, so the comment overstated the damage by half.
+//
+// And neither body was recompiled. The spawn was re-derived on 2026-08-16
+// as 0x029CF7E0 with 285 of 285 instructions IDENTICAL to two control
+// binaries: only the ENCODINGS changed (49 89 CF against 4C 8B F9 for the
+// same mov), first divergence at byte +0x0A, 80% byte identity. Every
+// fingerprint length store_port tries (12, 18, 26, 40) straddles that
+// divergence. The method was wrong, not the binary.
+//
+// Both rows stay 0 for the same REAL reason, which is not recompilation:
+// this linker put the function BODIES in the low stub region, so there is
+// no E9 thunk to hook. Every E9 in the 411 MB image was resolved and none
+// lands on either. Arming them needs a body-entry detour
+// (docs/scratch/PATCH-body-hook.md), designed and not built.
+//   head_table                             RETRACTED 2026-08-15. DERIVED, see
+//                                          the correction directly below.
+//
+// RETRACTION, 2026-08-15. This block previously read "head_table NOT STATICALLY
+// DERIVABLE: the vtable holds no absolute VAs on disk because Denuvo resolves
+// them at runtime". THAT IS FALSE, and it cost a week of head hide.
+//
+// `[VERIFIED]` by direct read of the file on disk: the table is fully populated
+// with absolute VAs, in all four archived binaries. On this build,
+// `head_table + 0x1F0` reads `0x00000001429EBA70`, which is ImageBase plus RVA
+// `0x029EBA70`, and the bytes there are `E9 3B C0 42 12`, a jump resolving to
+// RVA `0x14E17AB0`. That is exactly the class slot function `kHeadSlotFnSig`
+// finds, and it agrees with the live process: the 2026-08-15 log reports the
+// signature at `0x00007FF7FAB77AB0` against module base `0x00007FF7E5D60000`,
+// which is the same `0x14E17AB0`.
+//
+// What actually happened: `store_port.py`'s rule was "slot +0x1F0 holds the
+// SETTER thunk VA", and +0x1F0 does not hold the SetHidden setter. It holds the
+// class's own slot-0x0F member thunk, a different function. The rule searched
+// for the wrong constant, returned zero, failed its own positive control, and
+// the zero was explained away as Denuvo. The lesson is the one already written
+// higher up this file and then not applied: a method that cannot find the
+// answer in the binary where the answer IS known is not evidence about the
+// binary where it is not.
+//
+// How the answer was found: 35 tables in the image share this class family's
+// whole 17-entry {crc32(name), index} sequence, so the hash sequence alone does
+// not discriminate. Exactly ONE of the 35 holds the slot-function thunk at
+// +0x1F0, and that qword occurs exactly once in the whole 411 MB file.
+// Corroborated by the same table's idx-0x0D slot, which calls the already
+// derived SetHidden thunk at body offsets byte-identical to the verified 2017
+// original. The three older binaries all reproduced their known head_table.
+//
+// A wrong value still cannot arm anything: the existing +0x1F0 verify in
+// CameraProbe.cpp checks this exact relationship before the hook is installed.
+constexpr Build kLastRites2026 = {
+    "2026-08-lastrites", 0x6A75F2F4, 0x18B09000,
+    {{0x01375620, 0x0D7BB4A0},    // proj[0] anchor
+     {0x01375800, 0x0D7BB7C0},    // proj[1]
+     {0x013758D0, 0x0D7BB920},    // proj[2] gameplay
+     {0x01375BE0, 0x0D7BBCA0},    // proj[3] skew path
+     {0x01373AC0, 0x0D7B92A0},    // proj[4]
+     {0x01373BA0, 0x0D7B9430},    // proj[5]
+     {0,          0},             // on_calc_mvp NOT DERIVED (recompiled)
+     {0x013781B0, 0x0D7C0610},    // selector
+     {0x01897DF0, 0x0F8160E0},    // SkeletonPostUpdate
+     {0x018F1070, 0x0F947870},    // HIK datablock reader
+     {0x02751DA0, 0x1403F0B0}},   // cPlayerComponent::OnInit callee
+    0x003EA960, 0x00447580,       // setyaw, setpitch stubs
+    // Getter stubs are a DIFFERENT SHAPE from the setters and this cost a
+    // wrong answer once: setters are `mov rax,[rcx]; jmp [rax+disp]`, getters
+    // are `mov rax,[rcx]; mov rdx,[rax+disp]; jmp rdx`, the 13-byte form. A
+    // scan using the setter shape at the getter offsets returned confident
+    // single hits on entirely different functions; only the positive control
+    // caught it.
+    0x003EACB0, 0x00446B30,       // getyaw (+0x5B0), getpitch (+0x5F0) stubs
+    0x14E5BDBB, 0x14E5BDFC,       // per-shot aim read sites
+    0x029FAF60, 0x14E5BBC0,       // weapon per-frame update thunk + impl
+    0x030F9D30, 0x169B7630,       // hknpWorld::castRay thunk + impl
+    0x029EF0F0, 0x14E276C0,       // GetAimOrientation thunk + impl
+    0, 0,                         // projectile spawn NOT DERIVED (recompiled)
+    // head_table DERIVED 2026-08-15, and the note that said it could not be
+    // was WRONG. See below.
+    0x04AF4550, 0x02A25600, 0x14ED3990,   // head_table, setter thunk + impl
+    0x14E7625C,                   // no-blur match (agreed from both sources)
+    0x030F5AF0, 0x169AF020,       // weapon setterA thunk + impl
+    0x1880F098, 0x1880F0A0,       // ansel IAT slots (agreed from both sources)
+    0x03112DE0, 0x16B16990,       // TtCastRay thunk + impl
+    // XInputGetState shadow-IAT slot. Not findable by content: it is a data
+    // slot Denuvo fills at runtime. Chained instead through the one code
+    // reference to it (a `jmp [rip+disp]` import thunk), via a ported caller
+    // whose three call sites landed at byte-identical relative offsets
+    // (+0x7A, +0xED) onto the same descending 8-byte slot triple, with the
+    // XInput slot first in both builds.
+    0x0389D130,
+    // Same recompiled-body AOB as kUpdate2026: re-verified against this
+    // binary, one hit, landing exactly on head_setter_impl.
+    "48 83 EC 08 44 0F B6 DA 49 89 CA 38 51 68 74 ? 0F B7 41 4A 85 C0 74 ?",
+    0x0189CE30, 0x0F821260,       // Skeleton::PublishAttachments thunk + impl
+    0x017DEA30, 0x0F47BDC0,       // TransformNode::SetWorldTransform thunk + impl
+    // BUILD 105: the anchor world getters. Derived 2026-08-16 by constraining
+    // on BoneHandle::operator= (0x0186EEE0, 159 sites) filtered by destination
+    // displacement, NOT by scanning for stores to an offset, which answers the
+    // wrong question. Three sites write +0xD0 image-wide.
+    0x02993820, 0x14B366C0,       // aiming-point anchor world getter
+    0x02995340, 0x14B3DEB0,       // muzzle-shoot anchor world getter
+};
+
+// The 2026-08-19 update (Steam buildid 24821571). Offline scan, archived as
+// tools/scratch_update_port_20260819.py output, proved the patch re-stamped
+// and re-wrapped the exe without moving anything this mod uses: the section
+// tables are identical, all 51 pinned sites (every nonzero RVA above,
+// including the head_table data, both Ansel IAT slots and the XInput shadow
+// slot) are byte-identical at the same RVAs, and the head-setter AOB still
+// hits exactly once, landing on head_setter_impl. The flat FP workstream ran
+// the same comparison on its own address set against the same exe pair and
+// got the same answer (its ledger entry F-072). The row is therefore a copy
+// of kLastRites2026 with only the identity changed, and every install still
+// verifies bytes at runtime before writing (rule 7), so a wrong assumption
+// here refuses to arm rather than patching the wrong bytes.
+constexpr Build make_update20260819() {
+    Build b = kLastRites2026;
+    b.name = "2026-08-19-update";
+    b.pe_timestamp = 0x6A7C5143;
+    // SizeOfImage unchanged from Last Rites: 0x18B09000.
+    return b;
+}
+constexpr Build kUpdate20260819 = make_update20260819();
+
+const Build* kKnown[] = {&kSteam, &kStore, &kUpdate2026, &kLastRites2026,
+                         &kUpdate20260819};
 
 // Read once from the loaded module's own headers. No file I/O: the values
 // come from the same mapped image every RVA is applied to.
@@ -164,14 +319,19 @@ void log_identity() {
     }
     LOG_ERROR("build pin: UNKNOWN GRW.exe binary (TimeDateStamp %08X, "
               "SizeOfImage %08X, header read %s). Known: Steam %08X/%08X, "
-              "Ubisoft-Epic %08X/%08X, 2026-08-update %08X/%08X. Nothing "
+              "Ubisoft-Epic %08X/%08X, 2026-08-update %08X/%08X, "
+              "2026-08-lastrites %08X/%08X, 2026-08-19-update %08X/%08X. "
+              "Nothing "
               "that depends on analysed addresses will install; the game "
               "runs unmodified. This usually means a game update or a store "
               "build we have not analysed yet: please report this log.",
               ts, soi, have ? "ok" : "FAILED",
               kSteam.pe_timestamp, kSteam.pe_size_of_image,
               kStore.pe_timestamp, kStore.pe_size_of_image,
-              kUpdate2026.pe_timestamp, kUpdate2026.pe_size_of_image);
+              kUpdate2026.pe_timestamp, kUpdate2026.pe_size_of_image,
+              kLastRites2026.pe_timestamp, kLastRites2026.pe_size_of_image,
+              kUpdate20260819.pe_timestamp,
+              kUpdate20260819.pe_size_of_image);
 }
 
 }  // namespace gamebuild

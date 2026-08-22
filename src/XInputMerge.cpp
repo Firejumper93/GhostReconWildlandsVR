@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "XInputMerge.h"
+#include "Menu.h"
 #include "AimTrace.h"
 #include "GameBuild.h"
 #include "HeadPose.h"
@@ -107,6 +108,12 @@ DWORD WINAPI hook_GetState(DWORD idx, State* st) {
             if (!g_stick_pitch.load(std::memory_order_relaxed))
                 st->Gamepad.sThumbRY = 0;     // minus stick pitch (build 49)
             aimtrace::set_firing(st->Gamepad.bRightTrigger > kFireGate);
+    // BUILD 122: hand the merged stick and buttons to the settings panel, so
+    // the tester can drive it from the Touch thumbsticks. Three relaxed
+    // stores; the panel ignores them unless it is open.
+    menu::set_nav((float)st->Gamepad.sThumbLX / 32767.0f,
+                  (float)st->Gamepad.sThumbLY / 32767.0f,
+                  st->Gamepad.wButtons);
             return r;
         }
         memset(st, 0, sizeof(*st));
@@ -147,6 +154,12 @@ DWORD WINAPI hook_GetState(DWORD idx, State* st) {
     // Build 50: publish the shot window to the aim-reader census, from the
     // merged value the GAME sees, so Touch and a physical pad both mark it.
     aimtrace::set_firing(st->Gamepad.bRightTrigger > kFireGate);
+    // BUILD 122: hand the merged stick and buttons to the settings panel, so
+    // the tester can drive it from the Touch thumbsticks. Three relaxed
+    // stores; the panel ignores them unless it is open.
+    menu::set_nav((float)st->Gamepad.sThumbLX / 32767.0f,
+                  (float)st->Gamepad.sThumbLY / 32767.0f,
+                  st->Gamepad.wButtons);
     // Monotonic packet number. The pad object keeps its own previous/current
     // flag arrays per poll, so "changed every poll" costs nothing.
     st->dwPacketNumber = g_pkt.fetch_add(1, std::memory_order_relaxed) + 1;

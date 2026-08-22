@@ -7,6 +7,7 @@
 
 #include "WeaponDraw.h"
 #include "Log.h"
+#include "Menu.h"
 
 namespace grwxr {
 namespace weapondraw {
@@ -174,14 +175,13 @@ void poll() {
     // chance to lose the whole run. Now the recorder times itself and finds the
     // weapon swap in the data.
     //
-    // Bit 0x8000 alone would miss a tap between two 1 Hz polls, so bit 0x0001
-    // (pressed since the previous call for this key) is the real edge. Nothing
-    // else in the tree polls VK_NUMPAD7.
-    static bool was_down = false;
-    const SHORT st   = GetAsyncKeyState(VK_NUMPAD7);
-    const bool  down = (st & 0x8000) != 0;
-    const bool  edge = ((st & 0x0001) != 0) || (down && !was_down);
-    was_down = down;
+    // BUILD 129: the key was VK_NUMPAD7, and Numpad 7 is a preset slot now.
+    // The trigger moved to the panel's "Weapon draw census" row, which is the
+    // wiring Menu.h line 133 specified and which NOTHING IN THE TREE HAD EVER
+    // DONE: menu::fire_pending() had no callers at all, so every Captures row
+    // set a flag that no code read. Found while reclaiming this key, which is
+    // the only reason it was not silently deleted with it.
+    const bool edge = menu::fire_pending(menu::kProbeWeaponDraw);
 
     if (!g_recording.load(std::memory_order_relaxed)) {
         if (!edge) return;

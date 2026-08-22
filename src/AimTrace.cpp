@@ -12,6 +12,8 @@
 #include "GameBuild.h"
 #include "Log.h"
 #include "ThunkHook.h"
+#include "CameraProbe.h"   // build 106: base_pos, the world-space control
+#include "Voice.h"         // build 107: spoken test instructions
 
 // --- shared with ProbeStub.asm ---------------------------------------------
 //
@@ -69,6 +71,14 @@ uint64_t grwxr_aimq_orig = 0;
 void grwxr_aimq_entry();
 void grwxr_aimq_post(float* q, uint64_t ret_addr);
 
+// BUILD 105: the anchor world getters (see ProbeStub.asm).
+uint64_t grwxr_aimpt_orig = 0;
+void grwxr_aimpt_entry();
+void grwxr_aimpt_post(float* out, uint64_t iface);
+uint64_t grwxr_muzpt_orig = 0;
+void grwxr_muzpt_entry();
+void grwxr_muzpt_post(const float* out, uint64_t iface);
+
 // Build 56: the ballistic projectile spawn (see ProbeStub.asm).
 uint64_t grwxr_spawn_orig = 0;
 void grwxr_spawn_entry();
@@ -112,6 +122,92 @@ struct Row {
 volatile Row      g_rows[kMaxRows] = {};
 volatile int      g_row_count = 0;
 volatile uint32_t g_firing    = 0;     // set by set_firing from the merge
+
+// ---------------------------------------------------------------------
+// BUILD 105: THE AIMING-POINT A/B.
+//
+// GR_cWeaponComponent's three anchors are BoneHandles, so they cannot be
+// moved. What CAN be substituted is the WORLD POINT each resolves to, which
+// is what the two hooked getters return.
+//
+// The question this exists to answer, and it needs no instrumentation in the
+// headset: fire ten single shots at a wall and see whether you get ONE group
+// of holes or TWO. We alternate the returned aim point 5 m left, then 5 m
+// right, on successive trigger pulls. A constant misalignment cannot
+// alternate, so two groups prove causation and one group is a clean
+// negative. This is the build 51 trick, chosen because the tester has no
+// usable crosshair and therefore no reference for "is it offset".
+//
+// Deliberately NOT touched: no camera read, no aim setter, no aim_pump, no
+// g_aim_cum. The camera-hijack constraint is respected by construction.
+//
+// OWNER GATE IS MANDATORY. The class is shared with AI, which is exactly why
+// m_bPlayerOrReplica exists at +0xEA. Without the gate every NPC in the
+// province inherits our aim.
+volatile uint32_t g_ap_seen     = 0;   // aim getter calls observed
+volatile uint32_t g_ap_player   = 0;   //   of those, owner gate passed
+volatile uint32_t g_ap_ai       = 0;   //   of those, refused as not-player
+volatile uint32_t g_ap_written  = 0;   // returns actually rewritten
+volatile uint32_t g_ap_shots    = 0;   // trigger pulls seen by the A/B
+volatile uint32_t g_ap_side     = 0;   // 0 = left next, 1 = right next
+volatile uint32_t g_ap_armed    = 0;   // cfg aimpoint_ab
+volatile uint32_t g_ap_prev_fire= 0;
+float    g_ap_shift_m  = 5.0f;         // cfg aimpoint_ab_m
+float    g_ap_last[3]  = {0,0,0};      // last aim point the engine produced
+float    g_ap_muzzle[3]= {0,0,0};      // last muzzle point, from the twin
+volatile uint32_t g_ap_have_muz = 0;
+// BUILD 106.1: the census is PER WEAPON, not one global snapshot. Three
+// reasons, all of which would have made the last run thin:
+//
+//  1. The tester had TWO weapons out. Capturing "the first component we see"
+//     captures an arbitrary one of them, and there is no way afterwards to
+//     tell which.
+//  2. The muzzle getter had not run yet when the single snapshot was taken,
+//     so the muzzle column was zeros and the aim-versus-muzzle comparison,
+//     which is the entire point of having both hooks, was empty.
+//  3. Pairing aim and muzzle by nothing but "most recent" compares two
+//     different weapons the moment more than one exists.
+//
+// So: a small table keyed on the interface pointer, each entry holding that
+// weapon's own raw bytes, its own aim point and its own muzzle point, printed
+// once it has both. Four slots is plenty for two carried weapons plus a
+// sidearm, and the table reports if it fills, per the measurement rule that a
+// probe must state its own capacity limit.
+struct ApSlot {
+    uint64_t iface;
+    uint8_t  raw[48];      // weapon+0xB0 .. +0xDF
+    float    aim[4];
+    float    muz[4];
+    uint32_t have_aim;
+    uint32_t have_muz;
+    uint32_t player;
+    uint32_t printed;
+};
+constexpr int kApSlots = 4;
+ApSlot   g_ap_slot[kApSlots] = {};
+volatile uint32_t g_ap_slots_used = 0;
+volatile uint32_t g_ap_slots_full = 0;   // a weapon we had no room for
+// Build 107: the guided protocol. 0 idle, 1 arm requested, 2 running.
+volatile uint32_t g_guide_state = 0;
+uint32_t g_guide_ticks = 0;
+uint32_t g_guide_done  = 0;
+
+// Find or create the slot for one weapon. Called from both post handlers, on
+// engine threads, so it allocates nothing and takes no lock: the table is
+// append-only and a torn read costs at worst one duplicated log line.
+ApSlot* ap_slot_for(uint64_t iface) {
+    const uint32_t used = g_ap_slots_used;
+    for (uint32_t i = 0; i < used && i < (uint32_t)kApSlots; ++i)
+        if (g_ap_slot[i].iface == iface) return &g_ap_slot[i];
+    if (used >= (uint32_t)kApSlots) { g_ap_slots_full = g_ap_slots_full + 1;
+                                      return nullptr; }
+    ApSlot* s = &g_ap_slot[used];
+    s->iface = iface;
+    g_ap_slots_used = used + 1;
+    return s;
+}
+// ---------------------------------------------------------------------
+
 volatile uint64_t g_calls[2]  = {0, 0};   // every call through each stub
 volatile uint64_t g_other     = 0;     // ...on some other object (not ours)
 volatile uint64_t g_nolatch   = 0;     // ...before the player object was known
@@ -167,6 +263,8 @@ volatile uint32_t g_wf_f1     = 0;   // last float argument, bits
 hook::ThunkHook g_ray_hook;
 // Build 58: the direct-entry thunk to the same raycast machinery.
 hook::ThunkHook g_ray2_hook;
+hook::ThunkHook g_aimpt_hook;
+hook::ThunkHook g_muzpt_hook;
 constexpr int kMaxRay = 12;
 struct RayRow {
     uint32_t rva;
@@ -275,6 +373,13 @@ volatile uint32_t g_cr_ok     = 0;
 // published from the same pass so origin and direction can never disagree.
 volatile float    g_cr_pos[3] = {0, 0, 0};
 volatile uint32_t g_cr_pos_ok = 0;
+// 2026-08-13: the LEFT controller's position, for the two-handed weapon, and
+// the RIGHT controller's up vector, which carries the roll the aim ray throws
+// away (a direction vector has no twist about itself).
+volatile float    g_cl_pos[3] = {0, 0, 0};
+volatile uint32_t g_cl_pos_ok = 0;
+volatile float    g_cr_up[3]  = {0, 0, 0};
+volatile uint32_t g_cr_up_ok  = 0;
 volatile uint32_t g_cr_armed  = 0;           // cfg bullet_ctrl
 volatile uint32_t g_fly_on    = 0;           // this flight is being relocated
 volatile float    g_fly_org[3]   = {};       // ray origin = spawn origin
@@ -571,6 +676,127 @@ extern "C" void grwxr_ray_record(uint64_t ret_addr, const float* ray) {
 // which is the same order the engine composes in (base * yaw * pitch * roll),
 // so an extra term on the right reads as "more yaw" in its own convention.
 // Rule 8: a quaternion product and four stores, nothing else.
+// ---------------------------------------------------------------------------
+// BUILD 105: the muzzle-anchor world getter. OBSERVER ONLY, it never modifies
+// the result. It exists so the drain line can print how far the aiming point
+// sits from the muzzle, which is one of the four questions section 7b of
+// docs/scratch/HUNT-aiming-point.md asks and which needs no headset.
+// ---------------------------------------------------------------------------
+extern "C" void grwxr_muzpt_post(const float* out, uint64_t iface) {
+    using namespace grwxr::aimtrace;
+    if (!out || !iface) return;
+    __try {
+        // The A/B's lateral axis still wants the most recent muzzle point, so
+        // keep that; but the CENSUS pairs muzzle to aim per weapon, because
+        // with two weapons out "most recent" compares two different guns.
+        g_ap_muzzle[0] = out[0];
+        g_ap_muzzle[1] = out[1];
+        g_ap_muzzle[2] = out[2];
+        g_ap_have_muz  = 1;
+        if (ApSlot* sl = ap_slot_for(iface)) {
+            if (!sl->printed) {
+                sl->muz[0] = out[0]; sl->muz[1] = out[1];
+                sl->muz[2] = out[2]; sl->muz[3] = out[3];
+                sl->have_muz = 1;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BUILD 105: the aiming-point world getter. This is the A/B.
+//
+// Contract, fully known and verified in all four binaries:
+//   float4* f(float4* out /*rcx*/, IBallisticGenerator* iface /*rdx*/)
+//   weapon = iface - 0x80
+//
+// Rule 8: no logging, no allocation, no lock, no COM. Everything here is a
+// handful of guarded reads and some arithmetic; the census is captured into
+// plain globals and PRINTED by the drain thread, never from this function.
+// ---------------------------------------------------------------------------
+extern "C" void grwxr_aimpt_post(float* out, uint64_t iface) {
+    using namespace grwxr::aimtrace;
+    if (!out || !iface) return;
+    g_ap_seen = g_ap_seen + 1;
+
+    const uint64_t weapon = iface - 0x80;
+
+    __try {
+        // The owner gate, and it is not optional. m_bPlayerOrReplica exists
+        // at +0xEA precisely because this class is shared with AI.
+        const uint8_t is_player = *(const uint8_t*)(weapon + 0xEA);
+
+        // The 7b census: captured ONCE, from the first weapon we see, so it
+        // costs one branch per call afterwards. Handle layout: the bone-name
+        // CRC32 sits at handle+0x00 and the resolved index at handle+0x08.
+        // BUILD 106: RAW, because build 105 asserted a BoneHandle layout and
+        // got three impossible answers out of it: two different handles
+        // reporting the SAME name hash, an index of -1867857200, and an "aim
+        // world" of (0.00 0.35 0.04) in a game whose world coordinates run in
+        // the thousands. Dump the bytes and read the layout off them.
+        //
+        // Refreshed until the slot has been PRINTED, not captured once, so a
+        // snapshot taken before the muzzle getter first ran does not freeze an
+        // empty comparison in place. That is what happened on the 00:45 run.
+        if (ApSlot* sl = ap_slot_for(iface)) {
+            if (!sl->printed) {
+                for (int i = 0; i < 48; ++i)
+                    sl->raw[i] = *(const uint8_t*)(weapon + 0xB0 + i);
+                sl->aim[0] = out[0]; sl->aim[1] = out[1];
+                sl->aim[2] = out[2]; sl->aim[3] = out[3];
+                sl->player = is_player ? 1u : 0u;
+                sl->have_aim = 1;
+            }
+        }
+
+        g_ap_last[0] = out[0];
+        g_ap_last[1] = out[1];
+        g_ap_last[2] = out[2];
+
+        if (!is_player) { g_ap_ai = g_ap_ai + 1; return; }
+        g_ap_player = g_ap_player + 1;
+
+        if (!g_ap_armed) return;
+
+        // One alternation per TRIGGER PULL, not per call: this getter runs
+        // more than once a shot and flipping per call would average the two
+        // sides back into one group and manufacture a false negative.
+        const uint32_t firing = g_firing;
+        if (firing && !g_ap_prev_fire) {
+            g_ap_side  = g_ap_side ^ 1u;
+            g_ap_shots = g_ap_shots + 1;
+        }
+        g_ap_prev_fire = firing;
+        if (!firing) return;
+
+        // Lateral shift about the world up axis, taken perpendicular to the
+        // muzzle-to-aim-point line so it is a genuine left/right of the shot
+        // rather than of the world. Falls back to world X if that line is
+        // degenerate, which only happens before the muzzle getter has run.
+        float ax = out[0] - g_ap_muzzle[0];
+        float ay = out[1] - g_ap_muzzle[1];
+        float lx, ly;
+        const float alen = sqrtf(ax*ax + ay*ay);
+        if (g_ap_have_muz && alen > 0.05f) {
+            ax /= alen; ay /= alen;
+            lx = -ay; ly = ax;              // z-up: perpendicular in plan
+        } else {
+            lx = 1.0f; ly = 0.0f;
+        }
+
+        const float k = g_ap_side ? g_ap_shift_m : -g_ap_shift_m;
+        const float nx = out[0] + lx * k;
+        const float ny = out[1] + ly * k;
+        if (nx == nx && ny == ny) {         // NaN guard, cheap
+            out[0] = nx;
+            out[1] = ny;
+            g_ap_written = g_ap_written + 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
 extern "C" void grwxr_aimq_post(float* q, uint64_t ret_addr) {
     using namespace grwxr::aimtrace;
     g_aq_calls = g_aq_calls + 1;
@@ -712,7 +938,213 @@ bool probes_requested() {
     return on;
 }
 
+// ---------------------------------------------------------------------------
+// BUILD 105: THE ANCHOR GETTERS INSTALL ON THEIR OWN, and this placement is
+// deliberate rather than tidy.
+//
+// install() above returns early when cfg aim_probes is 0, which is now the
+// shipping AND the local value, because those probes cost 4,561 hook entries
+// a second and were measured on 2026-08-15. Putting these two hooks inside it
+// would have made them silently never install, and the headset result would
+// have read as a clean negative.
+//
+// That is the build 64 -> 64.1 lesson (a probe appended below an early return
+// dies the moment the return fires) and the build 52 lesson (prove the
+// instrument before believing a negative), and it has now cost this project a
+// session twice. Hence: separate entry point, no shared gate.
+// ---------------------------------------------------------------------------
+bool install_aimpoint() {
+    const gamebuild::Build* gb = gamebuild::get();
+    if (!gb) {
+        LOG_WARN("aimpoint: no build pin, so no verified getter RVAs. The "
+                 "aim-point probe is OFF for this run (rule 7).");
+        return false;
+    }
+    uint8_t* base = (uint8_t*)GetModuleHandleW(nullptr);
+    if (!base) return false;
+    g_base = base;
+
+    // BUILD 105: the anchor world getters. Installed unconditionally, because
+    // the log-only half (section 7b of docs/scratch/HUNT-aiming-point.md)
+    // answers four standing unknowns and costs a few guarded reads. The WRITE
+    // half stays inert until cfg aimpoint_ab arms it.
+    if (gb->aimpt_thunk && gb->aimpt_impl) {
+        grwxr_aimpt_orig = (uint64_t)(base + gb->aimpt_impl);
+        g_aimpt_hook.install(base + gb->aimpt_thunk, base + gb->aimpt_impl,
+                             (void*)&grwxr_aimpt_entry, "aim-point anchor");
+    } else {
+        LOG_WARN("aimtrace: the aiming-point world getter is not derived for "
+                 "this binary; the aim-point A/B is OFF (rule 7).");
+    }
+    if (gb->muzzlept_thunk && gb->muzzlept_impl) {
+        grwxr_muzpt_orig = (uint64_t)(base + gb->muzzlept_impl);
+        g_muzpt_hook.install(base + gb->muzzlept_thunk, base + gb->muzzlept_impl,
+                             (void*)&grwxr_muzpt_entry, "muzzle anchor");
+    }
+    return g_aimpt_hook.installed();
+}
+
+// Its own drain, for exactly the same reason. aimtrace::drain() is gated on
+// cfg aim_trace AND on the getyaw/getpitch hooks being installed, and neither
+// is true in the configuration this experiment runs in.
+void drain_aimpoint() {
+    if (!g_aimpt_hook.installed()) return;
+
+    // The 7b census, once, as soon as a weapon has been seen. idx == -1 means
+    // the bone never resolved, the getter is returning the zero vector, and
+    // nothing can aim at the world origin: that alone would explain
+    // camera-following bullets and it makes the A/B below meaningless.
+    // BUILD 106.1: print each weapon once, as soon as it has BOTH its aim
+    // point and its muzzle point, so the two columns always describe the same
+    // gun. A slot that has an aim point but no muzzle after several seconds is
+    // printed anyway, with the gap named, rather than being held back
+    // silently: an instrument that waits forever for a value that never comes
+    // reads exactly like an instrument that is not installed.
+    static int ap_ticks = 0;
+    ++ap_ticks;
+
+    // BUILD 107.1: announce the key ONCE, and only once the player is really
+    // in the world. Saying it during the loading screen means saying it to
+    // nobody, and the whole point of this module is that the tester should not
+    // have to remember anything.
+    {
+        static uint32_t said_ready = 0;
+        float probe[3];
+        if (!said_ready && !g_guide_state && camera::base_pos(probe)) {
+            said_ready = 1;
+            voice::say_key("End", "to start the anchor test.");
+        }
+    }
+
+    // BUILD 107: THE GUIDED PROTOCOL.
+    //
+    // Driven by what has actually been CAPTURED, never by a stopwatch. The
+    // tester is told to move on the moment a weapon's data is in, and told to
+    // wait when it is not, which removes the whole class of failure where a
+    // run is spent because a step happened before the thing it measured did.
+    // Every spoken line is also written to the log, so the run can be
+    // reconstructed afterwards without him remembering any of it.
+    if (g_guide_state == 1) {              // just armed
+        g_guide_state = 2;
+        g_guide_ticks = 0;
+        g_guide_done  = 0;
+        voice::say_wait("Anchor test started. Draw your first weapon and "
+                        "hold still.", 1500);
+    } else if (g_guide_state >= 2) {
+        ++g_guide_ticks;
+        uint32_t printed = 0;
+        for (uint32_t k = 0; k < g_ap_slots_used && k < (uint32_t)kApSlots; ++k)
+            if (g_ap_slot[k].printed) ++printed;
+
+        if (printed > g_guide_done) {
+            g_guide_done = printed;
+            g_guide_ticks = 0;
+            if (printed == 1) {
+                voice::say_wait("First weapon captured. Now switch to your "
+                                "second weapon and hold still.", 1500);
+            } else {
+                voice::say("Second weapon captured. That is everything. Quit "
+                           "the game and I will read the results.");
+                g_guide_state = 0;         // done, stop nagging
+            }
+        } else if (g_guide_ticks == 20) {
+            // Twenty seconds with nothing new. Say so rather than leaving him
+            // standing in silence wondering whether the build is working.
+            voice::say(g_ap_slots_used == 0
+                           ? "Nothing captured yet. Make sure a weapon is "
+                             "drawn and you are on foot."
+                           : "Still waiting. Keep the weapon drawn and hold "
+                             "still.");
+            g_guide_ticks = 0;
+        }
+    }
+    const uint32_t used = g_ap_slots_used;
+    for (uint32_t k = 0; k < used && k < (uint32_t)kApSlots; ++k) {
+        ApSlot* sl = &g_ap_slot[k];
+        if (sl->printed || !sl->have_aim) continue;
+        if (!sl->have_muz && ap_ticks < 6) continue;   // give it ~6 s
+        sl->printed = 1;
+
+        char hex[3 * 48 + 8];
+        for (int i2 = 0; i2 < 48; ++i2) {
+            static const char* kHex = "0123456789ABCDEF";
+            hex[i2 * 3 + 0] = kHex[(sl->raw[i2] >> 4) & 0xF];
+            hex[i2 * 3 + 1] = kHex[sl->raw[i2] & 0xF];
+            hex[i2 * 3 + 2] = ((i2 & 15) == 15) ? '|' : ' ';
+        }
+        hex[48 * 3 - 1] = 0;
+
+        LOG_INFO("aimanchor[%u]: iface=%016llX weapon=%016llX player=%u%s",
+                 k, (unsigned long long)sl->iface,
+                 (unsigned long long)(sl->iface - 0x80), sl->player,
+                 sl->have_muz ? "" : "  (NO MUZZLE POINT: that getter never "
+                                     "ran for this weapon)");
+        LOG_INFO("aimanchor[%u]: weapon+0xB0 raw, 3 x 16 bytes "
+                 "(gunroot|muzzle|aimpoint): %s", k, hex);
+        LOG_INFO("aimanchor[%u]: aim=(%.4f %.4f %.4f %.4f) "
+                 "muzzle=(%.4f %.4f %.4f %.4f)", k,
+                 sl->aim[0], sl->aim[1], sl->aim[2], sl->aim[3],
+                 sl->muz[0], sl->muz[1], sl->muz[2], sl->muz[3]);
+
+        // The control. camera::base_pos is the mod's own VERIFIED world
+        // reading, so the space these getters work in is settled by comparison
+        // rather than by assertion. If the returned point is thousands of
+        // metres from the camera it is not world space, and every reading
+        // built on the assumption that it is would be void.
+        float cam[3] = {0, 0, 0};
+        if (camera::base_pos(cam)) {
+            const float ax = sl->aim[0] - cam[0];
+            const float ay = sl->aim[1] - cam[1];
+            const float az = sl->aim[2] - cam[2];
+            const float mx = sl->muz[0] - cam[0];
+            const float my = sl->muz[1] - cam[1];
+            const float mz = sl->muz[2] - cam[2];
+            LOG_INFO("aimanchor[%u]: camera=(%.2f %.2f %.2f) "
+                     "|aim-cam|=%.2f |muzzle-cam|=%.2f  <<< a few metres means "
+                     "WORLD space, thousands means it is not", k,
+                     cam[0], cam[1], cam[2],
+                     sqrtf(ax*ax + ay*ay + az*az),
+                     sqrtf(mx*mx + my*my + mz*mz));
+        } else {
+            LOG_INFO("aimanchor[%u]: camera position unavailable, so the "
+                     "world-space control could not run this tick.", k);
+        }
+    }
+    if (g_ap_slots_full)
+        LOG_INFO("aimanchor: TABLE FULL, %u weapon(s) not captured (capacity "
+                 "%d). Raise kApSlots if this matters.",
+                 (unsigned)g_ap_slots_full, kApSlots);
+
+    // BUILD 108: count the shots for him. Counting to ten while wearing a
+    // headset, holding a rifle and watching a wall is exactly the kind of
+    // bookkeeping that gets a run thrown away.
+    if (g_ap_armed) {
+        static uint32_t said_shots = 0;
+        const uint32_t sh = g_ap_shots;
+        if (sh >= 10 && said_shots < 10) {
+            said_shots = 10;
+            voice::say("That is ten shots. Stop firing and look at the wall. "
+                       "One group of holes, or two?");
+        } else if (sh == 5 && said_shots < 5) {
+            said_shots = 5;
+            voice::say("Five.");
+        }
+        if (sh == 0) said_shots = 0;       // re-arm resets the count
+    }
+
+    static uint32_t last_seen = 0;
+    if (g_ap_seen == last_seen && !g_ap_armed) return;   // quiet when idle
+    last_seen = g_ap_seen;
+    LOG_INFO("aimpoint: %s shift=%.1fm | seen=%u player=%u ai_refused=%u "
+             "rewritten=%u shots=%u next=%s",
+             g_ap_armed ? "ARMED" : "idle", g_ap_shift_m,
+             (unsigned)g_ap_seen, (unsigned)g_ap_player, (unsigned)g_ap_ai,
+             (unsigned)g_ap_written, (unsigned)g_ap_shots,
+             g_ap_side ? "RIGHT" : "LEFT");
+}
+
 bool install() {
+
     if (!probes_requested()) {
         LOG_INFO("aimtrace: research probes are OFF (aim_probes=0 or absent "
                  "in grwxr.cfg). Nothing is hooked; this is the shipping "
@@ -809,6 +1241,7 @@ bool install() {
     }
 
     // Build 56: the projectile spawn.
+
     if (gb->spawn_thunk && gb->spawn_impl) {
         grwxr_spawn_orig = (uint64_t)(base + gb->spawn_impl);
         g_spawn_hook.install(base + gb->spawn_thunk, base + gb->spawn_impl,
@@ -1101,6 +1534,45 @@ bool view_fwd(float out[3]) {
     return true;
 }
 
+// Build 84: the barrel direction, published by grwxr_wgun_apply after its
+// filter. See AimTrace.h for why this is not the same thing as ctrl_ray.
+//
+// Freshness is a GENERATION COUNTER rather than a timestamp: no clock call on
+// a path entered 144 times a second, and it answers the only question the
+// reader has, which is "did the weapon writer run since I last looked". With
+// wgun = 0 nothing publishes, the counter stands still, and the reader falls
+// back instead of aiming at a barrel direction from minutes ago.
+volatile uint32_t g_bd_gen = 0;
+float             g_bd_dir[3] = {};
+
+void set_barrel_dir(const float dir[3], bool ok) {
+    if (!ok || !dir) return;
+    g_bd_dir[0] = dir[0];
+    g_bd_dir[1] = dir[1];
+    g_bd_dir[2] = dir[2];
+    // Bumped AFTER the vector, so a reader that sees a new generation is
+    // reading the vector that came with it, not the one before.
+    _ReadWriteBarrier();
+    g_bd_gen = g_bd_gen + 1;
+}
+
+bool barrel_dir(float out[3]) {
+    // Starts at 0, which is also the generation before anything has ever been
+    // published. So "wgun has never run" reads as stale and returns false,
+    // rather than handing back the zero vector the array was born with. That
+    // zero would have passed a naive length check nowhere but would have gone
+    // straight into an atan2 as a direction.
+    static uint32_t s_seen = 0;
+    if (!out) return false;
+    const uint32_t g = g_bd_gen;
+    if (g == s_seen) return false;        // wgun has not run since the last read
+    s_seen = g;
+    out[0] = g_bd_dir[0];
+    out[1] = g_bd_dir[1];
+    out[2] = g_bd_dir[2];
+    return true;
+}
+
 void set_ctrl_ray(const float dir[3], bool ok) {
     if (ok && dir) {
         g_cr_dir[0] = dir[0];
@@ -1138,6 +1610,46 @@ bool ctrl_pos(float out[3]) {
     out[0] = g_cr_pos[0];
     out[1] = g_cr_pos[1];
     out[2] = g_cr_pos[2];
+    return true;
+}
+
+// 2026-08-13: the LEFT controller's position and the RIGHT controller's up
+// vector, published from the same pass and the same basis as the two above, so
+// a two-handed weapon can never be assembled out of two different instants.
+// Same contract as the rest of this file: ok=false means "not tracked THIS
+// frame" and the last good value is deliberately NOT held, so a consumer sees
+// a dropout rather than a stale pose it cannot distinguish from a real one.
+void set_ctrl_pos_l(const float p[3], bool ok) {
+    if (ok && p) {
+        g_cl_pos[0] = p[0];
+        g_cl_pos[1] = p[1];
+        g_cl_pos[2] = p[2];
+    }
+    g_cl_pos_ok = ok ? 1u : 0u;
+}
+
+bool ctrl_pos_l(float out[3]) {
+    if (!g_cl_pos_ok || !out) return false;
+    out[0] = g_cl_pos[0];
+    out[1] = g_cl_pos[1];
+    out[2] = g_cl_pos[2];
+    return true;
+}
+
+void set_ctrl_up(const float u[3], bool ok) {
+    if (ok && u) {
+        g_cr_up[0] = u[0];
+        g_cr_up[1] = u[1];
+        g_cr_up[2] = u[2];
+    }
+    g_cr_up_ok = ok ? 1u : 0u;
+}
+
+bool ctrl_up(float out[3]) {
+    if (!g_cr_up_ok || !out) return false;
+    out[0] = g_cr_up[0];
+    out[1] = g_cr_up[1];
+    out[2] = g_cr_up[2];
     return true;
 }
 
@@ -1247,6 +1759,41 @@ bool shot_sites_ready() {
 }
 
 void set_firing(bool held) { g_firing = held ? 1u : 0u; }
+
+// Build 105. Arming RESETS the accounting, so a verdict is never read off
+// counters that accumulated across an earlier configuration.
+void set_aimpoint_ab(bool on, float shift_m) {
+    if (shift_m < 0.5f)  shift_m = 0.5f;
+    if (shift_m > 25.0f) shift_m = 25.0f;
+    g_ap_shift_m = shift_m;
+    const uint32_t want = on ? 1u : 0u;
+    if (g_ap_armed != want) {
+        g_ap_written = 0; g_ap_shots = 0; g_ap_side = 0; g_ap_prev_fire = 0;
+        g_ap_armed = want;
+        voice::say(want ? "Shot test armed. Fire ten single shots at a "
+                          "wall."
+                        : "Shot test disarmed.");
+        LOG_INFO("aimpoint: A/B %s (%.1f m alternating left/right per trigger"
+                 " pull, player-gated). THE QUESTION: fire ten single shots"
+                 " at a wall. ONE group of holes or TWO?",
+                 want ? "ARMED" : "disarmed", g_ap_shift_m);
+    }
+}
+
+bool aimpoint_ab() { return g_ap_armed != 0; }
+
+// Build 107: the End key. Resets the capture table so a second run in one
+// session is not read off the first run's slots, then hands the protocol to
+// the guide in drain_aimpoint.
+void guide_start() {
+    for (int i = 0; i < kApSlots; ++i) g_ap_slot[i] = ApSlot{};
+    g_ap_slots_used = 0;
+    g_ap_slots_full = 0;
+    g_guide_state = 1;
+    LOG_INFO("aimanchor: GUIDED RUN STARTED by hotkey. Capture table "
+             "cleared; the next two weapons drawn will be captured.");
+}
+bool firing()              { return g_firing != 0u; }
 
 void uninstall() {
     g_getyaw_hook.restore();

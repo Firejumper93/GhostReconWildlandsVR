@@ -5,36 +5,104 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
-## Unreleased: the 2026-08-13 title update breaks v0.8.5-alpha
+## v0.9.1-test2 (2026-08-22, TEST RELEASE): the current game version works again
 
-**There is no release for this game version yet, and no ETA.** This entry exists
-so the failure is documented rather than reported as a bug.
+**Builds 106-131.** Not tested as a packaged release. Everything below was run in
+a headset in pieces; the assembled zip was not.
 
-Ubisoft replaced `GRW.exe` again on 2026-08-13. This is a **different, newer**
-executable than the one v0.7.0 added support for, despite both being talked about
-as the August 2026 update:
+**The 2026-08-19 game update is supported** (`TimeDateStamp 6A7C5143`). An offline
+byte comparison proved that update re-stamped and re-wrapped `GRW.exe` without
+moving anything the mod uses: all 51 pinned sites are byte-identical at the same
+addresses, both Ansel import slots and the XInput shadow slot included, and the
+head-setter signature still hits exactly once, landing on the same function. The
+address table is therefore the 2026-08-13 table with only the identity changed, and
+every install still verifies the bytes at runtime before writing.
 
-| | supported by v0.7.0+ | the 2026-08-13 build |
-|---|---|---|
-| TimeDateStamp | `6A692948` (compiled 2026-07-28) | `6A75F2F4` (compiled 2026-08-07) |
-| SizeOfImage | `18502000` | `18B09000` |
+**The 2026-08-13 "Last Rites" table is in this repository's source for the first
+time.** It shipped in the v0.9.0-test1 zip on 2026-08-16, but that tag was never
+merged into `main`, so the front page still showed v0.8.5-era code. Five address
+tables now ship: two 2023 builds, the late-July 2026 update, 2026-08-13, and
+2026-08-19.
 
-**What you will see.** Nothing. The mod verifies the executable's identity before
-touching anything, does not recognise this build, installs nothing, and logs
-`build pin: UNKNOWN GRW.exe binary`. The game runs flat and unmodified. It does
-not crash and it does not damage anything, which is the behaviour this check
-exists to produce. You do not need to uninstall.
+**Head hiding in first person is restored.** Out since v0.7.0 because the engine's
+head-visibility function had been recompiled rather than moved. Re-derived
+2026-08-15 by constraining on a class method table whose slot-function pointer
+occurs exactly once in the 411 MB executable, corroborated against the verified
+2017 original, and reproduced on the three older binaries. It arms on both current
+executables (`hide: armed` in the log).
 
-**Why it is not a quick fix.** The mod locates engine functions at specific
-addresses inside `GRW.exe`. A new executable moves all of them, and every address
-has to be re-derived and re-verified against the new binary rather than guessed.
-That work is underway. Most of the table has been recovered; a few functions were
-recompiled enough that they have to be found again by hand, and at least one of
-them gates several features at once.
+**The first-person head-bone anchor was re-confirmed in the headset** on the
+2026-08-19 build, 2026-08-22: 6400 head-bone reads, zero rejects, the pin never
+moved, 72 fps median. Two of our own bugs had been disarming it: turning first
+person on cleared the resolved player object, and the player resolve trusted
+whichever component initialised last instead of testing for a Head bone.
 
-**Easy Anti-Cheat was removed in this update.** Confirmed from inside the game
-process, not just from the files on disk. This does not change the mod's scope:
-it remains singleplayer only. Denuvo is unchanged.
+**An in-headset settings panel on `F1`,** driven with the controller. The panel
+polls the controller itself rather than waiting for the game to poll XInput, which
+is what finally made it usable: in the confirming run the game polled XInput zero
+times during the window the panel was being driven.
+
+**Whole-config presets on the numpad.** `GRWVR\presets\*.cfg` load one per digit,
+`1`..`9` then `0`, ten per bank, with the panel paging between banks. Each load
+speaks its name and logs a key-by-key diff. Two things to know: **every digit now
+replaces your entire config**, where most of them previously did nothing, and
+**loading is additive**, so a preset must be a whole copy of `grwxr.cfg` or the
+keys it omits keep the previous preset's values. The mod warns and names every
+missing key.
+
+**The eye sign was inverted, and the shipped stereo values change because of it.**
+A controlled A/B in the headset on 2026-08-22, toggling only `ipd_swap` three
+times at `ipd_scale = 1.00`, came out in favour of `ipd_swap = 1`. The shipped
+config now carries `ipd_scale = 1.00` and `ipd_swap = 1`. This is "better, tested
+once", not "correct", which is why the swap is the first row on the panel.
+
+**The `ipd_scale` range was a guess and is now bounded by what actually breaks.**
+It was clamped 0.30..1.50 with a comment asserting no legitimate value existed
+outside it; a working value of 0.05 was in use at the time. The band is 0.00..3.00.
+
+**Four settings-panel buttons never did anything.** First person toggle, Recenter
+view, Weapon draw census and Skinning palette capture set a flag that nothing in
+the tree read, for as long as the page had existed. All four are wired now.
+
+**Known bug, shipped:** the two-handed hold flips 180 degrees on hand jitter, so
+the gun appears to split and reform and reads as reversed. The front-hand test has
+no deadband and no hysteresis; one instrumented 90-second run recorded 5466 flips
+across 61% of two-hand frames. Root cause found, not fixed. Workaround
+`wgun_twohand = 0`.
+
+**Also in this release:** spoken feedback for key presses and guided test runs
+(`voice`), a live tuner on Insert / Page Up / Page Down / Delete, the front-hand
+detection that measures which hand is forward instead of assuming, first person
+moved from Numpad 8 to `F2`, and a startup key banner that is generated from what
+the keys actually do after the previous one spent a build advertising a key that
+had become an empty preset slot.
+
+Built with the Visual Studio `\18\` toolchain, the same one used through v0.7.0.
+Issues #2 and #3 have not been tested against this build.
+
+**Easy Anti-Cheat was removed by the 2026-08-13 update.** Confirmed from inside the
+game process, not just from the files on disk. This does not change the mod's
+scope: it remains singleplayer only. Denuvo is unchanged.
+
+## v0.9.0-test1 (2026-08-16, TECH DEMO, pre-release)
+
+Published as a zip only; the source tag was never merged into `main`.
+
+- **Two-handed weapon handling.** The rear hand sets where the weapon is, the front
+  hand sets where it points, and wrist twist rolls it about its own barrel.
+  Front-hand authority fades in with hand separation, so hands together degrades to
+  a one-handed hold rather than to garbage. The weapon can sit in the fist rather
+  than at the model origin, and the handguard can land in the front hand.
+- **The gun no longer judders when you move.** It was placed relative to the game
+  camera position while the first-person feature was writing that same position
+  several times per frame, so it was placed from a value the mod was itself
+  editing. Standing still, the two answers it landed between were 1.9 metres apart.
+  It now reads a copy taken once per frame, before the mod touches anything.
+- **Live tuning from inside the headset**: Insert cycles the live setting, Page Up
+  and Page Down step it, Delete resets it.
+- Carried the 2026-08-13 "Last Rites" address table, which is why this one worked
+  on that game version when v0.8.5-alpha did not. That was never stated in the
+  release notes at the time.
 
 ## v0.8.5-alpha (2026-08-11, exclusive fullscreen fix)
 

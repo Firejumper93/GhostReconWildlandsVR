@@ -107,7 +107,15 @@ LONG CALLBACK on_exception(PEXCEPTION_POINTERS ep) {
         LOG_ERROR("  module  : %s + 0x%llX  (base 0x%p)",
                   name, (unsigned long long)off, (void*)mod);
         if (mod == g_self) {
-            LOG_ERROR("  >>> THE FAULT IS INSIDE OUR OWN DLL. This is our bug. <<<");
+            // NOT "this is our bug", and NOT "the run crashed". This handler is
+            // VECTORED, so it fires FIRST CHANCE and then declines (below), and
+            // an exception someone upstream catches still prints a full dump
+            // here. Corpus check 2026-08-22: 120 of the 126 logs carrying a dump
+            // kept heartbeating for a median of five more minutes. The old
+            // wording is why logreport.py graded every one of them as a crash.
+            LOG_ERROR("  >>> FAULT ADDRESS IS INSIDE OUR OWN DLL (first chance). <<<");
+            LOG_ERROR("      If heartbeats continue below, it was handled and the");
+            LOG_ERROR("      run is still valid. Worth fixing, not a crash.");
         } else {
             LOG_ERROR("  (fault is not in our module; likely the game, but our");
             LOG_ERROR("   timing or state may still have caused it)");

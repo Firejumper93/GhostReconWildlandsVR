@@ -76,6 +76,13 @@ bool toggle();
 // coordinates from the top-left, plus whether the trigger is down. hit=false
 // means the ray is off the panel, which parks the cursor rather than leaving
 // it stuck on the last widget it touched.
+// BUILD 122: gamepad navigation for the panel, fed from XInputMerge with the
+// MERGED Touch + physical pad state. The panel had NavEnableGamepad set from
+// the day it was written but nothing ever fed it a key, and set_pointer has no
+// callers, so until now it opened and could not be operated at all.
+// lx/ly are -1..1, buttons is the XInput wButtons mask.
+void set_nav(float lx, float ly, unsigned short buttons);
+
 void set_pointer(bool hit, float u, float v, bool pressed);
 
 // Render thread, called from inside Present while the game's pipeline state is
@@ -101,11 +108,16 @@ void poll();
 // read before and after the press.
 // ---------------------------------------------------------------------------
 
+// BUILD 129: these are WIRED now. Until this build fire_pending() had no
+// callers anywhere in the tree, so every row on the Captures page set a flag
+// that nothing read and the buttons did nothing at all. It was found while
+// reclaiming the numpad digits for presets, on the assumption that the panel
+// already covered what the keys did. It did not.
 enum ProbeId {
-    kProbeWeaponDraw = 0,   // WeaponDraw, currently Numpad 7
-    kProbePalette,          // PaletteProbe capture window, currently Numpad Minus
-    kProbeFirstPerson,      // the FP toggle, currently Numpad 8. The lobby crash.
-    kProbeRecenter,         // recenter the VR view
+    kProbeWeaponDraw = 0,   // WeaponDraw. Was Numpad 7, now panel only.
+    kProbePalette,          // PaletteProbe capture window. Numpad Minus, or panel.
+    kProbeFirstPerson,      // the FP toggle. Was Numpad 8, now panel only. Lobby crash.
+    kProbeRecenter,         // recenter the VR view. Also Home, and Space.
     kProbeCount
 };
 

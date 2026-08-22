@@ -41,6 +41,7 @@
 #include "WeaponDraw.h"
 #include "DrawHook.h"
 #include "Log.h"
+#include "Menu.h"
 
 namespace grwxr {
 namespace pal {
@@ -309,8 +310,13 @@ void poll() {
     static bool was_down = false;
     static int  grace = 0;
     static int  stall = 0;
+    // BUILD 129: Numpad Minus keeps working (it is not a preset slot), and the
+    // panel's "Skinning palette capture" row now fires it too. fire_pending()
+    // had no callers in the tree before this build, so that row did nothing.
     const bool down = (GetAsyncKeyState(VK_SUBTRACT) & 0x8000) != 0;
-    if (down && !was_down &&
+    const bool edge = (down && !was_down) ||
+                      menu::fire_pending(menu::kProbePalette);
+    if (edge &&
         g_remaining.load(std::memory_order_relaxed) <= 0 &&
         !g_dump_pending.load(std::memory_order_relaxed)) {
         grace = 0;

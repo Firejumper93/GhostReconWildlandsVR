@@ -2,21 +2,32 @@
 
 **English** | [Deutsch](README.de.md) | [한국어](README.ko.md)
 
-> [!CAUTION]
-> **A NEWER GAME UPDATE (2026-08-13) BREAKS THIS RELEASE.** Ubisoft replaced
-> `GRW.exe` again on 2026-08-13. This is a *different, newer* executable than the
-> one v0.7.0 added support for. On it, **v0.8.5-alpha will not do anything.**
+> [!IMPORTANT]
+> **THE CURRENT GAME VERSION IS SUPPORTED, as of v0.9.1-test2.** If you have been
+> sitting on "the mod does nothing since the update", this is the release for you.
 >
-> This is not a crash and nothing is damaged. The mod checks the executable's
-> identity before touching it, does not recognise this one, installs nothing, and
-> logs `build pin: UNKNOWN GRW.exe binary`. **The game simply runs flat and
-> unmodified.** You do not need to uninstall anything.
+> | Game update | `TimeDateStamp` | First release that supports it |
+> |---|---|---|
+> | late-July 2026 | `6A692948` | v0.7.0-alpha |
+> | 2026-08-13 ("Last Rites") | `6A75F2F4` | v0.9.0-test1 (never announced as such, which is most of the confusion) |
+> | **2026-08-19** | `6A7C5143` | **v0.9.1-test2, this one** |
 >
-> The new executable is `TimeDateStamp 6A75F2F4`, `SizeOfImage 18B09000`,
-> SHA256 `4b222677c5068d40104144af79f0e31fdc4d62d1a48f6ba07bc70b4ee167e56e`.
+> v0.8.5-alpha, which is what this page recommended until now, only ever knew the
+> late-July executable. On anything newer it recognises nothing, installs nothing,
+> and logs `build pin: UNKNOWN GRW.exe binary` while the game runs flat. That is
+> the check working, not a crash.
 >
-> Support for it is in development and **is not in any release yet.** There is no
-> ETA. Do not report "the mod does nothing" on this game version; it is expected.
+> This is also the first source push in a while: the repository's `main` branch was
+> still at v0.8.5-era code, so the newer work was only ever in release zips. It is
+> all here now.
+>
+> **This is a test release, not a polished one.** It carries a lot of new work
+> that has been run in a headset in pieces but never as a packaged release, and
+> it has one known ugly bug in two-handed weapon handling (see
+> [Known limitations](#known-limitations-honest-list)). If you want the calmest
+> thing available and you are still on the old game version, v0.8.5-alpha is
+> that. On the current game version, this is the only release that does
+> anything at all.
 
 > [!WARNING]
 > **SINGLEPLAYER ONLY. Solo campaign, never co-op, never PvP, never matchmaking.**
@@ -35,21 +46,25 @@
 > **THE WEAPON FOLLOWS YOUR CONTROLLER, as of v0.8.0.** Position and rotation,
 > one to one, confirmed in the headset. It is the game's own weapon, not an
 > overlay: point your hand and the gun points there, move your hand and it goes
-> with you.
+> with you. **Two-handed handling** (rear hand holds, front hand points, wrist
+> rolls the gun) arrived in v0.9.0-test1 and is on by default here, with the
+> caveat below.
 >
 > Bullets still follow your gaze in this release, so aiming down sights stays
-> the accurate way to shoot. That is the last piece, it is close, and it is
-> what the next release is about. Everything else is unchanged: sticks,
-> buttons, triggers and grips are still read as an ordinary gamepad, so no
-> physical controller is needed.
+> the accurate way to shoot. That is the last piece. Everything else is
+> unchanged: sticks, buttons, triggers and grips are still read as an ordinary
+> gamepad, so no physical controller is needed.
 >
-> **WORKS WITH THE AUGUST 2026 "LAST RITES" TITLE UPDATE, as of v0.7.0.** The update
-> replaced the game executable; this release carries a full verified address table
-> for it, and full stereo on the updated game is confirmed in the headset. Steam and
-> Ubisoft Connect now ship the IDENTICAL executable, so both stores are covered by
-> the same table. One known casualty until it is re-derived: **head hiding in first
-> person is temporarily NOT working on the updated game** (you will see hair or
-> helmet from inside). Details in "The 2026-08 game update" below.
+> **HEAD HIDING IS BACK on the current game version.** It was disabled from
+> v0.7.0 through v0.8.5 because the engine function that hides the head had been
+> recompiled and this mod never guesses an address. That address was re-derived
+> on 2026-08-15, and the hook arms and reports `hide: armed` on both current
+> executables.
+>
+> **YOU CAN NOW CHANGE SETTINGS WITHOUT TAKING THE HEADSET OFF.** `F1` opens a
+> settings panel you drive with the controller, and the numpad digits load whole
+> saved configs. Read the numpad warning in
+> [In the headset](#in-the-headset) before you press one.
 
 A native OpenXR VR mod for Tom Clancy's Ghost Recon Wildlands (AnvilNext 2.0, DirectX 11).
 Head-tracked stereoscopic 3D rendered by the game's own engine, injected through a
@@ -63,6 +78,10 @@ controllers as an emulated gamepad, controller-pointing hip-fire aim with a reti
 and removal of the first-person close-range body blur on 2026-08-03/04. The port to
 the August 2026 "Last Rites" game update was headset-verified on 2026-08-08, and on
 2026-08-10 the weapon itself began tracking the controller in position and rotation.
+Two-handed weapon handling followed on 2026-08-16, head hiding was restored on
+2026-08-15, the in-headset settings panel became driveable on 2026-08-22, and the
+first-person head-bone anchor was re-confirmed in the headset the same day on the
+2026-08-19 game build (72 fps median, 6400 head-bone reads, zero rejects).
 This is a development snapshot, not a finished mod. Expect rough edges. Performance numbers here come from one test
 system; different hardware, headsets, and settings may perform noticeably worse. The
 mod is being actively optimized and improved, so expect frequent changes.
@@ -77,50 +96,49 @@ delete the old `dxgi.dll` and install this one.
 See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, and the
 [Roadmap](#roadmap) below for what is coming and how close it is.
 
-## The 2026-08 game update ("Last Rites"): honest status
+## The 2026-08 game updates: honest status
 
-Ubisoft shipped a ~31 GB title update in August 2026 that replaced `GRW.exe`. The mod
-locates engine code inside that executable, so a new executable means every address
-must be re-derived and re-verified. That work is what v0.7.0 is. The current state,
-feature by feature:
+Ubisoft shipped three executables in quick succession in August 2026. The mod locates
+engine code at specific addresses inside `GRW.exe`, so a new executable means every
+address must be re-derived and re-verified before anything is written. **This release
+carries verified tables for all of them**, plus the two 2023 builds:
 
-**Verified working on the updated game (in the headset, 2026-08-08):**
+| Table | `TimeDateStamp` | How it was derived |
+|---|---|---|
+| Steam 2023-09-14 | (2017 lineage) | original derivation, headset-confirmed |
+| Epic / Ubisoft Connect 2023-09-08 | (2017 lineage) | machine-verified offline, never headset-confirmed by a store user |
+| late-July 2026 update | `6A692948` | full re-derivation, headset-confirmed 2026-08-08 (this is what v0.7.0 was) |
+| 2026-08-13 "Last Rites" | `6A75F2F4` | full re-derivation, shipped in the v0.9.0-test1 zip, **new to this repository's source** |
+| 2026-08-19 update | `6A7C5143` | **new in this release.** An offline byte comparison proved the patch re-stamped and re-wrapped the executable without moving anything the mod uses: all 51 pinned sites are byte-identical at the same addresses, and the head-setter signature still hits exactly once, on the same function |
 
-- Build identification: the mod recognizes the new executable and logs it as the
-  "2026-08-update binary". Steam and Ubisoft Connect now ship the byte-identical
-  executable, so one table covers both stores.
-- Full stereoscopic rendering, head tracking, the fullscreen view, and 4K internal
-  rendering: all camera and projection hooks re-derived and confirmed live.
-- Head aim, the Touch emulated gamepad, and the no-blur patch: re-derived and
-  installed (their hooks report success in the log).
-- The new executable enables ASLR (randomized load addresses); the mod handles it.
+The mod identifies which one it is running inside from the executable's own headers,
+and every install still verifies the bytes at the address at runtime before writing.
+A wrong assumption refuses to arm rather than patching the wrong thing.
 
-**Known NOT working on the updated game, to be restored in a coming release:**
+**What was restored on the newer executables:**
 
-- **Head hiding in first person.** The engine function that hides the head could not
-  be matched in the new executable (it was recompiled, not just moved), and this mod
-  never guesses addresses: rather than risk your game, the feature disables itself.
-  First person still works; you will see hair or helmet geometry from inside until
-  this is re-derived. It is the top restoration priority.
+- **Head hiding in first person.** Out since v0.7.0 because the engine's
+  head-visibility function had been recompiled rather than moved. Re-derived
+  2026-08-15 by constraining on a class method table with a slot-function
+  fingerprint that occurs exactly once in the 411 MB executable, and corroborated
+  against the verified 2017 original. It arms on both current executables.
+- **The first-person head-bone anchor**, re-confirmed in the headset on the
+  2026-08-19 build on 2026-08-22.
 
-**Not yet re-verified on the updated game (worked before, expected to work, but the
-update's gameplay changes touch them and they have not been re-confirmed in the
-headset yet):**
+**What is still not derived on the newer executables**, and therefore stays off
+rather than guessing: the `on_calc_mvp` camera entry point and the projectile-spawn
+function. Both were recompiled, not merely moved. Nothing depends on them in a
+shipped feature.
 
-- The head-bone first-person anchor (eye height tracking crouch and prone).
-- The hand markers and the research instruments around weapon identification. The
-  update changed weapon handling (reloads, a two-primary loadout), so the internal
-  weapon bookkeeping the research side reads is due a re-check.
+**Recommended settings for the current game version:** the August updates added FSR
+upscaling; **keep FSR off** while using the mod (it sits inside the render path the
+mod manages, untested and likely to blur the eyes). The native immersion toggles
+(reduced highlight glow, throwable sightline preview off, hidden-UI sounds) work fine
+and are recommended for VR.
 
-If any of these misbehave for you on the new game version, that is why; please
-report it with your `GRWVR\grwxr-<pid>.log`. Nothing silently guesses: every feature
-that could not be re-verified either disabled itself or is listed here.
-
-**Recommended settings for the new game version:** the update added FSR upscaling;
-**keep FSR off** while using the mod (it sits inside the render path the mod
-manages, untested and likely to blur the eyes). The update's new native immersion
-toggles (reduced highlight glow, throwable sightline preview off, hidden-UI sounds)
-work fine and are recommended for VR.
+If something misbehaves on your game version, please report it with your
+`GRWVR\grwxr-<pid>.log`. Nothing silently guesses: every feature that could not be
+verified either disabled itself or is listed here.
 
 ## What works
 
@@ -144,6 +162,22 @@ work fine and are recommended for VR.
   gun is the game's own weapon, placed by writing the bone the engine mounts it
   on, at the instant the engine reads that bone. Bullets follow your gaze for now;
   see "Motion controls: exactly where this is".
+- **Two-handed weapon handling.** Your rear hand sets where the weapon is, your
+  front hand sets where it points, and twisting your wrist rolls it about its own
+  barrel. Front-hand authority fades in with hand separation, so bringing your
+  hands together degrades to a one-handed hold rather than to garbage. **This has
+  a known bug in this release**, see Known limitations.
+- **An in-headset settings panel (`F1`).** Driven with the controller, so
+  settings that can only be judged by feel while moving can be changed without
+  taking the headset off. The panel polls the controller itself rather than
+  waiting on the game, which is what finally made it usable.
+- **Whole-config presets on the numpad.** Drop complete copies of `grwxr.cfg`
+  into `GRWVR\presets\` and the numpad digits load one each, ten keys per bank,
+  with the panel paging between banks. Each load announces its name and logs a
+  key-by-key diff of what changed.
+- **Spoken feedback (optional, `voice = 1`).** The mod can say what it just did
+  through Windows' own speech voice, so a key press confirms itself when you
+  cannot see a log.
 - **Hand markers**: two coloured dots drawn where your controllers actually are,
   with real stereo depth.
 - **True first person, anchored to your head bone.** A toggle moves the viewpoint onto
@@ -154,8 +188,9 @@ work fine and are recommended for VR.
 - **Your character's head is hidden in first person**, using the engine's own
   head-visibility mechanism, so you no longer see hair or helmet geometry from inside.
   Hiding is instant on the toggle (the first toggle of a session engages after your
-  first aim). **Temporarily NOT working on the 2026-08 game update** (see the update
-  section above); it disables itself there rather than guess at a moved address.
+  first aim). It was disabled from v0.7.0 onward because the engine function had
+  been recompiled; the address was re-derived on 2026-08-15 and it arms again on
+  both current executables.
 - **The first-person close-range body blur is REMOVED.** Your chest, arms and weapon
   no longer smear when the camera sits at the character's head. This was the top
   complaint from earlier builds.
@@ -171,7 +206,8 @@ work fine and are recommended for VR.
   true angular size.
 - **Config GUI and hot reload.** All tuning lives in `GRWVR\grwxr.cfg`, re-read about
   one second after any save, and `tools\cfg_gui\cfg_gui.exe` is a standalone slider
-  editor. Only three hotkeys remain in play (recenter, first person, head aim).
+  editor. Whatever is live is whatever `grwxr.cfg` says, always: the panel, the
+  hotkeys and the presets all work by changing that one file.
 - A cropped, non-alternating desktop mirror suitable for recording
 - Stable at 72 fps on the test system through extended open-world play
 
@@ -195,19 +231,35 @@ controller's ray directly rather than nudging it relative to where the game was
 already aiming. Two of those four had previously been assumed, and both assumptions
 turned out to be wrong, which is most of why this took as long as it did.
 
+### Two-handed handling, and the bug in it (2026-08-16 onward)
+
+A long gun can be held in two hands: the rear hand sets where it is, the front hand
+sets where it points, and your wrist rolls it about the barrel. That part works and
+is on by default.
+
+**It currently flips 180 degrees at random and the gun appears to split or reverse.**
+The mod decides which hand is in front by a sign test with no deadband and no
+hysteresis, so hand jitter across that boundary flips the sign frame to frame. A
+single instrumented 90-second run recorded **5466 flips**, 61% of the frames where
+both hands were engaged. The cause is understood and the counter that proves it is in
+the log; the fix is not in this release. Set `wgun_twohand = 0` to go back to a
+one-handed hold if it bothers you.
+
 ### What is still coming
 
 **Bullets follow your gaze rather than the gun**, so aiming down sights is still the
-accurate way to shoot. This is the last piece of the puzzle and it is close: the
-work is now down to a single identified candidate, after three other mechanisms were
-each tested, confirmed to run, and ruled out with evidence. **It is what the next
-release is about.**
+accurate way to shoot. This remains the last big piece. The previous approach shipped
+disabled after being ruled out by construction rather than by tuning: it steered the
+game's aim onto the barrel, but in this engine the aim *is* the camera, so both sides
+of the error moved together and it could never settle. A comparison against six other
+VR mods for closed engines, done 2026-08-22, has since identified which route the
+mods that solved this used, and that is what the work is now on.
 
 **Hip-fire spread is untouched**, so even a correctly pointed barrel scatters.
 **Your character's arms do not follow the weapon**, so the gun can look detached
-from the body. **There are still no hands, no gestures and no weapon manipulation**:
-no grabbing, no gesture reloads, no physical mag changes, no two-handed grip. Reload,
-swap and vehicle entry are ordinary button presses.
+from the body. **There are still no hands and no gesture-based weapon manipulation**:
+no grabbing, no gesture reloads, no physical mag changes. Reload, swap and vehicle
+entry are ordinary button presses.
 
 ### Everything else about the controls
 
@@ -244,11 +296,21 @@ watched working through a headset rather than inferred from a log.
 
 ## Known limitations (honest list)
 
-- **Head hiding is temporarily out on the 2026-08 game update** (the current game
-  version). You will see hair or helmet from inside in first person until the
-  moved engine function is re-derived. See "The 2026-08 game update" above.
+- **The two-handed hold flips 180 degrees at random**, so the gun appears to split
+  and reform and reads as reversed every so often. Understood, measured (5466 flips
+  in one 90-second run), not fixed in this release. Workaround:
+  `wgun_twohand = 0`.
+- **The numpad digits load whole configs now.** Before this release, most of them did
+  nothing. Now every digit `1`..`9` and `0` replaces your entire `grwxr.cfg` with a
+  preset file. If you have no `GRWVR\presets\` folder they do nothing and the log
+  says so, but if you do, a stray press changes everything at once. Each load says
+  its name out loud so you know it happened. Your live config is backed up once
+  before the first load of each session.
+- **Preset files must be WHOLE copies of `grwxr.cfg`.** Loading is additive: keys a
+  preset leaves out keep whatever the previous preset set them to, they do not reset
+  to defaults. The mod warns and names every missing key when it loads a partial one.
 - **Bullets follow your gaze, not the gun**, so aim down sights to shoot accurately.
-  This is the last piece and it is the focus of the next release.
+  This is still the last big piece.
 - **The gun may not sit exactly in your fist.** It is placed at the point the engine
   mounts it, which is near the receiver, so it can hang slightly off your hand. A
   grip offset is coming; `wgun_pos_scale` tunes reach in the meantime.
@@ -278,7 +340,9 @@ evidence comes in.
 | Feature | Progress | Where it stands |
 |---|---|---|
 | The weapon rides your controller | **~90%, shipped in v0.8.0** | **Position and rotation both confirmed in the headset.** The gun is the game's own weapon, moved by writing the bone the engine mounts it on, at the moment the engine reads that bone. Remaining: a grip offset so it sits in your fist rather than beside it, and travel-scale tuning |
-| Bullets go where the weapon points | ~60% | The last piece, and the whole of the next release. Three candidate mechanisms were each tested, confirmed to run, and ruled out with evidence, leaving one identified candidate to finish |
+| Two-handed hold | **~70%, shipped in v0.9.0-test1** | The hold itself works. The front-hand detection has no deadband, so it flips 180 degrees on jitter, which is the split-and-reverse artifact. Root cause found and measured; the fix is next |
+| Bullets go where the weapon points | ~60% | Still the last big piece. Three candidate mechanisms were each tested, confirmed to run, and ruled out with evidence. A comparison against six other closed-engine VR mods identified the route the ones that solved it took |
+| Settings you can change in the headset | **~85%, shipped here** | The panel opens, the controller drives it, and the numpad loads whole configs. Not every row has been exercised |
 | Hip-fire accuracy at ADS grade under VR aim | ~70% | The exact engine flag is located and verified unique in every supported build; one write-route decision remains before it ships |
 | Physical sighting (raise the gun, use the sights, no ADS mode) | ~35% | Follows directly from the two rows above. The gun already points where you point it; sights need the bullets fixed first, then an eye-aligned reticle |
 | Performance pass for dense towns | ~30% | The engine's shadow-quality lever is located and writable live; a measurement run will decide what ships |
@@ -289,32 +353,25 @@ Percentages are progress toward shipping, not promises or dates, and they move a
 evidence comes in. A row only goes up when something has been watched working in a
 headset.
 
-Shipped in v0.8.0: the controller-tracked weapon, plus a fix for a config value that
-could crash the game if it was mistyped.
-
-**This release (v0.8.0)** carries the controller-tracked weapon. **The next release**
-is about the bullets following it, after which a public **beta** follows.
+**This release (v0.9.1-test2)** carries support for the current game executables,
+head hiding restored, the in-headset settings panel, whole-config presets, and the
+corrected eye sign. **The next release** is about the two-hand flip and the bullets
+following the gun, after which a public **beta** follows.
 
 ## Which version of the game do I need?
 
-> [!IMPORTANT]
-> **Not the newest one.** The 2026-08-13 title update replaced `GRW.exe` with a
-> build this release does not carry a table for, and on it the mod installs
-> nothing. See the caution at the top. Everything in this section describes the
-> game as it was *before* 2026-08-13.
-
-**The August 2026 "Last Rites" patch is verified, on Steam, in the headset.**
-Since that update, Steam and Ubisoft Connect ship the byte-identical
-executable, so Ubisoft Connect installs are covered by the very same verified
-address table (headset confirmation from a Ubisoft Connect user is still welcome).
+**The current one is fine.** As of this release the mod carries verified address
+tables for every `GRW.exe` shipped in 2026, including the 2026-08-19 update, which is
+the build it was developed and run on. Since the late-July update, Steam and Ubisoft
+Connect ship the byte-identical executable, so Ubisoft Connect installs are covered
+by the very same tables (headset confirmation from a Ubisoft Connect user is still
+welcome).
 
 The mod finds the engine's camera and projection code at specific addresses inside
 `GRW.exe`, so every distinct build of that executable needs its own verified address
-table. This release carries THREE: the pre-update Steam build (2023-09-14), the
-pre-update Epic / Ubisoft Connect store build (2023-09-08, machine-verified offline,
-never headset-confirmed by a store user), and the current 2026-08 update build that
-both stores now ship (headset-verified). The mod identifies which one it is running
-inside from the executable's own headers.
+table. This release carries FIVE; they are listed with their provenance in
+["The 2026-08 game updates"](#the-2026-08-game-updates-honest-status) above. The mod
+identifies which one it is running inside from the executable's own headers.
 
 If the mod meets a `GRW.exe` it does not recognize (a future game patch, or a build
 we have not analysed), it says so in its log, names the builds it knows, and
@@ -325,9 +382,9 @@ controllers possibly still working. Check `GRWVR\grwxr-<pid>.log` for the
 
 ## Requirements
 
-- Ghost Recon Wildlands, current version (the August 2026 "Last Rites" update),
-  Steam or Ubisoft Connect (identical executable since that update; see above).
-  The two pre-update builds remain supported by their own address tables.
+- Ghost Recon Wildlands, any version up to and including the 2026-08-19 update,
+  Steam or Ubisoft Connect (identical executable since the late-July update; see
+  above). The two 2023 builds remain supported by their own address tables.
 - A PC VR headset with an OpenXR runtime. Tested only on Meta Quest 3 over Link cable
   with the Meta Quest Link runtime.
 - **Asynchronous Spacewarp must be disabled** (Oculus Debug Tool, set ASW to Disabled).
@@ -362,15 +419,17 @@ The sections below are for building from source.
 `build.bat` selects the toolchain in this order, using the first that exists:
 
 1. `C:\Program Files\Microsoft Visual Studio\18\Community` (the project's primary
-   build machine; **every release through v0.7.0 was compiled with this**),
+   build machine; **every release through v0.7.0, and v0.9.1-test2, was compiled
+   with this**),
 2. `C:\Program Files\Microsoft Visual Studio\2022\Community` (fallback).
 
-**This matters right now.** The releases split cleanly by compiler:
+**This matters right now.** The releases split by compiler:
 
 | Releases | Machine | Compiler |
 |---|---|---|
 | through **v0.7.0** (worked on VD / Steam Link) | primary build machine | Visual Studio at `\18\` |
 | **v0.8.0, v0.8.1, v0.8.2** (startup crash on VD / Steam Link) | second machine | **Visual Studio 2022 Community, MSVC 14.39.33519** |
+| **v0.9.1-test2** | primary build machine | Visual Studio at `\18\` |
 
 A startup crash in the v0.8.x builds (black screen, then the game closes) on
 Virtual Desktop and Steam Link is under investigation as a probable toolchain
@@ -378,6 +437,12 @@ difference: the code paths involved are byte-identical to v0.7.0. The
 `v0.7.0-vs2022-crashfix` pre-release pairs v0.7.0's known-good source with the
 VS 2022 compiler to confirm it (see issue #2). Each release records the compiler
 it was built with in its notes.
+
+**v0.9.1-test2 is back on the `\18\` toolchain**, which is the one no crash was
+ever reported against. That is a change of circumstance, not a fix: issues #2 and
+#3 remain open and this release has not been tested against either report. If you
+are one of those reporters, trying this one and saying what happens would genuinely
+help.
 
 ## Installing
 
@@ -393,6 +458,11 @@ it was built with in its notes.
 5. Set the baseline graphics settings below.
 6. Launch through Steam. The headset no longer needs to be awake before launch: the
    mod waits and arms itself the moment the headset wakes.
+
+Optional: to use the numpad preset loader, make a `GRWVR\presets\` folder and put
+whole copies of `grwxr.cfg` in it, named so they sort the way you want them
+(`01-baseline.cfg`, `02-wide-stereo.cfg`, and so on). Numpad `1` loads the first,
+`0` loads the tenth. With no such folder the digit keys do nothing.
 
 ## Baseline graphics settings (start here before judging anything)
 
@@ -424,15 +494,46 @@ log (`grwxr-<pid>.log`) and an optional `grwxr.cfg`.
 
 ## In the headset
 
-Only THREE hotkeys remain; every tuning key from older releases was removed. All
-tuning lives in `GRWVR\grwxr.cfg`, which hot-reloads about one second after any
-save, or use the included slider GUI (`tools\cfg_gui\cfg_gui.exe`).
+**The key map changed in this release.** The numpad digits used to be feature
+toggles; they are preset loaders now, and the features they carried moved onto the
+`F1` panel. The mod prints its own key list at startup, generated from what the keys
+actually do, and that log line is the authority if this table ever drifts.
+
+> [!WARNING]
+> **Numpad `1`..`9` and `0` each replace your whole `grwxr.cfg`.** They read
+> `GRWVR\presets\*.cfg` in file-name order. With no presets folder they do nothing.
+> With one, a stray press changes every setting at once.
+
+**Play keys:**
 
 | Key | Action |
 |---|---|
+| F1 | Open / close the settings panel (drive it with the controller) |
+| F2 | First person on / off (head hiding follows it automatically; also recenters, so a stale reference cannot poison the view) |
 | Home | Recenter (look where you want forward to be, then press) |
-| Numpad 8 | First person on / off (head hiding follows it automatically; also recenters, so a stale reference cannot poison the view) |
+| Space | Also recenters. Note it still vaults, because the mod polls the keyboard and does not intercept it |
 | Numpad . (Decimal) | 1:1 head aim on / off (bullets follow your gaze; default off) |
+| Numpad 1..9, 0 | Load a whole preset config from `GRWVR\presets\` (see the warning above) |
+
+**Live tuning keys:**
+
+| Key | Action |
+|---|---|
+| Insert | Cycle which setting the tuner is editing |
+| Page Up / Page Down | Step that setting up / down |
+| Delete | Reset that setting |
+| Numpad / | World BIGGER (`ipd_scale` up) |
+| Numpad * | World SMALLER (`ipd_scale` down) |
+| Numpad + | Head roll into the camera (`cam_pose_rot`). Diagnostic: it also makes the camera fight yaw and pitch |
+| Numpad - | Skinning palette capture (research aid) |
+| End | Start a guided spoken test run for weapon identification (silenced by `voice = 0`) |
+
+Every press logs the name, the value and what it changes. Saving `grwxr.cfg` restores
+the file's values over anything a key changed.
+
+**What moved onto the `F1` panel:** barrel aim, trigger ADS, the eye swap and the
+camera pose write are Settings rows; the weapon-draw recorder and first person are
+Captures rows.
 
 ### Touch controllers (emulated as a gamepad)
 
@@ -457,7 +558,8 @@ key in comments. The ones most worth knowing:
 
 | Key | Meaning |
 |---|---|
-| `ipd_scale` | Eye separation multiplier (default 0.50) |
+| `ipd_scale` | Eye separation multiplier. `1.00` means the headset's measured IPD at 1 world unit = 1 metre, and it is the shipped value in this release |
+| `ipd_swap` | **If the stereo looks wrong, try this first.** `1` (the shipped value) swaps which eye gets which offset. See the note below the table |
 | `fullscreen_fov` | Rendered field of view in radians (default 1.92) |
 | `upsize_width` / `upsize_height` | Internal render size (default 3840x2160). Lower it, for example 3200x1800, to trade sharpness for frame rate |
 | `fp_head_anchor` | `1` (default) anchors first person to the character's head bone; `0` falls back to the origin anchor |
@@ -472,7 +574,22 @@ key in comments. The ones most worth knowing:
 | `hand_markers` | `1` (default) draws the two hand-position dots; `0` hides them |
 | `wp_markers` | `0` (default in the shipped config) research aid: colored dots on the engine objects nearest the camera, used to identify the weapon's placement handle; turn on only if you are helping with that hunt |
 | `aim_steer`, `aim_ads`, `aim_fire` | Controller-pointing aim, trigger ADS and trigger fire; set any to `0` to disable |
+| `wgun` | The controller-tracked weapon. `0` gives you the v0.7.0 behaviour back |
+| `wgun_twohand` | Two-handed hold, `1` by default. **Set to `0` if the 180-degree flip bothers you** |
+| `wgun_grip_fwd` | Metres along the barrel: slides the gun forward or back in your fist |
+| `wgun_grip_two` | Front-hand hold strength, `0` to `1` |
+| `voice` | `1` speaks what the mod just did through Windows' own voice, `0` is silent |
 | `desktop_fov` | Crop of the desktop recording view, `0` disables |
+
+> [!NOTE]
+> **About `ipd_swap` and the shipped stereo values.** A controlled A/B in the headset
+> on 2026-08-22, toggling only this one key three times, came out in favour of
+> `ipd_swap = 1` at `ipd_scale = 1.00`. That is what this release ships. The
+> practical reading is that the eye sign was inverted, and that people running a very
+> small `ipd_scale` because "everything looks huge" were compensating for it. **This
+> is "better", tested once, and not declared correct**, which is exactly why the
+> panel puts the swap on the first row. If it looks wrong to you, flip it and say so
+> in an issue.
 
 ## Disabling and uninstalling
 
@@ -483,8 +600,10 @@ key in comments. The ones most worth knowing:
 
 ## Rules of use
 
-- **Solo campaign only. Never use this in co-op, PvP, or any matchmaking.** The game
-  ships Easy Anti-Cheat for multiplayer; this mod must never run in that context.
+- **Solo campaign only. Never use this in co-op, PvP, or any matchmaking.** The
+  2026-08-13 title update removed Easy Anti-Cheat from the game, and that changes
+  nothing about this rule: the mod is built and tested for the solo campaign only,
+  and it must never run in a competitive context.
 - For now, playing in offline mode is recommended (Steam offline mode, or Ubisoft
   Connect set to offline). It keeps the session unambiguously single-player while
   the mod is under development.

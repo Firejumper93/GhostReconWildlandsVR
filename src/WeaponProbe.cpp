@@ -209,9 +209,49 @@ int fmt_slot(char* buf, int off, int cap, const Slot& s) {
                              s.key & 0xFFFFFF, s.key >> 24, (long)s.count, dist);
 }
 
+// BUILD 102: the off switch this probe never had.
+//
+// `[VERIFIED, grwxr-29328.log]` this observer is the single highest volume hook
+// in the mod: 13,495 calls per second, peaking at 19,653, about 190 per frame.
+// Every one of them does an interlocked increment on a global that every engine
+// job thread shares, a call into camera::base_pos, a six entry watch scan and a
+// hash probe of up to sixteen slots.
+//
+// And it is installed UNCONDITIONALLY, unlike every other research probe. It
+// has been feeding wp_markers (0), wp_write_slot (-1) and wp_write_handle (0)
+// for eighteen builds, which is to say it has been doing bookkeeping for a log
+// line nobody reads. The pooled placement question it was built to answer was
+// CLOSED in session 26: the handles are body attachment sockets and writing the
+// hand socket moves nothing.
+//
+// Read directly from the file, because the cfg parser is not up this early.
+// Same pattern as draw_probes in PaletteProbe.cpp.
+bool wp_probe_requested() {
+    const std::wstring path = log::data_dir() + L"\\grwxr.cfg";
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return false;
+    char line[256];
+    bool on = false;
+    while (fgets(line, sizeof(line), f)) {
+        float v = 0.0f;
+        if (sscanf_s(line, " wp_probe = %f", &v) == 1) on = v > 0.0f;
+    }
+    fclose(f);
+    return on;
+}
+
 }  // namespace
 
 bool install() {
+    if (!wp_probe_requested()) {
+        LOG_INFO("wp: placement observer is OFF (wp_probe=0 or absent). This "
+                 "is the shipping default: it was the mod's busiest hook at "
+                 "~13500 calls/s and its question was answered in session 26. "
+                 "Set wp_probe=1 for placement research, which also re-enables "
+                 "wp_markers and the wp_write_* levers.");
+        return false;
+    }
+
     auto img = sig::main_image();
     if (!img) {
         LOG_ERROR("wp: cannot read GRW.exe image. Probe OFF.");

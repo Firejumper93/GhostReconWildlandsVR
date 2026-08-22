@@ -1,6 +1,6 @@
 // Log.h - minimal, allocation-light logging for GRW-XR.
 //
-// Rules this file exists to enforce (the project rules):
+// Rules this file exists to enforce (project rules):
 //   Rule 5: the FIRST line of grwxr.log must carry the deployed DLL's own
 //           SHA256 and timestamp, so a test result can be matched to the exact
 //           binary that produced it. We hash our own module at startup.

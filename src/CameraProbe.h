@@ -67,6 +67,13 @@ int  aim_arm(int axis, float delta_engine_units);
 //
 // The read is deliberately unsynchronized, so a caller on another thread can
 // see a position torn between two frames. That error is centimetres.
+//
+// BUILD 98: BOTH OF THESE NOW PREFER THE PER-FRAME ENGINE LATCH. Read the long
+// comment above base_frame_engine in CameraProbe.cpp before changing either.
+// The short version: since build 89 we WRITE Camera+0x000 row 3 about three
+// times a frame, so reading it live returns whichever of two values, 1.9 m
+// apart, the read happened to land between. Everything these two feed is ours,
+// and all of it wants the engine's own camera, not the row we are editing.
 bool base_pos(float out[3]);
 
 // Build 45: the player camera's full world frame, read from the camera
@@ -116,6 +123,77 @@ void set_wgun(int mode, float dz);
 // gun across the world in a single frame). cfg wgun_smooth, wgun_maxstep_deg.
 void set_wgun_filter(float smooth, float maxstep_deg);
 
+// 2026-08-13. TWO-HANDED AIM: the barrel points from the rear hand toward the
+// front hand instead of along the rear controller's own forward, blended in by
+// hand separation so it degrades to the one-handed behaviour when the hands
+// come together (where a two-point direction goes noisy). cfg wgun_twohand.
+//
+// ROLL: twisting the wrist twists the gun about its barrel. Applied as a
+// rotation about the aim axis, which fixes that axis exactly, so roll cannot
+// move the point of aim. wgun_roll_deg trims the unknown constant offset
+// between the model's up axis and the controller's. cfg wgun_roll,
+// wgun_roll_deg.
+void set_wgun_twohand(int on);
+void set_wgun_roll(int on, float trim_deg);
+
+// BUILD 120: the two-handed AGREEMENT GATE, as a live control.
+// It refuses a two-handed frame when the line between the hands disagrees
+// with the rear controller's own forward by more than acos(v). The
+// 2026-08-20 headset run refused 70% of two-handed frames at the old
+// hard-coded 0.35 (about 69 degrees), so this is the FIRST thing to move when
+// two-handed will not hold. Band -1.00 (accept everything, gate off) to 1.00
+// (perfect alignment only), which are the true limits of a cosine, not a
+// guess about what a tester could need.
+//
+// BUILD 123 SUPERSEDES THAT ADVICE. The gate was not tight, it was reading the
+// barrel backwards, and moving this was the wrong fix. Leave it at 0.35.
+void  set_wgun_two_agree(float v);
+float get_wgun_two_agree();
+
+// BUILD 123: which hand is the FRONT hand is MEASURED per frame instead of
+// assumed to be the left one.
+//
+// `[VERIFIED, log grwxr-29396, 128 samples]` the tester's front hand is his
+// RIGHT. Of the 11 samples with the hands more than 0.30 m apart, the median
+// angle between the hand-to-hand line and the right controller's own aim was
+// 140 degrees; flipped, the five widest read 39, 43, 32, 34 and 33 degrees.
+// That inverted line is why the agreement gate refused every frame it ever saw
+// (mean 90 deg, best 81 deg, threshold 70 deg, zero accepted).
+//
+// 1 = measure (default), 0 = the pre-123 fixed assumption. Handedness
+// agnostic: a correct hold never trips the flip, so this cannot make one worse.
+void  set_wgun_two_auto(int on);
+int   get_wgun_two_auto();
+
+// BUILD 124: restart the weapon direction and roll filters from the live value.
+// Anything that can REVERSE the target direction must call this, or the one-pole
+// slews the weapon through 180 degrees at the rate cap instead of snapping.
+void  reseed_wgun();
+
+// BUILD 125: THE EYE-SIGN A/B, +1 (every build since 10m) or -1.
+//
+// Build 93 established that positive ipd_scale displaces the LEFT eye to the
+// RIGHT, "geometrically the swapped direction", and that the stored sign is
+// [UNKNOWN] rather than wrong because build 10m could only measure the
+// COMPOSITE of sign and frame-pairing parity. **No log line can settle it.**
+//
+// It matters because reversed stereo fuses at tiny disparity and hurts at
+// large, which is exactly the reported shape: ipd_scale has only ever been
+// persisted at 0.50 and 0.90, 1.00 has never been run, and the working value
+// of 0.05 is a saturated hotkey reached in 4.1 seconds. If the sign is
+// inverted, 0.05 is just the largest reversed disparity the eyes tolerate.
+//
+// Live, because fusion cannot be A/B'd across a relaunch: the eyes adapt over
+// seconds and the comparison has to be back to back on the same view.
+// BUILD 126: bypass the static grip offset so the gun parks ON the tracked
+// hand position, for the "does the gun sit on the blob" test. The tuned grip
+// values are untouched, so turning this off restores them exactly.
+void  set_wgun_grip_bypass(int on);
+int   get_wgun_grip_bypass();
+
+void  set_ipd_sign(int s);
+int   get_ipd_sign();
+
 // Build 81: gun POSITION rides the controller, so the weapon can be raised to
 // the eye instead of pivoting where the animation left it. Applies only in
 // wgun mode 3 and is OFF by default, so the verified rotation cannot regress
@@ -124,6 +202,42 @@ void set_wgun_filter(float smooth, float maxstep_deg);
 // every possible tracking failure; smooth is the one-pole weight per call.
 // cfg wgun_pos, wgun_pos_scale, wgun_pos_clamp, wgun_pos_smooth.
 void set_wgun_pos(int on, float scale, float clamp_m, float smooth);
+
+// Build 99: WHERE THE GUN SITS IN YOUR HANDS.
+//
+// Build 81 put the gun ROOT on the right controller. The root is not the grip:
+// it is wherever the model's origin happens to be, so the weapon sits at some
+// fixed but arbitrary offset from your fist and no amount of aiming tuning
+// fixes it. These are that offset, in the WEAPON'S OWN frame, so they rotate
+// with the gun and mean the same thing at any angle.
+//
+//   fwd  metres along the barrel (+Y, [VERIFIED] build 79 as the bore axis).
+//        POSITIVE pushes the gun forward through your hand, so your hand ends
+//        up further back along the weapon.
+//   lat  metres along the weapon's +X.
+//   up   metres along the weapon's +Z.
+//
+// `two` is the front-hand grip, 0..1, and it is a different kind of thing. With
+// both hands tracked the rear hand fixes position and the front hand fixes
+// direction, so the handguard already points AT your left hand but is not
+// necessarily AT it: real hands are not always the weapon's own spacing apart.
+// This slides the weapon ALONG ITS OWN BARREL until the measured handguard
+// point sits on the front hand. `[VERIFIED, 2026-08-13, 112 samples, stable to
+// one millimetre]` that point is +0.481 m along the barrel from the root.
+//
+//   0.0  rear hand only, exactly the build 81 behaviour
+//   1.0  the handguard lands on the front hand and the rear grip absorbs all
+//        of the spacing error
+//   0.5  the error splits between the hands, which is what it feels like to
+//        hold a real rifle with your hands slightly off its natural spacing
+//
+// It is a translation along the aim axis, so like the roll trim it CANNOT move
+// point of aim. That is algebra, not tuning.
+//
+// All four default to zero, so a build carrying this behaves exactly as the one
+// before it until a key is pressed.
+void set_wgun_grip(float fwd, float lat, float up, float two);
+void get_wgun_grip(float* fwd, float* lat, float* up, float* two);
 
 // Build 78: step wgun 0 -> 1 -> 2 -> 0 from a key (NUMPAD 5), so the tester can
 // compare the two gun-root bones without removing the headset to edit a file.
@@ -177,6 +291,22 @@ void cycle_wnode_axis();
 // from the first-person state each frame; off restores engine behaviour
 // within a frame. Safe from any thread; a no-op if the hook did not install.
 void set_head_hide(bool on);
+
+// Build 96: zero the head-compose counters.
+//
+// The drain's "head compose:" line gates on frames != 0, and the counters are
+// cumulative for the life of the process. So once the camera write has run at
+// all, turning it OFF leaves that line printing its last totals forever, which
+// reads as "still composing" when nothing is. That is exactly what
+// grwxr-13140.log did at 19:52 onward: 41067 writes over 13695 frames, frozen,
+// for a full minute after the write had stopped.
+//
+// The Numpad 0 toggle calls this on every press, for the same reason
+// cycle_aim_barrel resets the barrel counters: the question the log answers is
+// about the state just selected, not about a total carried over from the
+// previous one. After a toggle to OFF the line becomes the idle branch, which
+// names the consequence out loud.
+void reset_head_telemetry();
 
 }  // namespace camera
 }  // namespace grwxr

@@ -1,8 +1,10 @@
 #include "VRMirror.h"
 #include "AimTrace.h"
+#include "Voice.h"
 #include "CameraProbe.h"
 #include "HeadPose.h"
 #include "Log.h"
+#include "Menu.h"
 #include "WeaponProbe.h"
 #include "XInputMerge.h"
 
@@ -51,6 +53,29 @@ bool        g_input_ok = false;
 // Hot path -> heartbeat handoff (rule 8: the present hook only stores plain
 // atomics; the heartbeat thread formats and logs).
 std::atomic<uint32_t> g_in_seen{0};   // bit0 = left tracked, bit1 = right
+// BUILD 124: HANDEDNESS. Which PHYSICAL hand is the trigger and pivot hand.
+// 1 = right (the default, and byte-identical to every build before this one),
+// 0 = left.
+//
+// `[VERIFIED, log grwxr-28520, 84 samples]` the tester shoots LEFT HANDED. His
+// LEFT trigger reached 1.00 and sat above the 0.55 threshold in 19 samples; his
+// RIGHT trigger peaked at 0.60 and crossed once. ADS and FIRE both read the
+// right trigger, so both reported `0 holds` and `0 pulls` in a run he spent
+// testing ADS. `aim_fire` had been ENABLED the whole time and had never once
+// fired, which is not a bug in the fire code: nothing was ever pulling the
+// trigger it watches.
+//
+// The same fact explains the backwards two-hand barrel found in build 123: his
+// front hand is his RIGHT because his left is on the grip. Both symptoms are
+// one root cause, and this is his own report, "the left and right directions
+// are reversed".
+//
+// The swap is applied ONCE, where the poses are stored, so all seventeen
+// consumers that hardcode hand index 1 become correct together and none can be
+// missed. Slot 1 means "main hand" from here down, not "right hand". The
+// gamepad snapshot is deliberately NOT swapped: it is the game's own pad
+// mapping and the game has its own rebinding for it.
+std::atomic<int>      g_main_hand{1};
 std::atomic<float>    g_in_pos[2][3] = {};
 std::atomic<float>    g_in_ori[2][4] = {};
 std::atomic<float>    g_in_trig[2]   = {};
@@ -126,6 +151,86 @@ float g_ctl_pitch  = 0.0f;
 bool  g_ctl_have   = false;             // never tracked yet: fall back to head
 std::atomic<float> g_ctl_diag[4] = {};  // 23.1: ctl yaw/pitch, head yaw/pitch
 std::atomic<bool>  g_ctl_diag_ok{false};
+
+// ---------------------------------------------------------------------------
+// BUILD 84: aim_barrel. THE BULLET LEAVES THE BARREL.
+//
+// This reopens a line the project closed on 2026-08-05, and it reopens it
+// because the reason it was closed does not apply to this shape.
+//
+// WHAT WAS ALREADY PROVEN, and then mis-filed. `aim_source = 1` drove the
+// engine's own aim from the controller and the tester reported it "sorta
+// follows the reticle". Bullets DID move. It was retired because in this engine
+// the aim IS the camera, so continuously chasing the hand dragged the view, and
+// the user's standing constraint (2026-08-05) forbids exactly that. The
+// campaign that followed went looking for a separate "authoritative shot
+// direction" and eliminated three candidates with proof (projectile relocation,
+// spawn direction owner+0x140, the per-shot aim reader at 0x1464DEDB). Those
+// eliminations are sound. The conclusion drawn from them, that the shot
+// direction has not been found, is not: it was found in build 23. It is the
+// engine's aim, and camera::aim_arm writes it.
+//
+// WHY THIS SHAPE IS ALLOWED WHERE aim_source = 1 WAS NOT. The user refined the
+// constraint the same night he set it: "aim following the controller DURING HIP
+// FIRE is wanted and works. The line is between 'aim tracks my hand while I am
+// shooting' (good) and 'the camera drifts toward my hand while I am doing
+// nothing' (rejected)." This is gated on the RIGHT TRIGGER, so it is the first
+// of those and never the second. It also matches the 0.9 requirement as stated:
+// the direction is established at trigger depress.
+//
+// WHY THE VIEW SHOULD NOT MOVE. Build 19's camera compose already rebuilds the
+// engine's base rotation with the absorbed aim (aim_cum) REMOVED before
+// composing the head on top. That machinery exists, ships, and is
+// headset-confirmed. Every radian injected here is accounted into aim_cum by
+// the pump exactly as head-driven injection is, so the compose subtracts it and
+// the view stays the head's. `[INFERRED]` This is the load-bearing assumption of
+// the build and it is what the headset test has to falsify or confirm. If the
+// view turns anyway, the mechanism is not the pump but something downstream
+// (third-person camera orbit follows the body, which we do not override), and
+// that is a different and much more specific problem than the one we had.
+//
+// THE LOOP IS CLOSED, not open. aimtrace::view_fwd is the engine's OWN aim
+// direction and aimtrace::barrel_dir is where the gun points, both in engine
+// world space from the same pass. The error between them is fed to the pump, so
+// once the engine absorbs it the error goes to zero and stays there. Nothing
+// integrates and nothing can ratchet, which is the failure mode both Halo MCC
+// VR and the Cyberpunk port hit with incremental aim.
+//
+// IT ALSO ANSWERS "unchanged by any outside force". Because the loop re-drives
+// the error every frame while the trigger is held, recoil, sway and any other
+// engine nudge to the aim are corrected out on the next frame. That is not an
+// extra feature, it falls out of running closed-loop instead of one-shot.
+//
+// KNOWN LIMIT, stated rather than discovered later: aim_pump stops injecting
+// below the 0.65 world-fov gate, which is ADS and optics. So this is HIP FIRE
+// ONLY on this build. Sighted fire needs the gate revisited and is not in it.
+// ---------------------------------------------------------------------------
+std::atomic<int>   g_aim_barrel{0};       // cfg aim_barrel: 0 off, 1 on
+std::atomic<float> g_aim_barrel_max{0.60f};  // cfg aim_barrel_max, rad, hard cap
+std::atomic<float> g_bar_diag[2] = {};    // last applied yaw/pitch error, rad
+std::atomic<unsigned> g_bar_frames{0};    // frames the loop drove the aim
+std::atomic<unsigned> g_bar_nodir{0};     // trigger held, no barrel and no ray
+std::atomic<unsigned> g_bar_noview{0};    // trigger held, engine aim unreadable
+std::atomic<unsigned> g_bar_clamp{0};     // error hit the cap (suspect a frame)
+std::atomic<int>   g_bar_src{0};          // 1 = barrel_dir, 2 = ctrl_ray fallback
+
+// THE TRIGGER IS TWO-STAGE, and this feature lives entirely in the second
+// stage. Build 14f puts ADS on the right trigger past 0.55 and build 14h puts
+// FIRE past 0.90. So by the time a round leaves, the game has been aiming down
+// sights for the whole first half of the pull, the world fov has dropped, and
+// aim_pump's own `live` gate (fov >= 0.65) has switched injection OFF.
+//
+// Gating this on "trigger held" would therefore have shipped a feature that is
+// inert at exactly the instant it is supposed to act, and the headset result
+// would have read as "barrel aim does nothing" when the real answer is "barrel
+// aim never ran". That is the most expensive failure class in this project's
+// ledger, so it is handled here rather than discovered in a test.
+//
+// g_bar_want lets aim_pump know the loop is actively driving, so it can keep
+// injecting through ordinary ADS. The floor drops only to mono_scope_fov, so a
+// real magnified optic (where hazard 25 says the compose must stand down and
+// the engine owns the sight picture) is still protected exactly as before.
+std::atomic<bool>  g_bar_want{false};     // barrel aim is driving this frame
 
 // BUILD 14f: TRIGGER = AIM DOWN SIGHTS. The right trigger drives the game's
 // own ADS binding (right-mouse hold), so the game's existing hip-to-ADS
@@ -282,6 +387,21 @@ std::vector<ID3D11RenderTargetView*> g_rtv[2];
 // g_blit_ok stays false and the 10L fixed copy path runs unchanged.
 ID3D11VertexShader*       g_blit_vs   = nullptr;
 ID3D11PixelShader*        g_blit_ps   = nullptr;
+
+// 2026-08-12: the settings panel. Menu.cpp has always been able to draw itself
+// into an offscreen texture, and dllmain already toggles it on F1, calls
+// init() and calls poll(). Nothing ever called render() or put the result in
+// front of the eyes, so the panel existed and was invisible. These two carry
+// it: the SRV is produced ONCE per frame (render() draws an ImGui frame, so
+// calling it per eye would draw two), then composited into both eye canvases.
+ID3D11BlendState*         g_menu_blend = nullptr;
+ID3D11ShaderResourceView* g_menu_srv   = nullptr;
+
+// Half the panel's angular width, as a tangent. Menu.h sizes the panel 0.9 m
+// wide at 1.2 m away, which is 0.45/1.2, and that lands near one texel per
+// headset pixel at 1024 wide so the text stays legible. The height follows
+// from the texture's aspect, so the panel can never come out stretched.
+constexpr float kMenuHalfTanX = 0.375f;
 // Build 24: the controller-aim reticle. A small dot drawn into each eye's
 // canvas at the controller ray's angular offset from the view center, so
 // hip-fire aim is VISIBLE the whole time (the game's own crosshair is
@@ -352,6 +472,14 @@ ID3D11DepthStencilState*  g_blit_dss  = nullptr;
 ID3D11ShaderResourceView* g_last_srv[2] = {nullptr, nullptr};
 bool g_blit_ok = false;
 
+// BUILD 118: does the runtime expose XR_KHR_composition_layer_depth, and did
+// we enable it at instance creation. Latched once in init(), read-only after.
+// the project spec names stale-eye reprojection as "the single most important delta
+// from the reference"; a submitted depth layer is what lets the compositor do
+// POSITIONAL timewarp instead of orientation-only, which is the architectural
+// half of that requirement we can get without writing our own pass.
+bool g_depth_ext = false;
+
 // Per-eye canvas mapping, from create_canvases: tangent units to canvas
 // pixels (sx, sy) and the canvas pixel of the optical center (cx, cy). The
 // canvas texture spans exactly [tanL..tanR] x [tanU..tanD] as submitted, so
@@ -410,8 +538,35 @@ static float g_cfg_wnode    = 0.0f;
 static float g_cfg_wnode_dz = 0.30f;
 static float g_cfg_wgun_dz = 0.30f;
 static float g_cfg_wbaxis  = 0.0f;   // build 79, log-only barrel-axis measure
+// 2026-08-13: two-handed aim and barrel roll, both ON by default. Each falls
+// back to the previous one-handed behaviour by itself when its inputs are
+// missing, so defaulting them on cannot strand a user with a broken weapon.
+static float g_cfg_wgun_twohand  = 1.0f;
+// BUILD 120: the two-hand agreement gate. 0.35 is the old hard-coded value,
+// so an untouched cfg reproduces build 119 exactly.
+static float g_cfg_wgun_two_agree = 0.35f;
+// BUILD 123: measure which hand is in front rather than assume the left one.
+// ON by default, because the assumption is verifiably wrong for this tester's
+// hold and a correct hold never trips the flip. See CameraProbe.h.
+static float g_cfg_wgun_two_auto  = 1.0f;
+// BUILD 124: 1 = right handed (default, identical to every earlier build),
+// 0 = left handed. See the long comment at g_main_hand.
+static float g_cfg_main_hand      = 1.0f;
+// BUILD 125: the eye-sign A/B. +1 is every build since 10m. See CameraProbe.h.
+static float g_cfg_ipd_swap       = 0.0f;
+// BUILD 126: the blob test. Bypasses the static grip offset so the gun parks on
+// the tracked hand position. Diagnostic, default off, tuned values untouched.
+static float g_cfg_wgun_grip_bypass = 0.0f;
+static float g_cfg_aimpoint_m    = 5.0f;   // build 105
+static float g_cfg_wgun_roll     = 1.0f;
+static float g_cfg_wgun_roll_deg = 0.0f;
 static float g_cfg_wgun_smooth  = 0.25f;   // build 80, rotation filter
 static float g_cfg_wgun_maxstep = 5.00f;   // build 80, degrees per call
+// Build 99: the grip offsets, all zero so a fresh install behaves as build 98.
+static float g_cfg_wgun_grip_fwd = 0.0f;
+static float g_cfg_wgun_grip_lat = 0.0f;
+static float g_cfg_wgun_grip_up  = 0.0f;
+static float g_cfg_wgun_grip_two = 0.0f;
 static float g_cfg_wgun_pos        = 0.0f;   // build 81, position rides ctrl
 static float g_cfg_wgun_pos_scale  = 1.0f;
 static float g_cfg_wgun_pos_clamp  = 1.0f;
@@ -422,6 +577,21 @@ static float g_cfg_wgun_pos_smooth = 0.35f;
 // the key is absent, so users who UPDATE (and keep their old cfg without this
 // key) still get the protection. adapter_check=0 forces past it.
 static bool g_cfg_adapter_check = true;
+
+// 2026-08-12: the frame-wait watchdog. See the block above on_present() for
+// the full reasoning. xr_async_wait moves the blocking xrWaitFrame off the
+// game's render thread so a runtime that never returns from it can no longer
+// freeze the game. xr_wait_timeout_ms is how long the render thread will wait
+// for the runtime before it gives up on VR for that one frame and lets the
+// game present normally.
+//
+// DEFAULT ON, and on when the key is absent. A protection against the game
+// freezing is not something a user should have to find in a text file and
+// switch on: the people it saves are exactly the people whose game dies
+// before they ever get far enough to care about config. xr_async_wait=0
+// restores the old inline wait.
+static std::atomic<int> g_cfg_async_wait{1};
+static std::atomic<int> g_cfg_wait_timeout{100};
 
 // Build 10m: the ipd_scale the run started with (cfg value, or 1.0 with no
 // cfg). Numpad * resets to this rather than a hardcoded 1.0, so reset means
@@ -436,13 +606,36 @@ void note(const char* fmt, ...) {
     g_want_log.store(true, std::memory_order_release);
 }
 
+// BUILD 119d: a SECOND deferred slot, for one-shot latched probes.
+//
+// note() is a SINGLE shared buffer drained once per second, so two notes in
+// the same second silently lose the first. That is exactly what happened to
+// build 119c's depth probe: it fired on the first blitting frame and was
+// overwritten by the 11a.2 canvas probe before the 1 Hz drain ran, so the
+// line never reached the log and the test produced nothing.
+//
+// A one-shot probe that reports a fact we cannot get any other way must not
+// compete with a per-frame diagnostic for one buffer. This slot is written
+// exactly once per process.
+char              g_once_note[600] = {};
+std::atomic<bool> g_once_want{false};
+
+void note_once(const char* fmt, ...) {
+    if (g_once_want.load(std::memory_order_acquire)) return;   // first wins
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_once_note, sizeof(g_once_note), fmt, ap);
+    va_end(ap);
+    g_once_want.store(true, std::memory_order_release);
+}
+
 // BUILD 10c: read the one user knob from GRWVR\grwxr.cfg at init. Missing
 // file or key leaves the default. Lines are `key=value`; `#` starts a comment.
 void load_config() {
     const std::wstring path = log::data_dir() + L"\\grwxr.cfg";
     FILE* f = nullptr;
     if (_wfopen_s(&f, path.c_str(), L"rt") != 0 || !f) {
-        LOG_INFO("VR: no grwxr.cfg, ipd_scale = 1.00 (Numpad 9/- adjusts, * resets)");
+        LOG_INFO("VR: no grwxr.cfg, ipd_scale = 1.00 (F1 panel, or Numpad * adjusts)");
         return;
     }
     char line[256];
@@ -450,8 +643,12 @@ void load_config() {
         if (line[0] == '#') continue;
         float v = 0.0f;
         if (sscanf_s(line, " ipd_scale = %f", &v) == 1) {
-            if (v < -2.0f) v = -2.0f;
-            if (v >  2.0f) v =  2.0f;
+            // Build 117: widened to match the hotkey band (0.00..3.00) so a
+            // value the tester settles on with Numpad / and * can actually be
+            // written back here. Negative is still accepted and still means
+            // the eyes are swapped, which is a diagnostic, not a setting.
+            if (v < -3.0f) v = -3.0f;
+            if (v >  3.0f) v =  3.0f;
             headpose::set_ipd_scale(v);
         }
         // Build 19: engine-vs-geometric direction of the aim angle pair, +1
@@ -504,6 +701,37 @@ void load_config() {
         }
         if (sscanf_s(line, " fp_head_anchor = %f", &v) == 1)
             headpose::set_fp_head_anchor(v != 0.0f);
+        // Build 89: write the camera pose from the `selector` target when
+        // on_calc_mvp is not derived. Without it, on the Last Rites binary,
+        // nothing composes the camera at all: no first person, no stereo.
+        if (sscanf_s(line, " cam_selector_pose = %f", &v) == 1)
+            headpose::set_cam_selector_pose(v != 0.0f);
+        // Build 90: 0 makes the camera write POSITION ONLY, which is what
+        // stops it fighting for a channel it does not own.
+        if (sscanf_s(line, " cam_pose_rot = %f", &v) == 1)
+            headpose::set_cam_pose_rot(v != 0.0f);
+        // Build 91: the viewpoint placement trio. See HeadPose.h for why each
+        // exists and what its default was measured against.
+        if (sscanf_s(line, " fp_fwd = %f", &v) == 1) {
+            if (v < 0.0f) v = 0.0f;
+            if (v > 0.5f) v = 0.5f;
+            headpose::set_fp_fwd(v);
+        }
+        if (sscanf_s(line, " fp_clamp = %f", &v) == 1) {
+            if (v < 0.0f) v = 0.0f;
+            if (v > 2.0f) v = 2.0f;
+            headpose::set_fp_clamp(v);
+        }
+        if (sscanf_s(line, " fp_smooth = %f", &v) == 1) {
+            if (v < 0.0f)   v = 0.0f;
+            if (v > 500.0f) v = 500.0f;
+            headpose::set_fp_smooth(v);
+        }
+        if (sscanf_s(line, " fp_smooth_z = %f", &v) == 1) {
+            if (v < 0.0f)   v = 0.0f;
+            if (v > 500.0f) v = 500.0f;
+            headpose::set_fp_smooth_z(v);
+        }
         // Build 15e.3: anchored lateral centering, meters along the base
         // camera's right axis.
         if (sscanf_s(line, " fp_anchor_side = %f", &v) == 1) {
@@ -524,6 +752,12 @@ void load_config() {
             headpose::set_fs_fov(v);
             headpose::set_fs_enabled(v > 0.0f);
         }
+        // Build 103: the lower edge of the band that override applies to.
+        // 0.60 is the old hardcoded value. Lower it toward mono_scope_fov to
+        // pull plain ADS into the override and out of the small-flat-window
+        // presentation. See HeadPose.h at set_fs_fov_lo.
+        if (sscanf_s(line, " fullscreen_fov_lo = %f", &v) == 1)
+            headpose::set_fs_fov_lo(v);
         // FRAMES IN FLIGHT (AFR Rev 4 section 15.8, Luke Ross R.E.A.L. does the
         // same under alternate-frame stereo). 0 leaves the engine's own value
         // untouched, so this key is a no-op until it is set; 1..16 caps the
@@ -587,6 +821,16 @@ void load_config() {
             g_aim_source.store(v >= 0.5f ? 1 : 0, std::memory_order_relaxed);
         if (sscanf_s(line, " aim_on_start = %f", &v) == 1)
             g_aim_on_start.store(v >= 0.5f ? 1 : 0, std::memory_order_relaxed);
+        // Build 84: hip-fire barrel aim. Hot-reloadable on purpose, so it can
+        // be armed and disarmed inside one session without a relaunch: this is
+        // the first build that can move impacts off the head and the tester
+        // needs to be able to A/B it against itself.
+        if (sscanf_s(line, " aim_barrel = %f", &v) == 1)
+            g_aim_barrel.store(v >= 1.5f ? 2 : (v >= 0.5f ? 1 : 0),
+                               std::memory_order_relaxed);
+        if (sscanf_s(line, " aim_barrel_max = %f", &v) == 1)
+            g_aim_barrel_max.store(v > 0.01f && v < 1.5f ? v : 0.60f,
+                                   std::memory_order_relaxed);
         if (sscanf_s(line, " hand_markers = %f", &v) == 1)
             g_hand_enable = v > 0.0f;
         // Build 45: weapon-candidate markers. 0 hides them (hot-reload).
@@ -608,12 +852,42 @@ void load_config() {
             g_cfg_wgun = v;
         if (sscanf_s(line, " adapter_check = %f", &v) == 1)
             g_cfg_adapter_check = v > 0.5f;
+        if (sscanf_s(line, " xr_async_wait = %f", &v) == 1)
+            g_cfg_async_wait.store(v > 0.5f ? 1 : 0, std::memory_order_relaxed);
+        if (sscanf_s(line, " xr_wait_timeout_ms = %f", &v) == 1) {
+            int ms = (int)v;
+            if (ms < 5)    ms = 5;      // below a frame is pointless
+            if (ms > 5000) ms = 5000;   // above this the game is frozen anyway
+            g_cfg_wait_timeout.store(ms, std::memory_order_relaxed);
+        }
         if (sscanf_s(line, " wbaxis = %f", &v) == 1)
             g_cfg_wbaxis = v;
         if (sscanf_s(line, " wgun_smooth = %f", &v) == 1)
             g_cfg_wgun_smooth = v;
         if (sscanf_s(line, " wgun_maxstep_deg = %f", &v) == 1)
             g_cfg_wgun_maxstep = v;
+        if (sscanf_s(line, " wgun_twohand = %f", &v) == 1)
+            g_cfg_wgun_twohand = v;
+        if (sscanf_s(line, " wgun_two_agree = %f", &v) == 1)
+            g_cfg_wgun_two_agree = v;
+        if (sscanf_s(line, " wgun_two_auto = %f", &v) == 1)
+            g_cfg_wgun_two_auto = v;
+        if (sscanf_s(line, " wgun_grip_bypass = %f", &v) == 1) {
+            g_cfg_wgun_grip_bypass = v;
+            camera::set_wgun_grip_bypass(v >= 0.5f ? 1 : 0);
+        }
+        if (sscanf_s(line, " ipd_swap = %f", &v) == 1) {
+            g_cfg_ipd_swap = v;
+            camera::set_ipd_sign(v >= 0.5f ? -1 : 1);
+        }
+        if (sscanf_s(line, " main_hand = %f", &v) == 1) {
+            g_cfg_main_hand = v;
+            g_main_hand.store(v >= 0.5f ? 1 : 0, std::memory_order_relaxed);
+        }
+        if (sscanf_s(line, " wgun_roll = %f", &v) == 1)
+            g_cfg_wgun_roll = v;
+        if (sscanf_s(line, " wgun_roll_deg = %f", &v) == 1)
+            g_cfg_wgun_roll_deg = v;
         if (sscanf_s(line, " wgun_pos = %f", &v) == 1)
             g_cfg_wgun_pos = v;
         if (sscanf_s(line, " wgun_pos_scale = %f", &v) == 1)
@@ -624,6 +898,15 @@ void load_config() {
             g_cfg_wgun_pos_smooth = v;
         if (sscanf_s(line, " wgun_dz = %f", &v) == 1)
             g_cfg_wgun_dz = v;
+        // Build 99: the grip. All default 0, which is the build 98 behaviour.
+        if (sscanf_s(line, " wgun_grip_fwd = %f", &v) == 1)
+            g_cfg_wgun_grip_fwd = v;
+        if (sscanf_s(line, " wgun_grip_lat = %f", &v) == 1)
+            g_cfg_wgun_grip_lat = v;
+        if (sscanf_s(line, " wgun_grip_up = %f", &v) == 1)
+            g_cfg_wgun_grip_up = v;
+        if (sscanf_s(line, " wgun_grip_two = %f", &v) == 1)
+            g_cfg_wgun_grip_two = v;
         if (sscanf_s(line, " wnode = %f", &v) == 1)
             g_cfg_wnode = v;
         if (sscanf_s(line, " wnode_dz = %f", &v) == 1)
@@ -687,6 +970,14 @@ void load_config() {
             aimtrace::set_bullet_yaw(v);
         }
         // Build 62: bullets follow the controller ray. 0 off, 1 on.
+        // Build 107: spoken test instructions. 0 silences them.
+        if (sscanf_s(line, " voice = %f", &v) == 1)
+            voice::set_enabled(v > 0.0f);
+        // Build 105: the aiming-point A/B. See AimTrace.h.
+        if (sscanf_s(line, " aimpoint_ab_m = %f", &v) == 1)
+            g_cfg_aimpoint_m = v;
+        if (sscanf_s(line, " aimpoint_ab = %f", &v) == 1)
+            aimtrace::set_aimpoint_ab(v > 0.0f, g_cfg_aimpoint_m);
         if (sscanf_s(line, " bullet_ctrl = %f", &v) == 1)
             aimtrace::set_bullet_ctrl(v > 0.0f);
         // Build 55: rotate the engine's own aim quaternion. Degrees, 0 off.
@@ -729,6 +1020,17 @@ void load_config() {
     camera::set_wgun_filter(g_cfg_wgun_smooth, g_cfg_wgun_maxstep);
     camera::set_wgun_pos((int)g_cfg_wgun_pos, g_cfg_wgun_pos_scale,
                          g_cfg_wgun_pos_clamp, g_cfg_wgun_pos_smooth);
+    // Build 99: the grip, applied with the rest of the weapon block so a cfg
+    // save is the way back from any amount of tuner wandering.
+    camera::set_wgun_grip(g_cfg_wgun_grip_fwd, g_cfg_wgun_grip_lat,
+                          g_cfg_wgun_grip_up, g_cfg_wgun_grip_two);
+    camera::set_wgun_twohand((int)g_cfg_wgun_twohand);
+    camera::set_wgun_two_agree(g_cfg_wgun_two_agree);
+    camera::set_wgun_two_auto((int)g_cfg_wgun_two_auto);
+    g_main_hand.store(g_cfg_main_hand >= 0.5f ? 1 : 0, std::memory_order_relaxed);
+    camera::set_ipd_sign(g_cfg_ipd_swap >= 0.5f ? -1 : 1);
+    camera::set_wgun_grip_bypass(g_cfg_wgun_grip_bypass >= 0.5f ? 1 : 0);
+    camera::set_wgun_roll((int)g_cfg_wgun_roll, g_cfg_wgun_roll_deg);
     camera::set_wgun((int)g_cfg_wgun, g_cfg_wgun_dz);
     camera::set_wbaxis((int)g_cfg_wbaxis);
     camera::set_wnode((int)g_cfg_wnode, g_cfg_wnode_dz);
@@ -858,8 +1160,35 @@ void aim_pump(float head_yaw, float head_pitch) {
     // territory) and while toggled off. While paused the baseline re-zeroes
     // every frame, so resuming never snaps: aim continues from wherever the
     // engine has it, tracking head MOVEMENT from that moment on.
-    const bool live = g_vraim_on &&
-                      headpose::read_fov(0.7853982f) >= 0.65f;
+    // Build 84: the 0.65 floor is hazard-25 territory (ADS and optics), and it
+    // is why head-driven injection pauses when you aim. Barrel aim cannot live
+    // with that, because the right trigger engages ADS at 0.55 and only fires
+    // at 0.90, so the fov is ALWAYS down by the time a round leaves. While the
+    // barrel loop is actively driving, the floor drops to the real-optics
+    // threshold instead. A magnified scope is still excluded, which is the case
+    // hazard 25 was actually written for: there the engine owns the sight
+    // picture and the compose already stands down.
+    // Build 88: BARREL AIM MUST NOT BE GATED ON THE HEAD-AIM TOGGLE.
+    //
+    // g_vraim_on is Numpad Decimal, "VR head aim", and it defaults to OFF.
+    // Build 84 left it in front of everything, so on the 2026-08-14 headset run
+    // the barrel loop computed correct errors off the real barrel (frames=646,
+    // src=barrel, err a few degrees) and handed every one of them to a pump
+    // that was switched off: "injected 0 presents". The aim therefore stayed
+    // exactly where the engine had it, which in this engine means the camera,
+    // which means the head. The feature looked completely dead while in fact
+    // only its last step was disabled.
+    //
+    // The two are also logically opposed. Head aim means "my head steers the
+    // gun"; barrel aim means "my hands steer the gun". Requiring the first to
+    // be on before the second can act is backwards, and it is why the tester
+    // reported "aim still follows head" on a build where the barrel direction
+    // was being computed correctly all along.
+    const float aim_fov = headpose::read_fov(0.7853982f);
+    const bool bar_want = g_bar_want.load(std::memory_order_relaxed);
+    const bool live = (g_vraim_on || bar_want) &&
+                      (aim_fov >= 0.65f ||
+                       (bar_want && aim_fov >= headpose::mono_scope_fov()));
 
     // Build 49 fix 2: complete a pending recenter resync. New injections
     // pause until it lands; the kicker unblocks a parasitic stall so this
@@ -1153,6 +1482,123 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
             }
             if (g_ctl_have) { ay = g_ctl_yaw; ap = g_ctl_pitch; }
         }
+
+        // -------------------------------------------------------------------
+        // BUILD 84: aim_barrel. See the state block at the top of the file for
+        // why this is allowed where aim_source = 1 was not.
+        //
+        // While the RIGHT TRIGGER is held, the pump's target stops being "where
+        // the head points" and becomes "where the head points, plus however far
+        // the barrel is off the engine's current aim". Once the engine absorbs
+        // that error its aim IS the barrel, the error reads zero, and the term
+        // vanishes. Release the trigger and the target is the plain head angle
+        // again, so nothing is left driving.
+        //
+        // Both vectors are ENGINE WORLD SPACE and the difference of two angles
+        // in one frame is frame-independent, which is why this can be added to
+        // ay/ap even though those live in the recentered reference frame. Doing
+        // it as an absolute would have required mapping the barrel into that
+        // frame, which is the kind of basis surgery that has cost this project
+        // whole sessions.
+        // -------------------------------------------------------------------
+        // MODE 1 fires the loop on the trigger. MODE 2 runs it always.
+        //
+        // Mode 2 is what "hip fire follows the barrel like a real gun" actually
+        // requires, and mode 1 cannot be tuned into it. The loop needs a few
+        // frames to converge, and the pump can only inject while the engine is
+        // touching its own aim code (hazard 45, parasitic by design). So on
+        // mode 1 the FIRST round of a pull leaves before the aim has become the
+        // barrel, and for a semi-automatic weapon the first round is the whole
+        // shot. A real weapon is already pointing where it points before the
+        // trigger breaks; it does not start aiming when you pull. Mode 2 keeps
+        // the engine's aim standing on the barrel continuously, so every round
+        // leaves correct with no convergence latency at all.
+        //
+        // THE STANDING CONSTRAINT (2026-08-05) FORBIDS CONTINUOUS AIM CHASING,
+        // and this has to be argued rather than waved past. What it forbids is
+        // "the camera drifts toward my hand while I am doing nothing", which is
+        // a statement about the VIEW. Build 19's compose removes the injected
+        // aim before composing the head, so the view is meant to stay put. If
+        // it does, mode 2 breaks no constraint: the body turns, the view does
+        // not. If it does not, then mode 1 is equally broken and merely hides
+        // it behind the trigger. Mode 2 is therefore the honest test of the
+        // architecture and mode 1 is the fallback, which is why both ship.
+        //
+        // Mode 2 requires the REAL barrel and will not run off the ctrl_ray
+        // fallback. Continuously chasing a raw controller ray with no weapon
+        // under it is build 43, which was rejected outright.
+        const int bmode = g_aim_barrel.load(std::memory_order_relaxed);
+        const bool bar_fire =
+            aimtrace::firing() ||
+            g_fire_lmb.load(std::memory_order_relaxed) ||
+            g_in_trig[1].load(std::memory_order_relaxed) >= 0.90f;
+        g_bar_want.store(bmode == 2 || (bmode == 1 && bar_fire),
+                         std::memory_order_relaxed);
+        if (bmode != 0 && (bmode == 2 || bar_fire)) {
+            float bd[3], vf[3];
+            // barrel_dir is fresh-or-nothing (it returns false unless the
+            // weapon writer has run since the last read), so with wgun = 0 this
+            // falls through to the raw controller ray rather than aiming at a
+            // barrel direction that stopped updating minutes ago. Holstering
+            // stops the publisher too, which is what stands mode 2 down.
+            int src = 0;
+            if (aimtrace::barrel_dir(bd))                  src = 1;
+            else if (bmode != 2 && aimtrace::ctrl_ray(bd)) src = 2;
+            if (!src) {
+                g_bar_nodir.fetch_add(1, std::memory_order_relaxed);
+            } else if (!aimtrace::view_fwd(vf)) {
+                g_bar_noview.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                // Same convention both sides: x right, y forward, z up, so
+                // yaw = atan2(fx, fy) and pitch = asin(fz). Identical to the
+                // extraction the camera hook does on the engine base, which is
+                // what makes the two comparable at all.
+                float bz = bd[2], vz = vf[2];
+                if (bz >  0.9999f) bz =  0.9999f;
+                if (bz < -0.9999f) bz = -0.9999f;
+                if (vz >  0.9999f) vz =  0.9999f;
+                if (vz < -0.9999f) vz = -0.9999f;
+                float ey = wrap_pi(atan2f(bd[0], bd[1]) - atan2f(vf[0], vf[1]));
+                float ep = asinf(bz) - asinf(vz);
+
+                // Build 88: CLAMP THE ERROR, DO NOT REFUSE THE FRAME.
+                //
+                // Build 84 dropped any frame whose error exceeded the cap, on
+                // the reasoning that a tracking pop must not spin the
+                // character. The 2026-08-14 run showed why that is wrong in
+                // continuous mode: overcap=1047 against frames=646, so MORE
+                // frames were thrown away than used. Pointing the gun a long
+                // way off where you are looking is the whole point of the
+                // feature, not a fault, and it produces exactly the large
+                // errors the cap was rejecting. Worse, refusing is
+                // self-defeating: the error stays large, so the next frame is
+                // refused too, and it never converges.
+                //
+                // Clamping keeps the safety property that matters (no single
+                // frame can swing the aim further than the cap) while still
+                // walking a genuine large divergence down over a few frames.
+                // The pump's own 0.30 rad per-injection limit still applies on
+                // top. Nonsense input is still refused outright, but by a NaN
+                // check rather than by magnitude, because magnitude cannot
+                // distinguish a tracking pop from a deliberate wide hold.
+                const float cap = g_aim_barrel_max.load(std::memory_order_relaxed);
+                if (!(ey == ey) || !(ep == ep)) {
+                    g_bar_nodir.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    if (ey >  cap) { ey =  cap; g_bar_clamp.fetch_add(1, std::memory_order_relaxed); }
+                    if (ey < -cap) { ey = -cap; g_bar_clamp.fetch_add(1, std::memory_order_relaxed); }
+                    if (ep >  cap) { ep =  cap; g_bar_clamp.fetch_add(1, std::memory_order_relaxed); }
+                    if (ep < -cap) { ep = -cap; g_bar_clamp.fetch_add(1, std::memory_order_relaxed); }
+                    ay = wrap_pi(ay + ey);
+                    ap = ap + ep;
+                    g_bar_frames.fetch_add(1, std::memory_order_relaxed);
+                    g_bar_diag[0].store(ey, std::memory_order_relaxed);
+                    g_bar_diag[1].store(ep, std::memory_order_relaxed);
+                    g_bar_src.store(src, std::memory_order_relaxed);
+                }
+            }
+        }
+
         aim_pump(ay, ap);
 
         // Build 24: place the aim reticle at the controller ray's offset
@@ -1372,6 +1818,78 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
                     pok = isfinite(pw[0]) && isfinite(pw[1]) && isfinite(pw[2]);
                 }
                 aimtrace::set_ctrl_pos(pw, pok);
+            }
+
+            // 2026-08-13: the LEFT controller's position, for the two-handed
+            // weapon. Deliberately a copy of the block above with the hand
+            // index changed, rather than a shared helper: that block is the
+            // headset-verified route (build 42's hand markers, build 81's
+            // world step) and the cheapest way to be sure the left hand lands
+            // in the same space as the right is to walk the identical path.
+            {
+                float pl[3] = {};
+                bool  plok  = false;
+                float Rl[9], Cl[3];
+                if (g_head_pos_ok &&
+                    g_in_track[0].load(std::memory_order_relaxed) &&
+                    camera::base_frame(Rl, Cl)) {
+                    const float lrel[3] = {
+                        g_in_pos[0][0].load(std::memory_order_relaxed) -
+                            g_head_pos[0],
+                        g_in_pos[0][1].load(std::memory_order_relaxed) -
+                            g_head_pos[1],
+                        g_in_pos[0][2].load(std::memory_order_relaxed) -
+                            g_head_pos[2]};
+                    float lv[3];
+                    quat_rotate_inv(q, lrel, lv);  // +x right, +y up, -z fwd
+                    const float lx = lv[0], lf = -lv[2], lu = lv[1];
+                    pl[0] = Cl[0] + lx * Rl[0] + lf * Rl[3] + lu * Rl[6];
+                    pl[1] = Cl[1] + lx * Rl[1] + lf * Rl[4] + lu * Rl[7];
+                    pl[2] = Cl[2] + lx * Rl[2] + lf * Rl[5] + lu * Rl[8];
+                    plok = isfinite(pl[0]) && isfinite(pl[1]) && isfinite(pl[2]);
+                }
+                aimtrace::set_ctrl_pos_l(pl, plok);
+            }
+
+            // 2026-08-13: the RIGHT controller's UP vector, so the weapon can
+            // carry wrist roll. Identical to the aim-ray block above except
+            // that the reference vector is the controller's local +Y instead
+            // of its local -Z. Publishing a second VECTOR rather than the
+            // whole quaternion is deliberate: the basis change below is a
+            // signed permutation that has been verified for vectors, and
+            // re-expressing a quaternion under it would need its own
+            // derivation and its own headset test to trust.
+            {
+                float uw[3] = {};
+                bool  uok   = false;
+                float Ru[9], Cu[3];
+                if (g_head_pos_ok &&
+                    g_in_track[1].load(std::memory_order_relaxed) &&
+                    camera::base_frame(Ru, Cu)) {
+                    const Quat c{g_in_ori[1][0].load(std::memory_order_relaxed),
+                                 g_in_ori[1][1].load(std::memory_order_relaxed),
+                                 g_in_ori[1][2].load(std::memory_order_relaxed),
+                                 g_in_ori[1][3].load(std::memory_order_relaxed)};
+                    if (c.x != 0.0f || c.y != 0.0f || c.z != 0.0f || c.w != 0.0f) {
+                        const float up_ref_in[3] = {0.0f, 1.0f, 0.0f};
+                        const Quat cconj{-c.x, -c.y, -c.z, c.w};
+                        float ur[3];
+                        quat_rotate_inv(cconj, up_ref_in, ur);
+                        float lv[3];
+                        quat_rotate_inv(q, ur, lv);
+                        const float lx = lv[0], lf = -lv[2], lu = lv[1];
+                        uw[0] = lx * Ru[0] + lf * Ru[3] + lu * Ru[6];
+                        uw[1] = lx * Ru[1] + lf * Ru[4] + lu * Ru[7];
+                        uw[2] = lx * Ru[2] + lf * Ru[5] + lu * Ru[8];
+                        const float m = sqrtf(uw[0]*uw[0] + uw[1]*uw[1] +
+                                              uw[2]*uw[2]);
+                        if (m > 0.5f) {
+                            uw[0] /= m; uw[1] /= m; uw[2] /= m;
+                            uok = true;
+                        }
+                    }
+                }
+                aimtrace::set_ctrl_up(uw, uok);
             }
             // Build 72: the game's own aim direction, from the same basis and
             // the same instant. Rows of Rw are right/forward/up, so row 1 is
@@ -1678,6 +2196,27 @@ bool create_blit_resources(const d3d11::State& st) {
         D3D11_DEPTH_STENCIL_DESC dd{};   // depth and stencil both disabled
         ok = SUCCEEDED(st.device->CreateDepthStencilState(&dd, &g_blit_dss));
     }
+    if (ok) {
+        // 2026-08-12: straight alpha blending, for the settings panel only.
+        // Menu::render() clears its target to alpha 0.92, so the panel is
+        // meant to sit slightly translucent over the game rather than punch a
+        // hole in it. Every other draw in this file stays opaque.
+        D3D11_BLEND_DESC bd{};
+        bd.RenderTarget[0].BlendEnable           = TRUE;
+        bd.RenderTarget[0].SrcBlend              = D3D11_BLEND_SRC_ALPHA;
+        bd.RenderTarget[0].DestBlend             = D3D11_BLEND_INV_SRC_ALPHA;
+        bd.RenderTarget[0].BlendOp               = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].DestBlendAlpha        = D3D11_BLEND_INV_SRC_ALPHA;
+        bd.RenderTarget[0].BlendOpAlpha          = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        // Optional, like the dot shader: losing it costs the panel, never the
+        // blit, so it does not join the `ok` chain that gates VR itself.
+        if (FAILED(st.device->CreateBlendState(&bd, &g_menu_blend))) {
+            g_menu_blend = nullptr;
+            LOG_WARN("VR: menu blend state creation failed; panel will be opaque.");
+        }
+    }
     if (!ok) {
         LOG_ERROR("VR: 11a blit state creation failed; blit disabled.");
         if (g_blit_dss)  { g_blit_dss->Release();  g_blit_dss  = nullptr; }
@@ -1868,6 +2407,44 @@ bool blit_into(int eye, ID3D11DeviceContext* ctx, float fovy) {
             ctx->PSSetShader(g_blit_ps, nullptr, 0);
         }
 
+        // 2026-08-12: the settings panel, drawn last so it sits over
+        // everything else. Same viewport-as-bounding-box trick as the markers,
+        // which is all it needs: the blit vertex shader already spreads uv 0..1
+        // across whatever viewport is set, so pointing it at the menu texture
+        // and sizing the viewport to the panel IS the draw.
+        //
+        // Placed HEAD LOCKED at zero disparity, exactly like the aim reticle:
+        // identical angular offset in both eyes, so the panel reads as a
+        // comfortable heads-up surface at optical infinity and text does not
+        // fight the eyes. A world-locked panel would need a real quad with a
+        // per-eye matrix, because turning your head makes it a general
+        // quadrilateral that a viewport rectangle cannot express.
+        //
+        // g_menu_srv is produced once per frame by on_present. If the panel is
+        // shut this is null and the whole block costs one branch.
+        if (g_menu_srv) {
+            const float half_w = kMenuHalfTanX;
+            const float half_h = kMenuHalfTanX * ((float)menu::kMenuH / (float)menu::kMenuW);
+            const float rx = half_w * g_sx[eye];
+            const float ry = half_h * g_sy[eye];
+            D3D11_VIEWPORT mv;
+            mv.TopLeftX = g_cx[eye] - rx;
+            mv.TopLeftY = g_cy[eye] - ry;
+            mv.Width    = 2.0f * rx;
+            mv.Height   = 2.0f * ry;
+            mv.MinDepth = 0.0f;
+            mv.MaxDepth = 1.0f;
+
+            const float bf[4] = {0, 0, 0, 0};
+            if (g_menu_blend) ctx->OMSetBlendState(g_menu_blend, bf, 0xFFFFFFFFu);
+            ctx->RSSetViewports(1, &mv);
+            ctx->PSSetShaderResources(0, 1, &g_menu_srv);
+            ctx->Draw(3, 0);
+            if (g_menu_blend) ctx->OMSetBlendState(nullptr, bf, 0xFFFFFFFFu);
+            // Put the eye texture back for anything drawn after this.
+            ctx->PSSetShaderResources(0, 1, &g_last_srv[eye]);
+        }
+
         // 11a.2 one-shot probe: read one pixel of the blit source and one of
         // the canvas after the draw. Runs once per run, a few seconds in (so
         // its note cannot clobber the canvas note), Map stall accepted as a
@@ -2003,6 +2580,95 @@ bool create_canvases(const d3d11::State& st, const XrView views[2]) {
     return true;
 }
 
+// BUILD 118: DEPTH CANDIDATE PROBE. Log only, latched once, then never again.
+//
+// The stale-eye reprojection the project spec calls "the single most important delta
+// from the reference" needs a depth buffer per eye. The mod has never captured
+// one. It does, however, ALREADY hold the game's depth-stencil view: ctx_save
+// calls OMGetRenderTargets and stores s.dsv, purely so ctx_restore can put it
+// back. It has been sitting there, AddRef'd, unread, since build 11a.
+//
+// This reads its description exactly ONCE and reports it. It answers, in a
+// single run and with no new hook, no new signature and no new address:
+//   - does the game even leave a depth-stencil bound at Present (route "a")
+//   - the real DXGI format, expected 19 R32G8X24_TYPELESS
+//   - the real BindFlags, expected 0x48 DEPTH_STENCIL | SHADER_RESOURCE, which
+//     is what makes an SRV possible at all and is the make-or-break fact
+//   - SampleDesc.Count, THE MSAA QUESTION. GRW.ini carries AntiAliasingMode=4
+//     and the engine's own AA option table has MSAA 4x at index 4. If the
+//     scene depth is multisampled the blit needs Texture2DMS and a resolve,
+//     which is a different build. This is the only thing standing between the
+//     project and a working depth blit and it cannot be settled offline.
+//   - the true render resolution. GRW.ini has Supersampling=0.90000 and
+//     0.9 * 3840 = 3456 exactly, so an exact match against st.width would
+//     silently find nothing. Do not predicate on it; measure it.
+//   - whether the engine's debug names survive into retail. If GetPrivateData
+//     returns a name, targets can be identified by string at runtime, which is
+//     exact and immune to description collisions.
+//
+// RULE 8: this is COM work on the render thread, which the rule bans. It is
+// permitted here on the same grounds as create_canvases, which allocates
+// swapchains in this same path: it runs ONCE, is init-shaped, and is gated by
+// a flag that is set before the work rather than after, so a fault inside
+// cannot make it retry every frame. It logs through note(), the deferred
+// buffer, never LOG_INFO directly.
+void probe_depth_once(const CtxState& s) {
+    static bool s_done = false;
+    if (s_done) return;
+    s_done = true;   // set FIRST: one attempt, ever, whatever happens below
+
+    if (!s.dsv) {
+        note_once("VR: 118 depth probe: NO depth-stencil bound at Present. "
+             "Route (a) is dead; the capture must move to OMSetRenderTargets "
+             "(d3d11 vtable slots 33 AND 34, or the UAV-bound passes are missed).");
+        return;
+    }
+
+    ID3D11Resource* res = nullptr;
+    s.dsv->GetResource(&res);
+    if (!res) {
+        note_once("VR: 118 depth probe: DSV bound but GetResource returned null.");
+        return;
+    }
+
+    D3D11_DEPTH_STENCIL_VIEW_DESC vd{};
+    s.dsv->GetDesc(&vd);
+
+    ID3D11Texture2D* tex = nullptr;
+    if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex)) && tex) {
+        D3D11_TEXTURE2D_DESC td{};
+        tex->GetDesc(&td);
+
+        // The engine names most render targets but, per the static pass,
+        // deliberately not this one. Ask anyway: a name here would be a
+        // stronger identifier than any description predicate.
+        char name[128] = {};
+        UINT n = sizeof(name) - 1;
+        const GUID kDebugObjectName =
+            {0x429b8c22, 0x9188, 0x4b0c, {0x87, 0x46, 0xb1, 0xe3, 0xa0, 0xc3, 0xfd, 0xcd}};
+        if (FAILED(tex->GetPrivateData(kDebugObjectName, &n, name)) || !n)
+            strcpy_s(name, "<unnamed>");
+
+        note_once("VR: 118 depth probe: %ux%u fmt=%u samples=%u/%u bind=0x%X "
+             "usage=%u arr=%u mips=%u misc=0x%X dsvfmt=%u dsvdim=%u dsvflags=0x%X "
+             "name=\"%s\" | content=%ux%u %s%s",
+             td.Width, td.Height, (unsigned)td.Format,
+             td.SampleDesc.Count, td.SampleDesc.Quality,
+             td.BindFlags, (unsigned)td.Usage, td.ArraySize, td.MipLevels,
+             td.MiscFlags,
+             (unsigned)vd.Format, (unsigned)vd.ViewDimension, vd.Flags,
+             name, g_content_w, g_content_h,
+             (td.BindFlags & D3D11_BIND_SHADER_RESOURCE)
+                 ? "SRV-BINDABLE" : "NOT SRV-bindable, cannot sample it",
+             td.SampleDesc.Count > 1
+                 ? ", MSAA: needs Texture2DMS and a resolve" : ", single-sample");
+        tex->Release();
+    } else {
+        note_once("VR: 118 depth probe: depth resource is not a Texture2D.");
+    }
+    res->Release();
+}
+
 }  // namespace
 
 bool begin_and_arm();   // build 38, defined below
@@ -2040,24 +2706,54 @@ bool init(const d3d11::State& st) {
     std::vector<XrExtensionProperties> exts(n, {XR_TYPE_EXTENSION_PROPERTIES});
     if (n) xrEnumerateInstanceExtensionProperties(nullptr, n, &n, exts.data());
     bool has_d3d11 = false;
+    // BUILD 118: the list was enumerated and thrown away since build 1, and
+    // "does this runtime expose the depth extension" has been an open
+    // [UNKNOWN] blocking the reprojection work that whole time. It is init
+    // time, so rule 8 does not apply and the lines are free. Log the lot.
+    LOG_INFO("VR: %u instance extension(s):", n);
     for (auto& e : exts) {
+        LOG_INFO("VR:   ext %s v%u", e.extensionName, e.extensionVersion);
         if (!strcmp(e.extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME)) has_d3d11 = true;
+        if (!strcmp(e.extensionName, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME))
+            g_depth_ext = true;
     }
     if (!has_d3d11) {
         LOG_ERROR("VR: runtime does not expose XR_KHR_D3D11_enable. Cannot continue.");
         g_failed.store(true);
         return false;
     }
+    LOG_INFO("VR: XR_KHR_composition_layer_depth %s",
+             g_depth_ext ? "PRESENT, enabling it"
+                         : "ABSENT: compositor stays orientation-only");
 
-    const char* enabled[] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME };
+    // Enabling the depth extension costs nothing on its own: it only matters
+    // once a depth layer is actually chained onto a projection view. Asking
+    // for an extension the runtime advertises cannot fail instance creation,
+    // and if it somehow did we would rather find out here, at init, than at
+    // submit time on the render thread.
+    const char* enabled[2] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME, nullptr };
+    uint32_t    enabled_n  = 1;
+    if (g_depth_ext) enabled[enabled_n++] = XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME;
     XrInstanceCreateInfo ici{XR_TYPE_INSTANCE_CREATE_INFO};
-    ici.enabledExtensionCount = 1;
+    ici.enabledExtensionCount = enabled_n;
     ici.enabledExtensionNames = enabled;
     strcpy_s(ici.applicationInfo.applicationName, "GRW-XR");
     ici.applicationInfo.applicationVersion = 1;
     strcpy_s(ici.applicationInfo.engineName, "AnvilNext");
     ici.applicationInfo.apiVersion = XR_API_VERSION_1_0;
     XrResult r = xrCreateInstance(&ici, &g_instance);
+    // BUILD 118 safety net. This build is the first to ask for a second
+    // extension, and it was deployed without a headset test. If the extra
+    // request is what killed instance creation, fall straight back to the
+    // exact build 117 request rather than losing VR altogether. A mod that
+    // silently drops one optimisation beats a mod that does not start.
+    if (XR_FAILED(r) && enabled_n > 1) {
+        LOG_WARN("VR: xrCreateInstance failed with the depth extension (XrResult %d); "
+                 "retrying with XR_KHR_D3D11_enable alone", (int)r);
+        g_depth_ext = false;
+        ici.enabledExtensionCount = 1;
+        r = xrCreateInstance(&ici, &g_instance);
+    }
     if (XR_FAILED(r)) return fail("xrCreateInstance", r);
 
     XrInstanceProperties ip{XR_TYPE_INSTANCE_PROPERTIES};
@@ -2071,6 +2767,22 @@ bool init(const d3d11::State& st) {
         LOG_ERROR("VR: no headset available (XrResult %d). Is Quest Link connected?", (int)r);
         g_failed.store(true);
         return false;
+    }
+
+    // 2026-08-12: name the HEADSET, not just the runtime. Every tester report
+    // so far has needed a round trip to ask which headset it was, and the
+    // runtime name does not answer it: VirtualDesktopXR and SteamVR both front
+    // several different devices. systemName is the runtime's own string for
+    // the physical hardware, so it lands in the log with no user effort.
+    XrSystemProperties sp{XR_TYPE_SYSTEM_PROPERTIES};
+    if (XR_SUCCEEDED(xrGetSystemProperties(g_instance, g_system, &sp))) {
+        LOG_INFO("VR: headset = %s (vendor 0x%04X), max swapchain %ux%u, %u layer(s)",
+                 sp.systemName, sp.vendorId,
+                 sp.graphicsProperties.maxSwapchainImageWidth,
+                 sp.graphicsProperties.maxSwapchainImageHeight,
+                 sp.graphicsProperties.maxLayerCount);
+    } else {
+        LOG_WARN("VR: headset name unavailable (xrGetSystemProperties failed)");
     }
 
     // The runtime dictates which adapter. If the game's device is on a different
@@ -2440,7 +3152,40 @@ bool begin_and_arm() {
 
     LOG_INFO("VR: session begun. Submitting the game frame to the headset.");
     LOG_INFO("VR: build 11f, big flat scope (%.2f rad window) + FP demo", g_scope_disp_fov);
-    LOG_INFO("VR: keys: Home recenter, Numpad 8 first person, Numpad Decimal head aim.");
+    // Build 96: the full live block, not three of it. This line had listed only
+    // Home, 8 and Decimal since build 21 while 1, 3, 4 and 7 were added around
+    // it, so the one place a tester could check what a key does was wrong about
+    // more keys than it was right about.
+    // Build 104: Numpad 4 removed from this list because the key is gone. It
+    // armed the spawn-direction write with no cfg key, and that write lands in
+    // a cosmetic trail object, so it was a hotkey for a retracted lever.
+    // BUILD 129b: this banner is now generated from what the keys ACTUALLY do.
+    // Build 129 moved six digit keys to the preset loader and left this text
+    // advertising the old map, so the log told the tester to press Numpad 8
+    // for first person when Numpad 8 had become an empty preset slot. A stale
+    // key banner is worse than no banner: it is the mod lying about itself.
+    LOG_INFO("VR: keys: F1 panel, F2 first person, Home recenter (Space too, "
+             "but Space also vaults), Numpad 1..9 then 0 LOAD A WHOLE PRESET "
+             "from GRWVR\\presets (each one says its name), Numpad Decimal "
+             "head aim, Numpad Minus palette capture.");
+    LOG_INFO("VR: what moved in build 129: barrel aim, ADS, eye swap and the "
+             "camera pose write are Settings rows in the F1 panel; the "
+             "weapon-draw recorder and first person are Captures rows. The "
+             "numpad digits are presets now.");
+    LOG_INFO("VR: tuning keys: Numpad / world BIGGER, Numpad * world SMALLER "
+             "(ipd_scale, 1.00 = LIFE SIZE, 0.05 a step, clamped 0.00..3.00), "
+             "Numpad + head roll "
+             "into the camera (cam_pose_rot, DIAGNOSTIC: it also makes the "
+             "camera fight yaw and pitch). Saving grwxr.cfg restores its "
+             "values.");
+    LOG_INFO("VR: END starts a GUIDED SPOKEN test run: it clears the "
+             "capture table, talks you through drawing each weapon, and "
+             "tells you when to quit. voice = 0 in grwxr.cfg silences it.");
+    LOG_INFO("VR: THE TUNER (build 99): INSERT cycles which setting is live, "
+             "PAGE UP and PAGE DOWN step it, DELETE resets it. Every press logs "
+             "the name, the value and what it changes. Start with "
+             "wgun_grip_fwd to seat the gun in your hand, then wgun_grip_two "
+             "for the front-hand hold.");
     LOG_INFO("VR: all tuning lives in grwxr.cfg, hot-reloaded ~1 s after any save");
     LOG_INFO("VR: (edit by hand or with cfg_gui.exe). Build 21.");
     LOG_INFO("VR: fullscreen %s, fov %.2f rad; desktop view %s, crop %.2f rad",
@@ -2481,6 +3226,124 @@ bool poll_start() {
     return begin_and_arm();
 }
 
+// ---------------------------------------------------------------------------
+// The frame-wait watchdog, 2026-08-12.
+//
+// xrWaitFrame BLOCKS by design: it is the runtime's frame throttle. Until this
+// build it was called directly on the GAME'S RENDER THREAD, from inside our
+// Present hook. So a runtime that never returns from it never lets the game
+// return from Present either, and the game freezes hard after exactly one
+// frame while our own heartbeat thread carries on logging.
+//
+// That is the exact signature in every failing Virtual Desktop log:
+//
+//     hb 12  frames=1  (+1 in the last second)
+//     hb 13  frames=1  (+0 in the last second)      <- and forever after
+//     head compose: idle (no head pose published)
+//
+// It localises to this call and nowhere else, because D3D11Hook.cpp does
+// frames++ BEFORE it calls us, and the head pose is published eight lines
+// AFTER the wait returns. frames stuck at 1 with no head pose ever published
+// means the thread went in and did not come out. It is not the exclusive
+// fullscreen upsize (that run had upsize disabled and windowed confirmed),
+// not the adapter (LUIDs matched), and not the canvas swapchains (created
+// further down, after xrBeginFrame, never reached).
+//
+// A thread already blocked inside the runtime cannot be rescued, so the only
+// fix that keeps the game alive is to never make the call on the render
+// thread. With xr_async_wait=1 the wait runs on a worker and the render
+// thread waits on it with a timeout. On timeout we skip VR for that frame and
+// return, and the game keeps presenting normally: a flat game beats a frozen
+// one.
+//
+// The healthy path is unchanged in ORDER: one xrWaitFrame, then xrBeginFrame
+// and xrEndFrame on the render thread, exactly as before. Only the thread the
+// wait runs on differs, which is the pipelined pattern the OpenXR frame
+// timing chapter describes. A new wait is only ever requested when none is in
+// flight, so the one-to-one ratio with xrBeginFrame is preserved as well.
+//
+// Default OFF, so every setup that works today is bit-for-bit unaffected
+// until this is confirmed in a headset.
+HANDLE                g_wait_thread  = nullptr;
+HANDLE                g_wait_request = nullptr;   // render -> worker
+HANDLE                g_wait_done    = nullptr;   // worker -> render
+std::atomic<bool>     g_wait_exit{false};
+std::atomic<bool>     g_wait_inflight{false};
+std::atomic<bool>     g_wait_ok{false};
+std::atomic<unsigned> g_wait_stalled{0};
+XrFrameState          g_wait_result{XR_TYPE_FRAME_STATE};
+
+DWORD WINAPI frame_wait_thread(LPVOID) {
+    for (;;) {
+        WaitForSingleObject(g_wait_request, INFINITE);
+        if (g_wait_exit.load(std::memory_order_acquire)) break;
+
+        XrFrameWaitInfo fwi{XR_TYPE_FRAME_WAIT_INFO};
+        XrFrameState    fs{XR_TYPE_FRAME_STATE};
+        // This is the call that may never return. It is now the only thing
+        // this thread does, and this thread owns nothing the game needs.
+        const XrResult r = xrWaitFrame(g_session, &fwi, &fs);
+
+        g_wait_result = fs;
+        g_wait_ok.store(XR_SUCCEEDED(r), std::memory_order_release);
+        SetEvent(g_wait_done);
+    }
+    return 0;
+}
+
+// Idempotent, called from the render thread. Failure here is not fatal: the
+// caller falls back to waiting inline, which is the pre-existing behaviour.
+bool start_wait_thread() {
+    if (g_wait_thread) return true;
+
+    if (!g_wait_request) g_wait_request = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_wait_done)    g_wait_done    = CreateEventW(nullptr, TRUE,  FALSE, nullptr);
+    if (!g_wait_request || !g_wait_done) return false;
+
+    g_wait_thread = CreateThread(nullptr, 0, frame_wait_thread, nullptr, 0, nullptr);
+    return g_wait_thread != nullptr;
+}
+
+// True when fs holds a frame state and the caller may proceed into
+// xrBeginFrame. False means "skip VR this frame and let the game present".
+bool acquire_frame_state(XrFrameState& fs) {
+    XrFrameWaitInfo fwi{XR_TYPE_FRAME_WAIT_INFO};
+
+    if (g_cfg_async_wait.load(std::memory_order_relaxed) == 0 ||
+        !start_wait_thread()) {
+        fs = XrFrameState{XR_TYPE_FRAME_STATE};
+        return XR_SUCCEEDED(xrWaitFrame(g_session, &fwi, &fs));
+    }
+
+    // Only ask for a new wait when the previous one actually came back.
+    if (!g_wait_inflight.exchange(true)) {
+        ResetEvent(g_wait_done);
+        SetEvent(g_wait_request);
+    }
+
+    const DWORD ms = (DWORD)g_cfg_wait_timeout.load(std::memory_order_relaxed);
+    if (WaitForSingleObject(g_wait_done, ms) != WAIT_OBJECT_0) {
+        // Still inside the runtime. Leave it in flight and give the frame back
+        // to the game. note() defers the write off this thread (rule 8).
+        const unsigned n = g_wait_stalled.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 60) {
+            note("VR: xrWaitFrame has not returned for %u frames (%lu ms each). "
+                 "The runtime is not releasing the frame. VR is standing by and "
+                 "the GAME KEEPS RUNNING; before this build the game froze here.",
+                 n, (unsigned long)ms);
+        }
+        return false;
+    }
+
+    g_wait_inflight.store(false, std::memory_order_release);
+    if (g_wait_stalled.exchange(0, std::memory_order_relaxed) >= 60) {
+        note("VR: xrWaitFrame returned again. Resuming submission to the headset.");
+    }
+
+    fs = g_wait_result;
+    return g_wait_ok.load(std::memory_order_acquire);
+}
+
 void on_present(const d3d11::State& st) {
     // Build 8.1: the session survives a doff. Taking the headset off sends
     // STOPPING; build 8 stopped polling events there, never called
@@ -2514,6 +3377,15 @@ void on_present(const d3d11::State& st) {
                     // in every sense; bootstrap both eyes afresh.
                     g_eye[0].valid = false;
                     g_eye[1].valid = false;
+                    // Build 93: and so is the TAG RING, which build 10a missed.
+                    // The pop sits after the !g_active early return, so the
+                    // present that handled STOPPING returned without popping
+                    // while pushes had already stopped. Depth is 1 at almost
+                    // any instant, so a doff leaves exactly one stale tag in
+                    // flight and every pop after this point is off by one,
+                    // which SWAPS THE EYES for the rest of the session with no
+                    // counter moving. See headpose::reset_eye_tags().
+                    headpose::reset_eye_tags();
                     g_active.store(true);
                 } else {
                     g_dead = true;
@@ -2545,11 +3417,25 @@ void on_present(const d3d11::State& st) {
     // resets; the layer poses are raw LOCAL space and unaffected.
     {
         static bool s_was_down = false;
-        const bool down = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
-        if (down && !s_was_down) {
+        // BUILD 129 (owner request, 2026-08-22): "recenter spacebar or
+        // something easy when the game is focused". Space is added BESIDE
+        // Home, not instead of it.
+        //
+        // KNOWN AND ACCEPTED SIDE EFFECT: the mod polls the keyboard, it does
+        // not intercept it. There is no WndProc hook in this tree (the window
+        // in D3D11Hook.cpp is a throwaway for device creation), so the game
+        // sees the same keypress and Space is bound in game. Every recenter on
+        // Space also vaults or jumps. Home does not. Both are live; use
+        // whichever wins by feel.
+        const bool down = (GetAsyncKeyState(VK_HOME)  & 0x8000) != 0 ||
+                          (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+        const bool edge = (down && !s_was_down) ||
+                          menu::fire_pending(menu::kProbeRecenter);
+        if (edge) {
             g_have_ref = false;
             g_aim_resync.store(true, std::memory_order_relaxed);
-            note("VR: recenter requested (Home). Head reference will re-capture.");
+            note("VR: recenter requested (Home, Space or the panel). Head "
+                 "reference will re-capture.");
         }
         s_was_down = down;
     }
@@ -2562,12 +3448,39 @@ void on_present(const d3d11::State& st) {
     // (ipd), 7 4 6 5 3 0 (first-person offsets), 1 2 + (fullscreen fov),
     // / (desktop view).
 
-    // Build 11c/15e/16a: first-person toggle. The offset tuning that shared
-    // this block moved to the cfg.
+    // Build 11c/15e/16a: first-person toggle, on Numpad 8.
+    //
+    // BUILD 129: THE KEY IS GONE, the toggle is not. Numpad 8 is a preset slot
+    // now (dllmain.cpp explains the whole digit row), and first person is the
+    // "First person toggle" row on the panel's Captures page, which has been
+    // there since the probe table was written and is reachable by controller
+    // as of build 128.
+    //
+    // Build 44's reason for folding a recenter into the toggle still stands (a
+    // stale head reference cost a run on 2026-08-05), and it is not lost: Home
+    // has always recentered on its own, and build 129 adds Space beside it.
+    //
+    // What must NOT move out of this poll is the head-hide republish below.
     {
-        static bool s_tog = false;
-        const bool tog = (GetAsyncKeyState(VK_NUMPAD8) & 0x8000) != 0;
-        if (tog && !s_tog) {
+        // BUILD 129b: F2 TOGGLES FIRST PERSON, because 129 took Numpad 8 for a
+        // preset slot and left the tester with no key at all.
+        //
+        // `[VERIFIED, log grwxr-8232]` he pressed Numpad 8 twice and got
+        // "preset 8 is empty" both times, and `[VERIFIED, grwxr-25296]` the
+        // next whole run reports `hide: idle (fp off)` on every status line:
+        // first person was never on, so the camera sat on the third-person
+        // chase rig for the entire session and read as the camera jumping.
+        // Build 129's startup banner still advertised Numpad 8 for it, so the
+        // mod told him to press a key it had just repurposed.
+        //
+        // F2 and not a numpad digit, so all ten preset slots survive: he
+        // already reaches for F1 for the panel, and F2 is the next key along.
+        // The panel's Captures row still fires it and is untested.
+        static bool s_f2 = false;
+        const bool f2 = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
+        const bool f2_edge = f2 && !s_f2;
+        s_f2 = f2;
+        if (menu::fire_pending(menu::kProbeFirstPerson) || f2_edge) {
             const bool on = !headpose::fp_enabled();
             headpose::set_fp_enabled(on);
             // BUILD 44 (user request): the first-person toggle ALSO recenters.
@@ -2576,8 +3489,7 @@ void on_present(const d3d11::State& st) {
             // as "the character faces hard to the left" and cost a run before
             // the log identified it). Folding the recenter into the toggle
             // means the reference is always freshly captured at the moment you
-            // enter first person, looking where you are actually looking, so
-            // that doubt cannot re-enter. Home still recenters on its own.
+            // enter first person, looking where you are actually looking.
             g_have_ref = false;
             g_aim_resync.store(true, std::memory_order_relaxed);
             note("VR: first person %s, and RECENTERED (the head reference "
@@ -2588,8 +3500,23 @@ void on_present(const d3d11::State& st) {
         // Re-published every poll (not only on the edge) so the detour is
         // correct even if FP was toggled before the hook finished installing.
         camera::set_head_hide(headpose::fp_enabled());
-        s_tog = tog;
     }
+    // BUILD 125: Numpad 9 flips the EYE SIGN, live.
+    //
+    // This is the A/B build 93 asked for and that no log line can settle. It
+    // is a hotkey rather than a cfg key because a fusion judgement cannot
+    // survive a relaunch: the eyes adapt over seconds, so the two states have
+    // to be compared back to back on the same view, standing still.
+    //
+    // It SPEAKS, because the tester cannot read a log or a screen mid-test.
+    //
+    // BUILD 129: THE KEY IS GONE, the A/B is not. Numpad 9 is a preset slot
+    // now. The swap is the "Swap the eyes  <<< TRY THIS FIRST" row that build
+    // 125b put on the panel, and the cfg key ipd_swap means a preset can carry
+    // either sign, which is a better A/B than the key was: both signs can now
+    // be a whole config each, loaded back to back on one key press.
+    //
+    // The panel row already speaks through the same voice path.
     // Build 19: Numpad Decimal toggles VR HEAD AIM (repurposed from the
     // build-17 one-shot experiment, which it supersedes). Default off.
     {
@@ -2646,9 +3573,11 @@ void on_present(const d3d11::State& st) {
     bool  built_q_ok = false;
     const int built_eye = headpose::pop_eye_tag(built_q, &built_q_ok);
 
-    XrFrameWaitInfo fwi{XR_TYPE_FRAME_WAIT_INFO};
+    // 2026-08-12: was a bare xrWaitFrame on this, the game's render thread.
+    // See the watchdog block above on_present(). Everything below is reached
+    // only with a frame state in hand, exactly as before.
     XrFrameState fs{XR_TYPE_FRAME_STATE};
-    if (XR_FAILED(xrWaitFrame(g_session, &fwi, &fs))) return;
+    if (!acquire_frame_state(fs)) return;
 
     // Build 8: head pose for this frame's predicted display time, published to
     // the camera hook. No logging here (rule 8); note() defers.
@@ -2688,34 +3617,39 @@ void on_present(const d3d11::State& st) {
         syn.activeActionSets = &aas;
         if (XR_SUCCEEDED(xrSyncActions(g_session, &syn))) {
             uint32_t seen = 0;
+            // BUILD 124: physical hand h is stored in LOGICAL slot s, where
+            // slot 1 is the main (trigger and pivot) hand. With main_hand = 1
+            // this is the identity and the build is byte-identical to 123.
+            const int mh = g_main_hand.load(std::memory_order_relaxed) ? 1 : 0;
             for (int h = 0; h < 2; ++h) {
+                const int s = (mh == 1) ? h : (1 - h);
                 XrSpaceLocation hl{XR_TYPE_SPACE_LOCATION};
                 if (XR_SUCCEEDED(xrLocateSpace(g_aim_space[h], g_space,
                                                fs.predictedDisplayTime, &hl)) &&
                     (hl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
                     (hl.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
-                    seen |= 1u << h;
-                    g_in_track[h].store(true, std::memory_order_relaxed);
-                    g_in_pos[h][0].store(hl.pose.position.x, std::memory_order_relaxed);
-                    g_in_pos[h][1].store(hl.pose.position.y, std::memory_order_relaxed);
-                    g_in_pos[h][2].store(hl.pose.position.z, std::memory_order_relaxed);
-                    g_in_ori[h][0].store(hl.pose.orientation.x, std::memory_order_relaxed);
-                    g_in_ori[h][1].store(hl.pose.orientation.y, std::memory_order_relaxed);
-                    g_in_ori[h][2].store(hl.pose.orientation.z, std::memory_order_relaxed);
-                    g_in_ori[h][3].store(hl.pose.orientation.w, std::memory_order_relaxed);
+                    seen |= 1u << s;
+                    g_in_track[s].store(true, std::memory_order_relaxed);
+                    g_in_pos[s][0].store(hl.pose.position.x, std::memory_order_relaxed);
+                    g_in_pos[s][1].store(hl.pose.position.y, std::memory_order_relaxed);
+                    g_in_pos[s][2].store(hl.pose.position.z, std::memory_order_relaxed);
+                    g_in_ori[s][0].store(hl.pose.orientation.x, std::memory_order_relaxed);
+                    g_in_ori[s][1].store(hl.pose.orientation.y, std::memory_order_relaxed);
+                    g_in_ori[s][2].store(hl.pose.orientation.z, std::memory_order_relaxed);
+                    g_in_ori[s][3].store(hl.pose.orientation.w, std::memory_order_relaxed);
                 } else {
-                    g_in_track[h].store(false, std::memory_order_relaxed);
+                    g_in_track[s].store(false, std::memory_order_relaxed);
                 }
                 XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
                 gi.action = g_act_trig;
                 gi.subactionPath = g_hand[h];
                 XrActionStateFloat tf{XR_TYPE_ACTION_STATE_FLOAT};
                 if (XR_SUCCEEDED(xrGetActionStateFloat(g_session, &gi, &tf)) && tf.isActive)
-                    g_in_trig[h].store(tf.currentState, std::memory_order_relaxed);
+                    g_in_trig[s].store(tf.currentState, std::memory_order_relaxed);
                 gi.action = g_act_grip;
                 tf = {XR_TYPE_ACTION_STATE_FLOAT};
                 if (XR_SUCCEEDED(xrGetActionStateFloat(g_session, &gi, &tf)) && tf.isActive)
-                    g_in_grip[h].store(tf.currentState, std::memory_order_relaxed);
+                    g_in_grip[s].store(tf.currentState, std::memory_order_relaxed);
             }
             g_in_seen.store(seen, std::memory_order_relaxed);
 
@@ -2893,7 +3827,25 @@ void on_present(const d3d11::State& st) {
             const bool blitting = g_canvas_ready && g_blit_ok;
             if (blitting) {
                 ctx_save(st.context, saved);
+
+                // BUILD 118: read the game's depth-stencil description once.
+                // ctx_save has just AddRef'd it for the restore, so it is
+                // guaranteed live here and this borrows it without a second
+                // reference. Latched: one attempt per process, ever.
+                probe_depth_once(saved);
+
+                // 2026-08-12: draw the settings panel's ImGui frame ONCE here,
+                // before either eye is composited, and hand the result to both.
+                // render() is a no-op returning null unless F1 has opened the
+                // panel, so a closed panel costs one call and nothing else.
+                // It must run BEFORE blit_bind: the ImGui DX11 backend sets up
+                // its own pipeline state, and doing that after we bind ours
+                // would leave the eye blit drawing with ImGui's state.
+                g_menu_srv = menu::ready() ? menu::render() : nullptr;
+
                 blit_bind(st.context);
+            } else {
+                g_menu_srv = nullptr;
             }
 
             // Capture the fresh frame into its eye's private texture first:
@@ -3056,6 +4008,11 @@ void on_present(const d3d11::State& st) {
 bool active() { return g_active.load(); }
 
 void drain_log() {
+    // BUILD 119d: drain the one-shot slot FIRST and independently, so a
+    // latched probe can never be lost to a per-frame diagnostic sharing the
+    // other buffer. Exchange, so it prints exactly once.
+    if (g_once_want.exchange(false, std::memory_order_acq_rel))
+        LOG_INFO("%s", g_once_note);
     if (!g_want_log.exchange(false, std::memory_order_acq_rel)) return;
     LOG_INFO("%s", g_deferred);
 }
@@ -3076,6 +4033,28 @@ void drain_input() {
                  g_ctl_diag[3].load(std::memory_order_relaxed) * 57.29578f,
                  g_ctl_diag_ok.load(std::memory_order_relaxed) ? 1 : 0);
     }
+    // Build 84: barrel-aim liveness. Printed whenever the feature is armed,
+    // including when it has never fired, because "armed and did nothing" and
+    // "not armed" look identical in the headset and have different causes.
+    // err is the LAST angular error the loop applied: it should be large on the
+    // first frame of a trigger hold and fall toward zero while held. If it does
+    // not fall, the engine is not absorbing and the pump is the problem, not
+    // this. src distinguishes the real barrel from the ctrl_ray fallback, which
+    // is the difference between testing this feature and testing build 23.
+    if (g_aim_barrel.load(std::memory_order_relaxed) != 0) {
+        LOG_INFO("barrel: mode=%d frames=%u src=%s | last err yaw %+.2f "
+                 "pitch %+.2f deg | skip nodir=%u noview=%u overcap=%u",
+                 g_aim_barrel.load(std::memory_order_relaxed),
+                 g_bar_frames.load(std::memory_order_relaxed),
+                 g_bar_src.load(std::memory_order_relaxed) == 1 ? "barrel" :
+                 g_bar_src.load(std::memory_order_relaxed) == 2 ? "ctrlray" : "-",
+                 g_bar_diag[0].load(std::memory_order_relaxed) * 57.29578f,
+                 g_bar_diag[1].load(std::memory_order_relaxed) * 57.29578f,
+                 g_bar_nodir.load(std::memory_order_relaxed),
+                 g_bar_noview.load(std::memory_order_relaxed),
+                 g_bar_clamp.load(std::memory_order_relaxed));
+    }
+
     const uint32_t seen = g_in_seen.load(std::memory_order_relaxed);
     if (!seen) return;
     float p[2][3], q[2][4], t[2];
@@ -3084,9 +4063,14 @@ void drain_input() {
         for (int i = 0; i < 4; ++i) q[h][i] = g_in_ori[h][i].load(std::memory_order_relaxed);
         t[h] = g_in_trig[h].load(std::memory_order_relaxed);
     }
-    LOG_INFO("input: L%c(%.3f %.3f %.3f) q(%.3f %.3f %.3f %.3f) trig %.2f | "
+    // BUILD 124: L and R here are LOGICAL slots, off hand and main hand. With
+    // main_hand = 0 they are the physical right and left controller in that
+    // order. The tag says which, so no future analysis of this line can be
+    // done against the wrong hand.
+    LOG_INFO("input: [main=%s] L%c(%.3f %.3f %.3f) q(%.3f %.3f %.3f %.3f) trig %.2f | "
              "R%c(%.3f %.3f %.3f) q(%.3f %.3f %.3f %.3f) trig %.2f | "
              "stick rc/act L=%d/%d R=%d/%d",
+             g_main_hand.load(std::memory_order_relaxed) ? "right" : "LEFT",
              (seen & 1u) ? '+' : '-', p[0][0], p[0][1], p[0][2],
              q[0][0], q[0][1], q[0][2], q[0][3], t[0],
              (seen & 2u) ? '+' : '-', p[1][0], p[1][1], p[1][2],
@@ -3134,6 +4118,10 @@ void shutdown() {
         if (g_last[eye])     { g_last[eye]->Release();     g_last[eye]     = nullptr; }
     }
     g_blit_ok = false;
+    // The SRV belongs to Menu.cpp, which frees it in its own shutdown; we only
+    // ever borrowed the pointer, so drop it without releasing it.
+    g_menu_srv = nullptr;
+    if (g_menu_blend) { g_menu_blend->Release(); g_menu_blend = nullptr; }
     if (g_blit_dss)  { g_blit_dss->Release();  g_blit_dss  = nullptr; }
     if (g_blit_rs)   { g_blit_rs->Release();   g_blit_rs   = nullptr; }
     if (g_blit_samp) { g_blit_samp->Release(); g_blit_samp = nullptr; }
@@ -3152,8 +4140,24 @@ void shutdown() {
     }
     if (g_view_space) { xrDestroySpace(g_view_space);    g_view_space = XR_NULL_HANDLE; }
     if (g_space)      { xrDestroySpace(g_space);         g_space = XR_NULL_HANDLE; }
-    if (g_session)   { xrDestroySession(g_session);     g_session = XR_NULL_HANDLE; }
-    if (g_instance)  { xrDestroyInstance(g_instance);   g_instance = XR_NULL_HANDLE; }
+    // 2026-08-12: retire the frame-wait worker. It is only ever idle-waiting on
+    // g_wait_request or blocked inside xrWaitFrame, and the blocked case is the
+    // whole reason this thread exists, so it is never joined: a join would
+    // reintroduce exactly the hang this fix removes, just at shutdown.
+    g_wait_exit.store(true, std::memory_order_release);
+    if (g_wait_request) SetEvent(g_wait_request);
+
+    if (g_wait_inflight.load(std::memory_order_acquire)) {
+        // Tearing the session down underneath a thread that is still inside
+        // xrWaitFrame on it is undefined. This runs at process exit, where the
+        // OS reclaims both handles anyway, so leaking them beats racing.
+        LOG_WARN("VR: the frame-wait worker is still inside xrWaitFrame. Leaving "
+                 "the session and instance for the OS to reclaim rather than "
+                 "destroying them under a blocked thread.");
+    } else {
+        if (g_session)   { xrDestroySession(g_session);     g_session = XR_NULL_HANDLE; }
+        if (g_instance)  { xrDestroyInstance(g_instance);   g_instance = XR_NULL_HANDLE; }
+    }
 }
 
 // Build 21: cfg hot-reload. load_config() is idempotent (every key clamps
@@ -3177,6 +4181,447 @@ void poll_config() {
     s_last = fad.ftLastWriteTime;
     LOG_INFO("VR: grwxr.cfg changed on disk, reloading");
     load_config();
+}
+
+// Build 86: the same facts the 1 Hz "barrel:" log line carries, handed to the
+// in-headset panel so a headset test never needs a log file. See VRMirror.h
+// for why that matters more than it sounds.
+BarrelStatus barrel_status() {
+    BarrelStatus s;
+    s.mode          = g_aim_barrel.load(std::memory_order_relaxed);
+    s.src           = g_bar_src.load(std::memory_order_relaxed);
+    s.frames        = g_bar_frames.load(std::memory_order_relaxed);
+    s.nodir         = g_bar_nodir.load(std::memory_order_relaxed);
+    s.noview        = g_bar_noview.load(std::memory_order_relaxed);
+    s.overcap       = g_bar_clamp.load(std::memory_order_relaxed);
+    s.err_yaw_deg   = g_bar_diag[0].load(std::memory_order_relaxed) * 57.29578f;
+    s.err_pitch_deg = g_bar_diag[1].load(std::memory_order_relaxed) * 57.29578f;
+    return s;
+}
+
+// Build 86: Numpad 1. Cycles the barrel aim so the A/B test can be run from
+// inside the headset instead of from a text editor. Counters are reset on
+// every change, because the question the panel answers ("did it drive the aim
+// this time") is about the mode you just selected, not about a total that
+// carries over from the previous one and reads as a false success.
+void cycle_aim_barrel() {
+    const int next = (g_aim_barrel.load(std::memory_order_relaxed) + 1) % 3;
+    g_aim_barrel.store(next, std::memory_order_relaxed);
+    g_bar_frames.store(0, std::memory_order_relaxed);
+    g_bar_nodir.store(0, std::memory_order_relaxed);
+    g_bar_noview.store(0, std::memory_order_relaxed);
+    g_bar_clamp.store(0, std::memory_order_relaxed);
+    g_bar_src.store(0, std::memory_order_relaxed);
+    LOG_INFO("hotkey: aim_barrel = %d (%s)", next,
+             next == 2 ? "always on" :
+             next == 1 ? "only while firing" : "off");
+}
+
+// Build 86: Numpad 3. OFF is real hip fire, with ADS on the left trigger where
+// the game itself puts it; ON restores the build 14f behaviour where a half
+// pull raises the sights and every shot therefore passes through ADS.
+void toggle_aim_ads() {
+    const bool next = !g_ads_on.load(std::memory_order_relaxed);
+    g_ads_on.store(next, std::memory_order_relaxed);
+    LOG_INFO("hotkey: aim_ads = %d (%s)", next ? 1 : 0,
+             next ? "trigger also aims down sights"
+                  : "hip fire, ADS on the left trigger");
+}
+
+// Build 96: Numpad 0. The gun-jitter control. See VRMirror.h for why it is a
+// key and for the two warnings that come with it.
+//
+// The log line names the CONSEQUENCE, not the variable, because the tester is
+// reading this afterwards to work out which half of an A/B a stretch of the run
+// belongs to, and "cam_selector_pose = 0" tells him nothing on its own.
+void toggle_cam_pose() {
+    const bool next = !headpose::cam_selector_pose();
+    headpose::set_cam_selector_pose(next);
+    camera::reset_head_telemetry();
+    LOG_INFO("hotkey: cam_selector_pose = %d (%s)", next ? 1 : 0,
+             next ? "camera pose write ON: first person and stereo live, and "
+                    "the gun's origin rides the written camera row"
+                  : "camera pose write OFF: first person is a no-op and both "
+                    "eyes get the same image, but the gun's origin is the "
+                    "engine's own camera again (the build 88 configuration). "
+                    "This is a DIAGNOSTIC state, not a setting to keep.");
+}
+
+// Build 97: Numpad / and Numpad *. See VRMirror.h.
+//
+// The log line names which way the WORLD moved, not just the number, because
+// the mapping is the opposite of the intuitive one and the tester is converging
+// this by eye with no reference to check against. A narrower baseline is less
+// parallax, which the brain reads as a more distant and therefore larger
+// object: perceived size scales by (true IPD / rendered baseline).
+void step_ipd_scale(int dir) {
+    const float step = 0.05f;
+    float v = headpose::ipd_scale() + (dir < 0 ? -step : step);
+    // BUILD 117 (owner directive, 2026-08-20): the old band was 0.30..1.50 and
+    // the comment here claimed "there is no legitimate tuning target outside
+    // that". That was wrong, and it cost a test session. The owner reached the
+    // rail while still reporting the near-field gun as crosseyed, which is the
+    // one symptom this control exists to chase. A guess about what a tester
+    // could possibly need is not a safety argument.
+    //
+    // Band is now 0.00..3.00.
+    //
+    // 0.00 IS DELIBERATE AND IT IS THE MOST USEFUL VALUE ON THE DIAL. It means
+    // both eyes receive an identical view: no stereo separation at all. If the
+    // gun STILL doubles at 0.00 then eye separation cannot be the cause, and
+    // the fault is temporal (one eye per frame under AFR, with no stale-eye
+    // reprojection) rather than geometric. That single press decides between
+    // the two remaining candidates without a build, so it is worth more than
+    // any value the old band could reach.
+    //
+    // The runaway-key argument the old comment made still holds, which is why
+    // there is still a clamp at all: 3.00 bounds it, and the step is unchanged.
+    if (v < 0.00f) v = 0.00f;
+    if (v > 3.00f) v = 3.00f;
+    // Snap to the step grid so repeated presses cannot accumulate float drift
+    // into values like 0.7999998 that read as noise in the log.
+    v = floorf(v * 20.0f + 0.5f) / 20.0f;
+    headpose::set_ipd_scale(v);
+    // BUILD 118: SAY WHAT SATURATION COSTS. The old line said only "lower =
+    // bigger world" and never named a nominal value, so there was nothing on
+    // screen to stop at. [VERIFIED, 479-log sweep 2026-08-20] ipd_scale has
+    // only ever been PERSISTED at 0.50 and 0.90; 1.00 has never been run. On
+    // 2026-08-20, minutes after the band was widened, it was driven 0.85 to
+    // 0.00 in 4.1 seconds and then back one step to 0.05, and 0.05 became the
+    // baseline. That is a saturated control, not a chosen value.
+    //
+    // Perceived depth and size both scale as 1/ipd_scale, because the brain
+    // reads a smaller rendered baseline as a more distant, larger world. At
+    // 0.05 the world reads 20x oversize and effectively flat. Printing that
+    // multiplier is the whole fix: a tester cannot knowingly saturate a dial
+    // that tells him what he is giving up. The BAND IS DELIBERATELY UNCHANGED
+    // at 0.00..3.00 (re-clamping is the mistake the project spec already records).
+    if (v >= 0.005f) {
+        LOG_INFO("hotkey: ipd_scale = %.2f (world reads %.1fx life size. "
+                 "1.00 = life size. Depth cues scale as 1/ipd_scale, so far "
+                 "below 1.00 the world goes big and FLAT. Save grwxr.cfg to "
+                 "keep it)", v, 1.0f / v);
+    } else {
+        LOG_INFO("hotkey: ipd_scale = %.2f (MONO: both eyes get the SAME "
+                 "view, no stereo at all. If the gun still doubles here the "
+                 "cause is NOT eye separation. 1.00 = life size)", v);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Build 99: THE TUNER. See VRMirror.h for why it exists and what the keys are.
+//
+// Each row is a name, a getter, a setter, a step, bounds, and one line of help
+// that says what the tester will SEE change. The help matters more than it
+// looks: he is reading these from a log after the fact to work out which half
+// of an A/B a stretch of play belongs to, and a bare number does not tell him.
+//
+// The cfg default is captured the first time a row is touched, not at load, so
+// Delete restores what the file actually said even after a hot-reload changed
+// it under us.
+// ---------------------------------------------------------------------------
+namespace {
+
+float tune_get_grip_fwd() { float v; camera::get_wgun_grip(&v, 0, 0, 0); return v; }
+float tune_get_grip_lat() { float v; camera::get_wgun_grip(0, &v, 0, 0); return v; }
+float tune_get_grip_up()  { float v; camera::get_wgun_grip(0, 0, &v, 0); return v; }
+float tune_get_grip_two() { float v; camera::get_wgun_grip(0, 0, 0, &v); return v; }
+
+void tune_set_grip(int which, float v) {
+    float f, l, u, t;
+    camera::get_wgun_grip(&f, &l, &u, &t);
+    if (which == 0) f = v;
+    if (which == 1) l = v;
+    if (which == 2) u = v;
+    if (which == 3) t = v;
+    camera::set_wgun_grip(f, l, u, t);
+}
+void tune_set_grip_fwd(float v) { tune_set_grip(0, v); }
+void tune_set_grip_lat(float v) { tune_set_grip(1, v); }
+void tune_set_grip_up (float v) { tune_set_grip(2, v); }
+void tune_set_grip_two(float v) { tune_set_grip(3, v); }
+
+float tune_get_ipd() { return headpose::ipd_scale(); }
+void  tune_set_ipd(float v) { headpose::set_ipd_scale(v); }
+
+// Build 103: the ADS presentation, converged by eye. See HeadPose.h.
+// Build 105: the aiming-point A/B, armable from inside the headset.
+float tune_get_apab() { return aimtrace::aimpoint_ab() ? 1.0f : 0.0f; }
+void  tune_set_apab(float v) {
+    aimtrace::set_aimpoint_ab(v >= 0.5f, g_cfg_aimpoint_m);
+}
+float tune_get_apab_m() { return g_cfg_aimpoint_m; }
+void  tune_set_apab_m(float v) {
+    g_cfg_aimpoint_m = v;
+    aimtrace::set_aimpoint_ab(aimtrace::aimpoint_ab(), g_cfg_aimpoint_m);
+}
+
+float tune_get_fs_lo() { return headpose::fs_fov_lo(); }
+void  tune_set_fs_lo(float v) { headpose::set_fs_fov_lo(v); }
+
+float tune_get_roll_deg() { return g_cfg_wgun_roll_deg; }
+void  tune_set_roll_deg(float v) {
+    g_cfg_wgun_roll_deg = v;
+    camera::set_wgun_roll((int)g_cfg_wgun_roll, v);
+}
+
+float tune_get_pos_clamp() { return g_cfg_wgun_pos_clamp; }
+void  tune_set_pos_clamp(float v) {
+    g_cfg_wgun_pos_clamp = v;
+    camera::set_wgun_pos((int)g_cfg_wgun_pos, g_cfg_wgun_pos_scale,
+                         g_cfg_wgun_pos_clamp, g_cfg_wgun_pos_smooth);
+}
+
+// Build 101. Three knobs that a test has already asked about and that were not
+// reachable from inside the headset, so the tester could not answer either
+// question without a cfg edit he has told us he will not make.
+float tune_get_pos_smooth() { return g_cfg_wgun_pos_smooth; }
+void  tune_set_pos_smooth(float v) {
+    g_cfg_wgun_pos_smooth = v;
+    camera::set_wgun_pos((int)g_cfg_wgun_pos, g_cfg_wgun_pos_scale,
+                         g_cfg_wgun_pos_clamp, g_cfg_wgun_pos_smooth);
+}
+
+float tune_get_maxstep() { return g_cfg_wgun_maxstep; }
+void  tune_set_maxstep(float v) {
+    g_cfg_wgun_maxstep = v;
+    camera::set_wgun_filter(g_cfg_wgun_smooth, g_cfg_wgun_maxstep);
+}
+
+// A/B for the shoulder-left rotation reported 2026-08-15. With two-handed aim
+// on, the barrel direction is the line from the rear hand to the front hand;
+// with it off it is the rear controller's own forward. One keypress says which
+// of the two the tester is actually fighting, which is a measurement instead of
+// a theory about where his left hand sits when he shoulders.
+float tune_get_twohand() { return g_cfg_wgun_twohand; }
+float tune_get_two_agree() { return camera::get_wgun_two_agree(); }
+void  tune_set_two_agree(float v) { g_cfg_wgun_two_agree = v; camera::set_wgun_two_agree(v); }
+// BUILD 125: the eye sign, live.
+// BUILD 126: the blob test, live.
+float tune_get_grip_bypass() { return (float)camera::get_wgun_grip_bypass(); }
+void  tune_set_grip_bypass(float v) {
+    const bool on = (v >= 0.5f);
+    g_cfg_wgun_grip_bypass = on ? 1.0f : 0.0f;
+    camera::set_wgun_grip_bypass(on ? 1 : 0);
+}
+
+float tune_get_ipd_swap() { return camera::get_ipd_sign() < 0 ? 1.0f : 0.0f; }
+void  tune_set_ipd_swap(float v) {
+    const bool sw = (v >= 0.5f);
+    g_cfg_ipd_swap = sw ? 1.0f : 0.0f;
+    camera::set_ipd_sign(sw ? -1 : 1);
+}
+
+// BUILD 124: handedness, live. Changing it swaps which physical controller the
+// weapon pivots on, so the weapon filters are reseeded through the same
+// generation counter the other direction-changing settings use.
+float tune_get_main_hand() { return (float)g_main_hand.load(std::memory_order_relaxed); }
+void  tune_set_main_hand(float v) {
+    const int want = (v >= 0.5f) ? 1 : 0;
+    g_cfg_main_hand = (float)want;
+    if (g_main_hand.exchange(want, std::memory_order_relaxed) != want)
+        camera::reseed_wgun();
+}
+
+// BUILD 123: the front-hand detection, so a bad call can be undone in the
+// headset without a cfg edit or a rebuild.
+float tune_get_two_auto() { return (float)camera::get_wgun_two_auto(); }
+void  tune_set_two_auto(float v) {
+    g_cfg_wgun_two_auto = (v >= 0.5f) ? 1.0f : 0.0f;
+    camera::set_wgun_two_auto((int)g_cfg_wgun_two_auto);
+}
+void  tune_set_twohand(float v) {
+    g_cfg_wgun_twohand = (v >= 0.5f) ? 1.0f : 0.0f;
+    camera::set_wgun_twohand((int)g_cfg_wgun_twohand);
+}
+
+struct Tunable {
+    const char* name;
+    float (*get)();
+    void  (*set)(float);
+    float step, lo, hi;
+    const char* help;
+};
+
+// BUILD 101: EVERY RAIL WIDENED. `[USER DIRECTIVE, 2026-08-15]` "you absolutely
+// can not cap things like this you always are too conservative with your cap."
+// He is right and the log proves it: he ran wgun_grip_up into its +0.40 rail and
+// pressed Page Up thirty-one more times against a value that had stopped moving.
+//
+// A rail on a tuning row is not a safety device. The safety device is
+// wgun_pos_clamp, which bounds the FINAL placement no matter what these say. So
+// these exist only to stop a stuck key from running a number to infinity, and
+// they belong far outside any value a person would choose, not just outside the
+// value I guessed at.
+const Tunable kTunables[] = {
+    {"wgun_grip_fwd", tune_get_grip_fwd, tune_set_grip_fwd, 0.02f, -2.00f, 2.00f,
+     "slides the gun ALONG ITS BARREL through your right hand: + puts your hand "
+     "further back on the weapon"},
+    {"wgun_grip_up", tune_get_grip_up, tune_set_grip_up, 0.02f, -2.00f, 2.00f,
+     "raises or lowers the gun in your right hand"},
+    {"wgun_grip_lat", tune_get_grip_lat, tune_set_grip_lat, 0.02f, -2.00f, 2.00f,
+     "shifts the gun left or right in your right hand"},
+    {"wgun_grip_two", tune_get_grip_two, tune_set_grip_two, 0.10f, 0.00f, 1.00f,
+     "the FRONT HAND HOLD: 0 the left hand only points, 1 the handguard lands "
+     "in it, 0.5 splits the difference. Cannot move point of aim"},
+    {"wgun_twohand", tune_get_twohand, tune_set_twohand, 1.00f, 0.00f, 1.00f,
+     "1 aims the gun along the line between your two hands, 0 aims it along the "
+     "right controller alone. Press this if the gun rotates when you shoulder"},
+    {"wgun_grip_bypass", tune_get_grip_bypass, tune_set_grip_bypass, 1.00f, 0.00f, 1.00f,
+     "THE BLOB TEST. Parks the gun ON your tracked hand by ignoring the grip "
+     "offset, so you can see whether the gun lands on the orange marker. Your "
+     "tuned grip values are kept and come back when you turn this off"},
+    {"ipd_swap", tune_get_ipd_swap, tune_set_ipd_swap, 1.00f, 0.00f, 1.00f,
+     "SWAP THE EYES. 1 swapped, 0 as shipped. The F1 panel row is the better "
+     "way. If swapped is the right one, ipd_scale goes back to 1.00 and the "
+     "world stops reading 20x too large"},
+    {"main_hand", tune_get_main_hand, tune_set_main_hand, 1.00f, 0.00f, 1.00f,
+     "WHICH HAND HOLDS THE GRIP AND PULLS THE TRIGGER. 1 right, 0 left. Your "
+     "last run pulled the LEFT trigger 19 times and the right one once, so ADS "
+     "and FIRE were both watching the hand you do not shoot with"},
+    {"wgun_two_auto", tune_get_two_auto, tune_set_two_auto, 1.00f, 0.00f, 1.00f,
+     "1 works out which hand is in FRONT, 0 always assumes the left. Your last "
+     "run measured your RIGHT hand in front, which pointed the gun backwards and "
+     "made the gate refuse every frame. Leave this at 1"},
+    {"wgun_two_agree", tune_get_two_agree, tune_set_two_agree, 0.05f, -1.00f, 1.00f,
+     "THE TWO-HAND GATE. Refuses the front hand when the line between your hands "
+     "disagrees with the right controller. Leave this at 0.35: the refusals were "
+     "the backwards barrel, not a tight gate, and wgun_two_auto is the fix"},
+    {"wgun_roll_deg", tune_get_roll_deg, tune_set_roll_deg, 5.0f, -180.0f, 180.0f,
+     "rotates the gun about its own barrel. Cannot move point of aim"},
+    {"wgun_pos_clamp", tune_get_pos_clamp, tune_set_pos_clamp, 0.05f, 0.05f, 8.00f,
+     "how far the gun may sit from where the engine put it. Raise it if the gun "
+     "will not reach your hand. Watch clamped= in the wgun log line"},
+    {"wgun_pos_smooth", tune_get_pos_smooth, tune_set_pos_smooth, 0.05f, 0.02f, 1.00f,
+     "how hard the gun's POSITION is filtered: 1.00 is raw and instant, lower is "
+     "smoother and laggier. Raise it if the gun feels like it is swimming"},
+    {"wgun_maxstep_deg", tune_get_maxstep, tune_set_maxstep, 2.50f, 0.50f, 90.00f,
+     "the most the gun may ROTATE in one call. Raise it if fast hand turns feel "
+     "rubbery, lower it if tracking pops throw the muzzle"},
+    {"ipd_scale", tune_get_ipd, tune_set_ipd, 0.05f, 0.00f, 3.00f,
+     "eye separation. 1.00 IS LIFE SIZE and has never actually been run. The "
+     "world reads 1/ipd_scale oversize and equally flatter, so 0.05 is a 20x "
+     "giant flat world. 0.00 = both eyes get the SAME view, so if the gun "
+     "still doubles there it is NOT the IPD"},
+    {"aimpoint_ab", tune_get_apab, tune_set_apab, 1.00f, 0.00f, 1.00f,
+     "THE SHOT TEST. Alternates the weapon's aiming point left then right on "
+     "each trigger pull. Fire ten single shots at a wall: ONE group of holes "
+     "or TWO?"},
+    {"aimpoint_ab_m", tune_get_apab_m, tune_set_apab_m, 1.00f, 0.50f, 25.00f,
+     "how far the shot test throws the aiming point each way, in metres"},
+    {"fullscreen_fov_lo", tune_get_fs_lo, tune_set_fs_lo, 0.02f, 0.05f, 1.30f,
+     "AIMING DOWN SIGHTS. Step DOWN past 0.33 to stop ADS drawing as a small "
+     "flat window and make it fill the view like the rest of the game"},
+};
+const int kTunableCount = (int)(sizeof(kTunables) / sizeof(kTunables[0]));
+
+int   g_tune_sel = 0;
+float g_tune_default[kTunableCount] = {};
+bool  g_tune_have_default[kTunableCount] = {};
+
+// BUILD 120: THE TUNER SPEAKS. This was the whole point of the tuner and it
+// was missing.
+//
+// Every tuner press wrote one LOG_INFO line and nothing else. The tester is
+// inside a headset, where the log, the cfg and the desktop screen are all
+// unreachable, which is the exact problem Voice.h was written for ("the mod
+// talks, because the tester cannot read"). So the instruction "press INSERT
+// until it says wgun_grip_two" was unfollowable: nothing ever said anything.
+//
+// Rule 8: say() only copies a string into a queue under a lock and returns,
+// and all COM lives on Voice's own thread. The tuner runs on the hotkey poll,
+// not on Present, which is one of the two callers Voice.h names as intended.
+//
+// The name is shortened for speech: the "wgun_" prefix is dropped and
+// underscores become spaces, so "wgun_grip_two" is spoken "grip two".
+void tune_speak(const Tunable& t, const char* suffix) {
+    const char* n = t.name;
+    if (!strncmp(n, "wgun_", 5)) n += 5;
+    char nice[80];
+    size_t i = 0;
+    for (; n[i] && i + 1 < sizeof(nice); ++i) nice[i] = (n[i] == '_') ? ' ' : n[i];
+    nice[i] = 0;
+    char sp[200];
+    snprintf(sp, sizeof(sp), "%s, %.2f%s", nice, t.get(), suffix ? suffix : "");
+    voice::say(sp);
+}
+
+void tune_capture_default(int i) {
+    if (!g_tune_have_default[i]) {
+        g_tune_default[i] = kTunables[i].get();
+        g_tune_have_default[i] = true;
+    }
+}
+
+}  // namespace
+
+void tuner_cycle() {
+    g_tune_sel = (g_tune_sel + 1) % kTunableCount;
+    const Tunable& t = kTunables[g_tune_sel];
+    tune_capture_default(g_tune_sel);
+    LOG_INFO("tuner: [%d/%d] %s = %.2f  (Page Up / Page Down step by %.2f, "
+             "Delete resets). %s",
+             g_tune_sel + 1, kTunableCount, t.name, t.get(), t.step, t.help);
+    tune_speak(t, nullptr);
+}
+
+// Build 101: `mult` is 10 while Shift is held, so a knob that needs 30 cm of
+// travel costs three presses instead of fifteen. Same reason the rails moved:
+// the tester should never be grinding a key to reach a value.
+//
+// AND IT SAYS WHEN IT IS RAILED. Build 99 printed the same number over and over
+// while the tester kept pressing, with nothing in the line to distinguish "this
+// moved" from "this cannot move". That is a probe reporting its own capacity
+// limit, which is measurement rule 2, and it was missing here.
+void tuner_step(int dir, int mult) {
+    const Tunable& t = kTunables[g_tune_sel];
+    tune_capture_default(g_tune_sel);
+    if (mult < 1) mult = 1;
+    const float before = t.get();
+    float v = before + (dir < 0 ? -t.step : t.step) * (float)mult;
+    bool railed = false;
+    if (v < t.lo) { v = t.lo; railed = true; }
+    if (v > t.hi) { v = t.hi; railed = true; }
+    // Snap to the step grid so repeated presses cannot accumulate float drift
+    // into values that read as noise in the log.
+    const float inv = 1.0f / t.step;
+    v = floorf(v * inv + 0.5f) / inv;
+    t.set(v);
+    if (railed && v == before) {
+        LOG_INFO("tuner: %s = %.2f AT ITS %s RAIL (%.2f .. %.2f), pressing again "
+                 "will not move it. Say so and the rail moves",
+                 t.name, v, dir < 0 ? "LOWER" : "UPPER", t.lo, t.hi);
+        tune_speak(t, ", at its limit");
+    } else {
+        LOG_INFO("tuner: %s = %.2f%s  (%s)", t.name, v,
+                 mult > 1 ? "  [coarse x10]" : "", t.help);
+        tune_speak(t, nullptr);
+    }
+}
+
+void tuner_reset() {
+    const Tunable& t = kTunables[g_tune_sel];
+    tune_capture_default(g_tune_sel);
+    t.set(g_tune_default[g_tune_sel]);
+    LOG_INFO("tuner: %s RESET to %.2f (the value it had when you first touched "
+             "it this run; saving grwxr.cfg also restores the file's value)",
+             t.name, g_tune_default[g_tune_sel]);
+    tune_speak(t, ", reset");
+}
+
+// Build 97: Numpad +. See VRMirror.h. This is the control for the reversed
+// head roll reported 2026-08-15, not the fix for it.
+void toggle_cam_pose_rot() {
+    const bool next = !headpose::cam_pose_rot();
+    headpose::set_cam_pose_rot(next);
+    LOG_INFO("hotkey: cam_pose_rot = %d (%s)", next ? 1 : 0,
+             next ? "head rotation composed into the camera basis: ROLL now "
+                    "reaches the content, so it should agree with the pose we "
+                    "advertise. The camera will also fight you on yaw and "
+                    "pitch, which is expected and is why this ships off. "
+                    "DIAGNOSTIC only"
+                  : "position-only camera write: the engine keeps its own "
+                    "basis and nothing argues with where you are looking");
 }
 
 }  // namespace vr

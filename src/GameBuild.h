@@ -164,6 +164,35 @@ struct Build {
     // so gating on rcx is MANDATORY. 0 = not derived, installs nothing.
     uintptr_t setworld_thunk;
     uintptr_t setworld_impl;
+
+    // BUILD 105: THE ANCHOR WORLD GETTERS.
+    //
+    // `[VERIFIED, cross-checked in all four binaries]` GR_cWeaponComponent
+    // carries three BoneHandles: m_GunRootBone +0xB0, m_MuzzleShootAnchor
+    // +0xC0, m_AimingPointAnchor +0xD0. They are 16-byte HANDLES, not vectors,
+    // so writing one repoints a bone rather than moving a point. What CAN be
+    // rewritten is the world position each resolves to, and that is what these
+    // two functions return.
+    //
+    //   float4* f(float4* out /*rcx*/, IBallisticGenerator* iface /*rdx*/)
+    //   weapon = rdx - 0x80     (an MSVC multiple-inheritance this-adjustment)
+    //
+    // Both are slots of one reflected method table (stride 0x20): muzzle at
+    // slot RVA 0x04AE4E00, aim point at 0x04AE4E40. Both sit behind proper
+    // E9 + int3-pad, 16-aligned thunks, so ThunkHook installs them unchanged.
+    // These are the first targets this session that needed no body hook.
+    //
+    // The aim getter returns the ZERO VECTOR when its bone does not resolve,
+    // which is the most useful diagnostic in the family, because nothing can
+    // aim at the world origin.
+    //
+    // The class is SHARED WITH AI (m_bPlayerOrReplica +0xEA exists for exactly
+    // that reason), so any write MUST be owner-gated or every NPC in the
+    // province inherits our aim. 0 = not derived, installs nothing (rule 7).
+    uintptr_t aimpt_thunk;
+    uintptr_t aimpt_impl;
+    uintptr_t muzzlept_thunk;
+    uintptr_t muzzlept_impl;
 };
 
 // The table for the binary this process actually loaded, detected once from

@@ -30,7 +30,7 @@
 > anything at all.
 
 > [!WARNING]
-> **SINGLEPLAYER ONLY. Solo campaign, never co-op, never PvP, never matchmaking.**
+> **SINGLEPLAYER OR PRIVATE CO-OP ONLY, never PvP, never matchmaking.**
 > This is a hard rule of the project and it has not changed.
 >
 > Note that the 2026-08-13 title update **removed Easy Anti-Cheat** from the game.

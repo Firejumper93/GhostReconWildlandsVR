@@ -7,7 +7,7 @@ DirectX 11). Head-tracked stereoscopic 3D rendered by the game's own engine and
 injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
 
 > [!IMPORTANT]
-> ### v0.11.0 is out
+> ### v0.11.1 is out
 >
 > **[Download the latest release](https://github.com/Firejumper93/GhostReconWildlandsVR/releases/latest)**
 >
@@ -16,11 +16,12 @@ injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
 >   is the release to try. It also stands down to flat instead of taking the
 >   game with it when something blocks it, so a machine that used to die should
 >   now either work or tell you why.
-> - **The magnified overlay is big enough to shoot through.** Hold the left
->   trigger. Shooting at range works properly for the first time. Built for iron
->   sights and red dots.
-> - **The two-handed hold ships switched off** while it is reworked. One hand on
->   the weapon works well.
+> - **The magnified overlay is big enough to shoot through.** Click the left
+>   thumbstick (L3) to raise it, click again to put it away. Shooting at range
+>   works properly for the first time. Built for iron sights and red dots. The
+>   left trigger stays the game's own aim-down-sights.
+> - **The two-handed hold is on.** Squeeze the left grip with your hand near the
+>   handguard and both hands take the weapon.
 
 > [!WARNING]
 > **SINGLEPLAYER OR PRIVATE CO-OP ONLY, never PvP, never matchmaking.**
@@ -46,8 +47,7 @@ injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
 >
 > **There are still rough edges and they are listed honestly below.** Driving is
 > unfinished and is the next thing being worked on. A magnified scope fitted to a
-> weapon does not work yet. The two-handed hold is off while it is fixed. The mod
-> is right-handed only for now.
+> weapon does not work yet. The mod is right-handed only for now.
 >
 > Each release has closed more of that list than it has opened, and the
 > [Roadmap](#roadmap) says exactly where every piece stands: what works, what is
@@ -158,9 +158,12 @@ verified either disabled itself or is listed here.
   gun is the game's own weapon, placed by writing the bone the engine mounts it
   on, at the instant the engine reads that bone. Rounds leave its muzzle and go
   where it points; see "Motion controls: exactly where this is".
-- **The magnified overlay, for shooting at range.** Hold the left trigger and a
-  magnified picture of whatever the barrel is pointing at appears on the weapon,
-  large enough to aim through as of v0.11.0. Built for iron sights and red dots.
+- **The magnified overlay, for shooting at range.** Click the left thumbstick
+  (L3) and a magnified picture of whatever the barrel is pointing at appears on
+  the weapon, large enough to aim through. Built for iron sights and red dots.
+- **Two-handed weapon handling.** Your rear hand sets where the weapon is, your
+  front hand sets where it points, and twisting your wrist rolls it about its
+  own barrel.
 - **An in-headset settings panel (`F1`).** Driven with the controller, so
   settings that can only be judged by feel while moving can be changed without
   taking the headset off. The panel polls the controller itself rather than
@@ -181,10 +184,8 @@ verified either disabled itself or is listed here.
   body rather than to a nearby NPC.
 - **Your character's head is hidden in first person**, using the engine's own
   head-visibility mechanism, so you no longer see hair or helmet geometry from inside.
-  Hiding is instant on the toggle (the first toggle of a session engages after your
-  first aim). It was disabled from v0.7.0 onward because the engine function had
-  been recompiled; the address was re-derived on 2026-08-15 and it arms again on
-  both current executables.
+  It is hidden at all times, in every state, with no key to press and no aiming
+  needed, and it holds through movement, firing and cover.
 - **The first-person close-range body blur is REMOVED.** Your chest, arms and weapon
   no longer smear when the camera sits at the character's head. This was the top
   complaint from earlier builds.
@@ -225,21 +226,21 @@ controller's ray directly rather than nudging it relative to where the game was
 already aiming. Two of those four had previously been assumed, and both assumptions
 turned out to be wrong, which is most of why this took as long as it did.
 
-### Two-handed handling, and why it ships switched off
+### Two-handed handling
 
 A long gun can be held in two hands: the rear hand sets where it is, the front hand
 sets where it points, and your wrist rolls it about the barrel.
 
-**It ships switched off in v0.11.0**, and that is a deliberate choice rather than a
-gap. Earlier releases described this as flipping at random on hand jitter. A measured
-run has refuted that: whenever the hold engages it is **consistently inverted**, and
-the reason is that the mod has no test for whether your off hand is on the weapon at
-all, only how far apart your hands are. Anywhere between roughly 12 cm and 45 cm of
-separation, "my left hand happens to be there" and "my left hand is on the handguard"
-look identical to it, and shouldering a rifle puts your hands squarely in that band.
-Rather than ship that, it is off while the real fix — an actual on-weapon test — is
-built. One hand on the weapon works well in the meantime, and `wgun_twohand = 1`
-turns the old behaviour back on if you want to try it.
+**It ships on, and it is the part of the build most worth trying.**
+
+Earlier releases described a bug here as the hold flipping at random on hand
+jitter. A measured run has refuted that reading: when it does misbehave it is
+**consistently inverted**, and the reason is that the mod has no test for whether
+your off hand is on the weapon at all, only how far apart your hands are. Anywhere
+between roughly 12 cm and 45 cm of separation, "my left hand happens to be there"
+and "my left hand is on the handguard" look identical to it. The fix is an actual
+on-weapon test and it is being built. If it bothers you in the meantime,
+`wgun_twohand = 0` gives you a one-handed hold.
 
 ### What is still coming
 
@@ -290,13 +291,12 @@ watched working through a headset rather than inferred from a log.
 
 ## Known limitations (honest list)
 
-- **The two-handed hold ships switched off in v0.11.0**, and that is a
-  deliberate choice rather than a gap. A measured run showed it is not flipping
-  on jitter as previously reported: whenever it engages it is consistently
-  inverted, because the mod tests only how far apart your hands are and not
-  whether your off hand is actually on the weapon. The real fix is an on-weapon
-  test and it is next. One hand on the weapon works well in the meantime, and
-  `wgun_twohand = 1` turns the old behaviour back on if you want it.
+- **The two-handed hold can invert when it engages.** A measured run showed it
+  is not flipping on jitter as older notes said: when it misbehaves it is
+  consistently inverted, because the mod tests only how far apart your hands are
+  and not whether your off hand is actually on the weapon. The real fix is an
+  on-weapon test and it is being built. `wgun_twohand = 0` gives you a
+  one-handed hold if you would rather.
 - **The numpad digits load whole configs now.** Before this release, most of them did
   nothing. Now every digit `1`..`9` and `0` replaces your entire `grwxr.cfg` with a
   preset file. If you have no `GRWVR\presets\` folder they do nothing and the log
@@ -347,7 +347,7 @@ first table once it has been watched working in a headset.
 | **The head, helmet and night vision hidden** | At all times, in every state, with no aiming needed. Holds through movement, firing and cover |
 | **The weapon in your hands** | The game's own weapon, held at the pistol grip, moved by writing the bone the engine mounts it on |
 | **Rounds go where the barrel points** | Fired down the muzzle rather than down your gaze, confirmed on both axes, with a green dot showing you where that is. This was the project's biggest open problem for months |
-| **The magnified overlay** | Hold the left trigger. Large enough to aim through as of v0.11.0. Built for iron sights and red dots |
+| **The magnified overlay** | Click the left thumbstick (L3). Large enough to aim through as of v0.11.0. Built for iron sights and red dots |
 | **Full stereo, head tracked, 72 Hz** | A wide field of view, with the sky and clouds fixed to the world |
 | **Touch controllers as a gamepad** | Sticks, triggers, grips, buttons and menus, so no physical gamepad is needed |
 | **Settings you can change with the headset on** | An in-headset panel on F1, and a config that reloads about a second after you save it |
@@ -357,7 +357,7 @@ first table once it has been watched working in a headset.
 | | |
 |---|---|
 | **Driving** | The view is inverted while driving and the camera can be left off after you get out. Both causes are found: the viewpoint is dropped at a hardcoded distance, and an aim value is not reset when you leave the vehicle. This is the next thing being worked on |
-| **The two-handed hold** | Ships switched off in v0.11.0. It is not flipping on jitter as previously reported: whenever it engages it is consistently inverted, because the mod tests how far apart your hands are rather than whether your off hand is on the weapon. The fix is a real on-weapon test |
+| **The two-handed hold** | It works and ships on, and it is the part of the build most worth trying. It is not flipping on jitter as older notes said: when it does misbehave it is consistently inverted, because the mod tests how far apart your hands are rather than whether your off hand is on the weapon. A real on-weapon test is the fix |
 | **A magnified scope you can look through** | A scope fitted to a weapon still shows you the scope body rather than the target. The game keeps only one camera and has no separate scope render to borrow, so the picture has to be built; the approach other VR shooters use is identified and the groundwork is in |
 | **The startup crash on some machines** | A possible fix ships in v0.11.0 and needs reports from affected machines to confirm. If yours still fails, the log is what helps |
 
@@ -371,10 +371,9 @@ first table once it has been watched working in a headset.
 | **Left-handed support** | The mod is right-handed throughout: the aim ray and the weapon both come from the right controller. This needs doing before a stable release |
 | **Physical weapon handling** | Gesture reloads, magazine changes and grabbing. The weapon is already in your hands, so this is a build rather than a research problem |
 
-**This release (v0.11.0)** carries a possible fix for the startup crash, a
-magnified overlay big enough to shoot through, and the two-handed hold switched
-off while it is reworked. **The next release** is about driving and the
-two-handed hold. A public **beta** follows once driving is solid and a
+**This release (v0.11.1)** carries a possible fix for the startup crash and a
+magnified overlay big enough to shoot through, with the two-handed hold on.
+**The next release** is about driving. A public **beta** follows once driving is solid and a
 previously broken machine has confirmed it starts.
 
 ## Which version of the game do I need?

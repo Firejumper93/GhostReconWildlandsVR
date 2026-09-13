@@ -219,7 +219,7 @@ verified either disabled itself or is listed here.
 This section is deliberately blunt in both directions, because motion controls are
 the thing people care about most and the easiest thing to overstate.
 
-### What now works, confirmed in the headset (2026-08-10)
+### What now works, confirmed in the headset
 
 **The weapon follows your controller, one to one, in position and rotation.** Point
 your hand and the gun points there. Move your hand and the gun moves with it. You
@@ -234,7 +234,7 @@ controller's ray directly rather than nudging it relative to where the game was
 already aiming. Two of those four had previously been assumed, and both assumptions
 turned out to be wrong, which is most of why this took as long as it did.
 
-### Two-handed handling, and the bug in it (2026-08-16 onward)
+### Two-handed handling, and why it ships switched off
 
 A long gun can be held in two hands: the rear hand sets where it is, the front hand
 sets where it points, and your wrist rolls it about the barrel.
@@ -422,11 +422,40 @@ controllers possibly still working. Check `GRWVR\grwxr-<pid>.log` for the
   `ml64`). See **Building** below for the exact toolchain each release used and
   how `build.bat` selects one.
 
-## Quick install (no build needed)
+## Install
 
-Download the latest release zip from the
-[Releases page](https://github.com/Firejumper93/GhostReconWildlandsVR/releases),
-unzip it anywhere, run `install.bat`, and read the included `INSTALL.txt`.
+You do not need to build anything. Download
+**[the latest release](https://github.com/Firejumper93/GhostReconWildlandsVR/releases/latest)**
+and follow these steps.
+
+1. **Set your game resolution first.** Launch the game flat once and set a
+   resolution your card is comfortable with. Too high a setting can crash the
+   game before the menu ever appears, and that looks exactly like the mod
+   failing when it is not.
+2. **Unzip the release anywhere** and run **`install.bat`**. It finds the game
+   by itself - Steam libraries, Ubisoft Connect, or the folder it is sitting in
+   - and asks you for a VR render resolution. If it cannot find the game it
+   asks you for the path.
+3. **If the game lives somewhere Windows protects**, such as
+   `C:\Program Files`, right-click `install.bat` and **Run as administrator**.
+   Without that the files do not copy and the game starts without the mod, with
+   no error to tell you so.
+4. **Set your OpenXR runtime** to the one you actually use - Meta Quest Link,
+   Virtual Desktop (VDXR), or SteamVR - before launching.
+5. **Turn Asynchronous Spacewarp off** (Oculus Debug Tool, or Virtual Desktop's
+   own settings) and **SteamVR reprojection off**. The mod re-presents frames
+   itself and these fight it.
+6. **Launch the game.** First person turns itself on a few seconds after you
+   load in. Press **F1** in the game window for the settings panel.
+
+`INSTALL.txt` inside the zip is the full manual: every control, every setting,
+the graphics baseline, troubleshooting, and how to report a problem. To remove
+the mod, run `uninstall.bat`.
+
+**If the mod has never started for you** - black screen, then the game closes a
+few seconds later - v0.11.0 carries a possible fix for that. See the release
+notes, and send the log if it still happens.
+
 The sections below are for building from source.
 
 ## Building

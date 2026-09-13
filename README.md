@@ -2,101 +2,92 @@
 
 **English** | [Deutsch](README.de.md) | [한국어](README.ko.md)
 
+A native OpenXR VR mod for Tom Clancy's Ghost Recon Wildlands (AnvilNext 2.0,
+DirectX 11). Head-tracked stereoscopic 3D rendered by the game's own engine and
+injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
+
 > [!IMPORTANT]
-> **v0.11.0 is out, and it is the release to try if the mod has never started
-> for you.** It carries a possible fix for the startup crash that has been
-> stopping some people cold, and a magnified overlay that is finally big enough
-> to shoot through.
+> ### v0.11.0 is out
 >
-> | Game update | `TimeDateStamp` | First release that supports it |
-> |---|---|---|
-> | late-July 2026 | `6A692948` | v0.7.0-alpha |
-> | 2026-08-13 ("Last Rites") | `6A75F2F4` | v0.9.0-test1 (never announced as such, which is most of the confusion) |
-> | **2026-08-19** | `6A7C5143` | **v0.9.1-test2 onward, including this one** |
+> **[Download the latest release](https://github.com/Firejumper93/GhostReconWildlandsVR/releases/latest)**
 >
-> v0.8.5-alpha, which is what this page recommended until now, only ever knew the
-> late-July executable. On anything newer it recognises nothing, installs nothing,
-> and logs `build pin: UNKNOWN GRW.exe binary` while the game runs flat. That is
-> the check working, not a crash.
->
-> This is also the first source push in a while: the repository's `main` branch was
-> still at v0.8.5-era code, so the newer work was only ever in release zips. It is
-> all here now.
->
-> **This is a test release and the project is still in testing.** Everything
-> listed under [What works](#what-works) has been played in a headset, but this
-> is a first pass at a lot of it, not a finished one. Treat what ships as the
-> floor rather than the ceiling: it is meant to be good enough to play and good
-> enough to tell us what to fix next. That is exactly what the last few releases
-> have done, and it is why the list under What works keeps growing.
->
-> **English only for now.** The German and Korean pages below were contributed by
-> community members and describe an earlier release; updated translations are
-> planned rather than abandoned.
+> - **A possible fix for the startup crash.** If the mod has never started for
+>   you - black screen, then the game closes eight or nine seconds later - this
+>   is the release to try. It also stands down to flat instead of taking the
+>   game with it when something blocks it, so a machine that used to die should
+>   now either work or tell you why.
+> - **The magnified overlay is big enough to shoot through.** Hold the left
+>   trigger. Shooting at range works properly for the first time. Built for iron
+>   sights and red dots.
+> - **The two-handed hold ships switched off** while it is reworked. One hand on
+>   the weapon works well.
 
 > [!WARNING]
 > **SINGLEPLAYER OR PRIVATE CO-OP ONLY, never PvP, never matchmaking.**
-> This is a hard rule of the project and it has not changed.
->
-> Note that the 2026-08-13 title update **removed Easy Anti-Cheat** from the game.
-> That does not loosen this rule: the mod is built and tested for the campaign,
-> solo or with friends in a private session, and competitive play stays out of
-> scope.
->
-> **THIS IS NOT A COMPLETE VR EXPERIENCE.** This mod is in the EARLY STAGES of
-> development and testing. The rendering side is genuinely good: stereo depth, a
-> fullscreen 4K view, and a real first-person camera anchored to your character's
-> head bone (head hidden, close-range body blur removed).
->
-> **THE WEAPON FOLLOWS YOUR CONTROLLER, as of v0.8.0.** Position and rotation,
-> one to one, confirmed in the headset. It is the game's own weapon, not an
-> overlay: point your hand and the gun points there, move your hand and it goes
-> with you. **Two-handed handling** (rear hand holds, front hand points, wrist
-> rolls the gun) arrived in v0.9.0-test1 and is on by default here, with the
-> caveat below.
->
-> Rounds now leave the muzzle and go where the barrel points, and a green dot
-> shows you where that is. Everything else is
-> unchanged: sticks, buttons, triggers and grips are still read as an ordinary
-> gamepad, so no physical controller is needed.
->
-> **HEAD HIDING IS BACK on the current game version.** It was disabled from
-> v0.7.0 through v0.8.5 because the engine function that hides the head had been
-> recompiled and this mod never guesses an address. That address was re-derived
-> on 2026-08-15, and the hook arms and reports `hide: armed` on both current
-> executables.
->
-> **YOU CAN NOW CHANGE SETTINGS WITHOUT TAKING THE HEADSET OFF.** `F1` opens a
-> settings panel you drive with the controller, and the numpad digits load whole
-> saved configs. Read the numpad warning in
-> [In the headset](#in-the-headset) before you press one.
+> This is a hard rule of the project and it has not changed. The 2026-08-13
+> title update removed Easy Anti-Cheat, and that does not loosen it: the mod is
+> built and tested for the campaign, solo or with friends in a private session,
+> and competitive play stays out of scope.
 
-A native OpenXR VR mod for Tom Clancy's Ghost Recon Wildlands (AnvilNext 2.0, DirectX 11).
-Head-tracked stereoscopic 3D rendered by the game's own engine, injected through a
-`dxgi.dll` proxy. No game files are modified, ever.
+> [!NOTE]
+> ### This is not a complete VR experience yet, and it is getting close to beta
+>
+> It is a real, playable VR mod rather than a proof of concept: stereo depth, a
+> fullscreen head-tracked view, first person that turns itself on, your head and
+> helmet hidden, the game's own weapon in your hands, and rounds that go where
+> the barrel points. All of that has been played in a headset.
+>
+> **Weapon tracking is markedly better than it was.** The weapon follows your
+> controller in position and rotation, one to one - it is the game's own weapon,
+> not an overlay - it is held at the pistol grip rather than the stock, and
+> rounds leave its muzzle and go where it points rather than where you are
+> looking. A green dot shows you where the barrel is aimed. That last part was
+> the project's largest open problem for months.
+>
+> **There are still rough edges and they are listed honestly below.** Driving is
+> unfinished and is the next thing being worked on. A magnified scope fitted to a
+> weapon does not work yet. The two-handed hold is off while it is fixed. The mod
+> is right-handed only for now.
+>
+> Each release has closed more of that list than it has opened, and the
+> [Roadmap](#roadmap) says exactly where every piece stands: what works, what is
+> being fixed, and what is coming.
 
-**Status: experimental alpha, in ongoing development.** Stereo fusion with real depth
-was achieved on 2026-07-29, the fullscreen view on 2026-07-30, 4K internal rendering,
-controller-pointing aim and anchored first person on 2026-08-01/02, head-bone
-first person, head hiding, and continuous 1:1 head aim on 2026-08-03, and Touch
-controllers as an emulated gamepad, controller-pointing hip-fire aim with a reticle,
-and removal of the first-person close-range body blur on 2026-08-03/04. The port to
-the August 2026 "Last Rites" game update was headset-verified on 2026-08-08, and on
-2026-08-10 the weapon itself began tracking the controller in position and rotation.
-Two-handed weapon handling followed on 2026-08-16, head hiding was restored on
-2026-08-15, the in-headset settings panel became driveable on 2026-08-22, and the
-first-person head-bone anchor was re-confirmed in the headset the same day on the
-2026-08-19 game build (72 fps median, 6400 head-bone reads, zero rejects).
-This is a development snapshot, not a finished mod. Expect rough edges. Performance numbers here come from one test
-system; different hardware, headsets, and settings may perform noticeably worse. The
-mod is being actively optimized and improved, so expect frequent changes.
+> [!TIP]
+> ### Testers wanted
+>
+> This has been built and tested largely on one machine, and the most useful
+> thing anyone can do is run it on a different one. Other GPUs, other headsets,
+> other runtimes, AMD and Intel cards, and the Ubisoft Connect and Epic editions
+> are all thinly covered or not covered at all.
+>
+> **Especially wanted: anyone the mod has never worked for.** Startup failures
+> have been the hardest thing to chase precisely because they do not happen here,
+> and every log sent in has moved it forward - the crash work in v0.11.0 exists
+> because of them.
+>
+> [Open an issue](https://github.com/Firejumper93/GhostReconWildlandsVR/issues)
+> with your GPU, headset and runtime, what you did and what happened, and attach
+> `GRWVR\grwxr-<numbers>.log` - the one with digits in the name. Reports that it
+> simply worked are just as useful as reports that it did not.
 
-**If you tested an earlier release** (v0.1.x through v0.3.x): the "flat screen
-floating in space" is long gone. Current builds render a fullscreen, head-tracked,
-stereoscopic view with real depth, let you play on the Touch controllers (emulated
-as a gamepad, not true motion controls), aim by pointing the right controller, and
-support a true first-person mode. If your install still shows a floating window, you are on the old release:
-delete the old `dxgi.dll` and install this one.
+### Which game version
+
+| Game update | `TimeDateStamp` | Supported |
+|---|---|---|
+| late-July 2026 | `6A692948` | yes |
+| 2026-08-13 ("Last Rites") | `6A75F2F4` | yes |
+| **2026-08-19** | `6A7C5143` | **yes, and this is the current one** |
+
+The mod pins itself to executables it recognises and never guesses at addresses.
+On an unrecognised build it installs nothing and logs
+`build pin: UNKNOWN GRW.exe binary` while the game runs flat. That is the check
+working, not a crash.
+
+**English only for now.** The German and Korean pages above were contributed by
+community members and describe an earlier release; updated translations are
+planned rather than abandoned, and the thanks in [Credits](#credits) stand
+regardless.
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, and the
 [Roadmap](#roadmap) below for what is coming and how close it is.

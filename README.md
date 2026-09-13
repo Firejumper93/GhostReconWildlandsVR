@@ -20,8 +20,16 @@ injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
 >   thumbstick (L3) to raise it, click again to put it away. Shooting at range
 >   works properly for the first time. Built for iron sights and red dots. The
 >   left trigger stays the game's own aim-down-sights.
+> - **The head hide is repaired.** In v0.10.0-test1 and every build back to
+>   v0.9.0, your character's head would not hide while you held a weapon. It
+>   hides again now: at all times, in every state, through movement, firing and
+>   cover.
 > - **The two-handed hold is on.** Squeeze the left grip with your hand near the
 >   handguard and both hands take the weapon.
+>
+> **Coming from v0.10.0-test1 or older? This is a large update** - eleven builds
+> of work, and it repairs something that had been broken in every release since
+> v0.9.0.
 
 > [!WARNING]
 > **SINGLEPLAYER OR PRIVATE CO-OP ONLY, never PvP, never matchmaking.**

@@ -3,14 +3,16 @@
 **English** | [Deutsch](README.de.md) | [한국어](README.ko.md)
 
 > [!IMPORTANT]
-> **THE CURRENT GAME VERSION IS SUPPORTED, as of v0.9.1-test2.** If you have been
-> sitting on "the mod does nothing since the update", this is the release for you.
+> **v0.11.0 is out, and it is the release to try if the mod has never started
+> for you.** It carries a possible fix for the startup crash that has been
+> stopping some people cold, and a magnified overlay that is finally big enough
+> to shoot through.
 >
 > | Game update | `TimeDateStamp` | First release that supports it |
 > |---|---|---|
 > | late-July 2026 | `6A692948` | v0.7.0-alpha |
 > | 2026-08-13 ("Last Rites") | `6A75F2F4` | v0.9.0-test1 (never announced as such, which is most of the confusion) |
-> | **2026-08-19** | `6A7C5143` | **v0.9.1-test2, this one** |
+> | **2026-08-19** | `6A7C5143` | **v0.9.1-test2 onward, including this one** |
 >
 > v0.8.5-alpha, which is what this page recommended until now, only ever knew the
 > late-July executable. On anything newer it recognises nothing, installs nothing,
@@ -21,22 +23,25 @@
 > still at v0.8.5-era code, so the newer work was only ever in release zips. It is
 > all here now.
 >
-> **This is a test release, not a polished one.** It carries a lot of new work
-> that has been run in a headset in pieces but never as a packaged release, and
-> it has one known ugly bug in two-handed weapon handling (see
-> [Known limitations](#known-limitations-honest-list)). If you want the calmest
-> thing available and you are still on the old game version, v0.8.5-alpha is
-> that. On the current game version, this is the only release that does
-> anything at all.
+> **This is a test release and the project is still in testing.** Everything
+> listed under [What works](#what-works) has been played in a headset, but this
+> is a first pass at a lot of it, not a finished one. Treat what ships as the
+> floor rather than the ceiling: it is meant to be good enough to play and good
+> enough to tell us what to fix next. That is exactly what the last few releases
+> have done, and it is why the list under What works keeps growing.
+>
+> **English only for now.** The German and Korean pages below were contributed by
+> community members and describe an earlier release; updated translations are
+> planned rather than abandoned.
 
 > [!WARNING]
 > **SINGLEPLAYER OR PRIVATE CO-OP ONLY, never PvP, never matchmaking.**
 > This is a hard rule of the project and it has not changed.
 >
 > Note that the 2026-08-13 title update **removed Easy Anti-Cheat** from the game.
-> That does not loosen this rule: the mod is built and tested for the solo
-> campaign only, and multiplayer remains out of scope. Playing offline (Steam
-> offline mode or Ubisoft Connect offline) is still recommended while testing.
+> That does not loosen this rule: the mod is built and tested for the campaign,
+> solo or with friends in a private session, and competitive play stays out of
+> scope.
 >
 > **THIS IS NOT A COMPLETE VR EXPERIENCE.** This mod is in the EARLY STAGES of
 > development and testing. The rendering side is genuinely good: stereo depth, a
@@ -50,8 +55,8 @@
 > rolls the gun) arrived in v0.9.0-test1 and is on by default here, with the
 > caveat below.
 >
-> Bullets still follow your gaze in this release, so aiming down sights stays
-> the accurate way to shoot. That is the last piece. Everything else is
+> Rounds now leave the muzzle and go where the barrel points, and a green dot
+> shows you where that is. Everything else is
 > unchanged: sticks, buttons, triggers and grips are still read as an ordinary
 > gamepad, so no physical controller is needed.
 >
@@ -160,13 +165,11 @@ verified either disabled itself or is listed here.
   convenient, and it is not what "VR motion controllers" normally means.
 - **THE WEAPON FOLLOWS YOUR CONTROLLER**, position and rotation, one to one. The
   gun is the game's own weapon, placed by writing the bone the engine mounts it
-  on, at the instant the engine reads that bone. Bullets follow your gaze for now;
-  see "Motion controls: exactly where this is".
-- **Two-handed weapon handling.** Your rear hand sets where the weapon is, your
-  front hand sets where it points, and twisting your wrist rolls it about its own
-  barrel. Front-hand authority fades in with hand separation, so bringing your
-  hands together degrades to a one-handed hold rather than to garbage. **This has
-  a known bug in this release**, see Known limitations.
+  on, at the instant the engine reads that bone. Rounds leave its muzzle and go
+  where it points; see "Motion controls: exactly where this is".
+- **The magnified overlay, for shooting at range.** Hold the left trigger and a
+  magnified picture of whatever the barrel is pointing at appears on the weapon,
+  large enough to aim through as of v0.11.0. Built for iron sights and red dots.
 - **An in-headset settings panel (`F1`).** Driven with the controller, so
   settings that can only be judged by feel while moving can be changed without
   taking the headset off. The panel polls the controller itself rather than
@@ -234,32 +237,31 @@ turned out to be wrong, which is most of why this took as long as it did.
 ### Two-handed handling, and the bug in it (2026-08-16 onward)
 
 A long gun can be held in two hands: the rear hand sets where it is, the front hand
-sets where it points, and your wrist rolls it about the barrel. That part works and
-is on by default.
+sets where it points, and your wrist rolls it about the barrel.
 
-**It currently flips 180 degrees at random and the gun appears to split or reverse.**
-The mod decides which hand is in front by a sign test with no deadband and no
-hysteresis, so hand jitter across that boundary flips the sign frame to frame. A
-single instrumented 90-second run recorded **5466 flips**, 61% of the frames where
-both hands were engaged. The cause is understood and the counter that proves it is in
-the log; the fix is not in this release. Set `wgun_twohand = 0` to go back to a
-one-handed hold if it bothers you.
+**It ships switched off in v0.11.0**, and that is a deliberate choice rather than a
+gap. Earlier releases described this as flipping at random on hand jitter. A measured
+run has refuted that: whenever the hold engages it is **consistently inverted**, and
+the reason is that the mod has no test for whether your off hand is on the weapon at
+all, only how far apart your hands are. Anywhere between roughly 12 cm and 45 cm of
+separation, "my left hand happens to be there" and "my left hand is on the handguard"
+look identical to it, and shouldering a rifle puts your hands squarely in that band.
+Rather than ship that, it is off while the real fix — an actual on-weapon test — is
+built. One hand on the weapon works well in the meantime, and `wgun_twohand = 1`
+turns the old behaviour back on if you want to try it.
 
 ### What is still coming
 
-**Bullets follow your gaze rather than the gun**, so aiming down sights is still the
-accurate way to shoot. This remains the last big piece. The previous approach shipped
-disabled after being ruled out by construction rather than by tuning: it steered the
-game's aim onto the barrel, but in this engine the aim *is* the camera, so both sides
-of the error moved together and it could never settle. A comparison against six other
-VR mods for closed engines, done 2026-08-22, has since identified which route the
-mods that solved this used, and that is what the work is now on.
+**Rounds go where the barrel points.** This was the project's biggest open
+problem for months and it is solved: the weapon fires down its own muzzle rather
+than down your gaze, confirmed on both axes in a headset, with a green dot showing
+you where the barrel is aimed. You can shoot from the hip and hit what you are
+pointing at.
 
-**Hip-fire spread is untouched**, so even a correctly pointed barrel scatters.
-**Your character's arms do not follow the weapon**, so the gun can look detached
-from the body. **There are still no hands and no gesture-based weapon manipulation**:
+**Your hands hold the weapon**, at the pistol grip. Forearms are deliberately
+hidden rather than shown wrong. **There is no gesture-based weapon manipulation**:
 no grabbing, no gesture reloads, no physical mag changes. Reload, swap and vehicle
-entry are ordinary button presses.
+entry are ordinary button presses. **The mod is right-handed only** for now.
 
 ### Everything else about the controls
 
@@ -272,10 +274,11 @@ That part is gamepad emulation rather than motion control, and this README will 
 call it anything else. Turning the weapon feature off (`wgun = 0` in the config)
 gives you exactly the v0.7.0 behaviour back.
 
-**Aiming down sights stays consistent** under head aim, because the game draws its
-sight picture at view centre and that is exactly where your bullets go. Optics are
-head-anchored rather than gun-anchored. Since bullets follow your gaze, aiming down
-sights remains the accurate way to shoot in this release.
+**The magnified overlay is how you shoot at range.** Hold the left trigger and a
+magnified picture of what the barrel is pointing at appears on the weapon. It is
+built for iron sights and red dots and works well on those; a magnified scope
+fitted to the weapon shows you the scope body instead, so fit iron sights or a red
+dot for long shots. A real scope picture is being worked on.
 
 ### Why this takes the time it takes
 
@@ -296,10 +299,13 @@ watched working through a headset rather than inferred from a log.
 
 ## Known limitations (honest list)
 
-- **The two-handed hold flips 180 degrees at random**, so the gun appears to split
-  and reform and reads as reversed every so often. Understood, measured (5466 flips
-  in one 90-second run), not fixed in this release. Workaround:
-  `wgun_twohand = 0`.
+- **The two-handed hold ships switched off in v0.11.0**, and that is a
+  deliberate choice rather than a gap. A measured run showed it is not flipping
+  on jitter as previously reported: whenever it engages it is consistently
+  inverted, because the mod tests only how far apart your hands are and not
+  whether your off hand is actually on the weapon. The real fix is an on-weapon
+  test and it is next. One hand on the weapon works well in the meantime, and
+  `wgun_twohand = 1` turns the old behaviour back on if you want it.
 - **The numpad digits load whole configs now.** Before this release, most of them did
   nothing. Now every digit `1`..`9` and `0` replaces your entire `grwxr.cfg` with a
   preset file. If you have no `GRWVR\presets\` folder they do nothing and the log
@@ -309,18 +315,23 @@ watched working through a headset rather than inferred from a log.
 - **Preset files must be WHOLE copies of `grwxr.cfg`.** Loading is additive: keys a
   preset leaves out keep whatever the previous preset set them to, they do not reset
   to defaults. The mod warns and names every missing key when it loads a partial one.
-- **Bullets follow your gaze, not the gun**, so aim down sights to shoot accurately.
-  This is still the last big piece.
+- **A magnified scope fitted to a weapon does not work yet.** The overlay shows
+  the scope body rather than the target. Iron sights and red dots are what the
+  overlay is built for, and it works well on those, so fit those and take your
+  long shots through the overlay. A real scope picture is being worked on.
 - **The gun may not sit exactly in your fist.** It is placed at the point the engine
   mounts it, which is near the receiver, so it can hang slightly off your hand. A
   grip offset is coming; `wgun_pos_scale` tunes reach in the meantime.
-- **No hands, gestures or weapon manipulation.** No grabbing, gesture reloads,
-  physical mag changes or two-handed grip.
-- **Your character's arms do not follow the weapon**, so the gun can look detached.
+- **No gestures or physical weapon manipulation.** Your hands hold the weapon,
+  but there is no grabbing, gesture reload or physical magazine change.
+- **The mod is right-handed only.** The aim ray and the weapon both come from the
+  right controller. Left-handed support is a known gap and is on the roadmap.
 - The camera can occasionally attach to the wrong body after a respawn or fast travel.
   Toggling first person off and on while facing your character re-acquires it.
-- Vehicles in first person are unfinished. Ground vehicles are playable and fun in
-  practice; aerial vehicle interiors are not yet wired up.
+- **Vehicles in first person are unfinished, and driving is the next thing being
+  worked on.** The view is inverted while driving and the camera can be left off
+  after you get out. Both causes have been found; the fixes are being built. Walk
+  or fast travel where you can for now.
 - Wide-angle rendering can look warped or "off" toward the edges; the projection
   geometry is under active tuning.
 - Sky and cloud registration at wide field of view is still imperfect.
@@ -333,30 +344,47 @@ watched working through a headset rather than inferred from a log.
 
 ## Roadmap
 
-What is being worked on right now, with an honest estimate of how far along each item
-is. Percentages are progress toward shipping, not promises or dates; they move as
-evidence comes in.
+Three buckets: what is working now, what is known broken and being fixed, and
+what is coming. Nothing here is a date or a promise. A line only moves into the
+first table once it has been watched working in a headset.
 
-| Feature | Progress | Where it stands |
-|---|---|---|
-| The weapon rides your controller | **~90%, shipped in v0.8.0** | **Position and rotation both confirmed in the headset.** The gun is the game's own weapon, moved by writing the bone the engine mounts it on, at the moment the engine reads that bone. Remaining: a grip offset so it sits in your fist rather than beside it, and travel-scale tuning |
-| Two-handed hold | **~70%, shipped in v0.9.0-test1** | The hold itself works. The front-hand detection has no deadband, so it flips 180 degrees on jitter, which is the split-and-reverse artifact. Root cause found and measured; the fix is next |
-| Bullets go where the weapon points | ~60% | Still the last big piece. Three candidate mechanisms were each tested, confirmed to run, and ruled out with evidence. A comparison against six other closed-engine VR mods identified the route the ones that solved it took |
-| Settings you can change in the headset | **~85%, shipped here** | The panel opens, the controller drives it, and the numpad loads whole configs. Not every row has been exercised |
-| Hip-fire accuracy at ADS grade under VR aim | ~70% | The exact engine flag is located and verified unique in every supported build; one write-route decision remains before it ships |
-| Physical sighting (raise the gun, use the sights, no ADS mode) | ~35% | Follows directly from the two rows above. The gun already points where you point it; sights need the bullets fixed first, then an eye-aligned reticle |
-| Performance pass for dense towns | ~30% | The engine's shadow-quality lever is located and writable live; a measurement run will decide what ships |
-| Aerial vehicle interior camera | ~20% | Ground-vehicle first person already works in practice; helicopter and plane interiors need their camera behaviour characterised first |
-| VR arms and hands (IK) | ~15% | The GPU skinning data format was recovered from the game's own shipped shaders. The engine's own IK system is confirmed present, which is the long-term route. Note the weapon does NOT depend on this: it is moved directly, so arms are a separate, harder problem |
+### Working now
 
-Percentages are progress toward shipping, not promises or dates, and they move as
-evidence comes in. A row only goes up when something has been watched working in a
-headset.
+| | |
+|---|---|
+| **First person, by itself** | Load in and wait a few seconds. No hotkey to press |
+| **The head, helmet and night vision hidden** | At all times, in every state, with no aiming needed. Holds through movement, firing and cover |
+| **The weapon in your hands** | The game's own weapon, held at the pistol grip, moved by writing the bone the engine mounts it on |
+| **Rounds go where the barrel points** | Fired down the muzzle rather than down your gaze, confirmed on both axes, with a green dot showing you where that is. This was the project's biggest open problem for months |
+| **The magnified overlay** | Hold the left trigger. Large enough to aim through as of v0.11.0. Built for iron sights and red dots |
+| **Full stereo, head tracked, 72 Hz** | A wide field of view, with the sky and clouds fixed to the world |
+| **Touch controllers as a gamepad** | Sticks, triggers, grips, buttons and menus, so no physical gamepad is needed |
+| **Settings you can change with the headset on** | An in-headset panel on F1, and a config that reloads about a second after you save it |
 
-**This release (v0.9.1-test2)** carries support for the current game executables,
-head hiding restored, the in-headset settings panel, whole-config presets, and the
-corrected eye sign. **The next release** is about the two-hand flip and the bullets
-following the gun, after which a public **beta** follows.
+### Being fixed
+
+| | |
+|---|---|
+| **Driving** | The view is inverted while driving and the camera can be left off after you get out. Both causes are found: the viewpoint is dropped at a hardcoded distance, and an aim value is not reset when you leave the vehicle. This is the next thing being worked on |
+| **The two-handed hold** | Ships switched off in v0.11.0. It is not flipping on jitter as previously reported: whenever it engages it is consistently inverted, because the mod tests how far apart your hands are rather than whether your off hand is on the weapon. The fix is a real on-weapon test |
+| **A magnified scope you can look through** | A scope fitted to a weapon still shows you the scope body rather than the target. The game keeps only one camera and has no separate scope render to borrow, so the picture has to be built; the approach other VR shooters use is identified and the groundwork is in |
+| **The startup crash on some machines** | A possible fix ships in v0.11.0 and needs reports from affected machines to confirm. If yours still fails, the log is what helps |
+
+### Coming
+
+| | |
+|---|---|
+| **Parachuting and the wingsuit** | Not yet handled as its own thing. It needs its own camera behaviour rather than inheriting the on-foot one |
+| **Vehicle interiors** | Helicopters and planes have not been wired up at all, and being able to lean and look around inside a cabin follows the driving fixes above |
+| **An optimization pass** | A large share of every rendered frame is currently drawn outside what the lenses can physically show. Reclaiming it is understood and measured, and it buys frame rate and sharpness at once |
+| **Left-handed support** | The mod is right-handed throughout: the aim ray and the weapon both come from the right controller. This needs doing before a stable release |
+| **Physical weapon handling** | Gesture reloads, magazine changes and grabbing. The weapon is already in your hands, so this is a build rather than a research problem |
+
+**This release (v0.11.0)** carries a possible fix for the startup crash, a
+magnified overlay big enough to shoot through, and the two-handed hold switched
+off while it is reworked. **The next release** is about driving and the
+two-handed hold. A public **beta** follows once driving is solid and a
+previously broken machine has confirmed it starts.
 
 ## Which version of the game do I need?
 
@@ -431,18 +459,24 @@ The sections below are for building from source.
 | **v0.8.0, v0.8.1, v0.8.2** (startup crash on VD / Steam Link) | second machine | **Visual Studio 2022 Community, MSVC 14.39.33519** |
 | **v0.9.1-test2** | primary build machine | Visual Studio at `\18\` |
 
-A startup crash in the v0.8.x builds (black screen, then the game closes) on
-Virtual Desktop and Steam Link is under investigation as a probable toolchain
-difference: the code paths involved are byte-identical to v0.7.0. The
-`v0.7.0-vs2022-crashfix` pre-release pairs v0.7.0's known-good source with the
-VS 2022 compiler to confirm it (see issue #2). Each release records the compiler
-it was built with in its notes.
+**The startup crash is not a compiler difference.** Earlier versions of this page
+said it probably was, and that is now ruled out: the same binary, sha for sha,
+plays on one machine and wedges on another. The compiler cannot be what separates
+them, and anyone debugging from that theory was being sent down a blind alley.
 
-**v0.9.1-test2 is back on the `\18\` toolchain**, which is the one no crash was
-ever reported against. That is a change of circumstance, not a fix: issues #2 and
-#3 remain open and this release has not been tested against either report. If you
-are one of those reporters, trying this one and saying what happens would genuinely
-help.
+What the logs actually point at is **other OpenXR API layers installed on the
+machine** — ReShade's OpenXR layer, VIVE layers, foveation layers. Across every log
+sent in, the machines that die almost always have one and the machines that play
+have none. One machine that dies has none either, so it is a strong lead rather
+than a proven cause.
+
+**v0.11.0 acts on it.** The mod now reads the layers actually installed on your
+machine and disables each one by the name that layer itself declares, instead of
+guessing at two names as it used to — a guess that never matched ReShade's real
+one, so for ReShade users that suppression had been doing nothing at all. And if a
+layer survives anyway, or the first frame hangs, the mod stands down and lets the
+game run flat instead of taking it down. If you have been unable to start the mod,
+that release is the one to try, and the log is what helps if it still fails.
 
 ## Installing
 
@@ -509,7 +543,7 @@ actually do, and that log line is the authority if this table ever drifts.
 | Key | Action |
 |---|---|
 | F1 | Open / close the settings panel (drive it with the controller) |
-| F2 | First person on / off (head hiding follows it automatically; also recenters, so a stale reference cannot poison the view) |
+| F2 | First person on / off. You do not need it: first person turns itself on, and the head, helmet and night vision are hidden at all times with no aiming needed |
 | Home | Recenter (look where you want forward to be, then press) |
 | Space | Also recenters. Note it still vaults, because the mod polls the keyboard and does not intercept it |
 | Numpad . (Decimal) | 1:1 head aim on / off (bullets follow your gaze; default off) |
@@ -558,7 +592,7 @@ key in comments. The ones most worth knowing:
 
 | Key | Meaning |
 |---|---|
-| `ipd_scale` | Eye separation multiplier. `1.00` means the headset's measured IPD at 1 world unit = 1 metre, and it is the shipped value in this release |
+| `ipd_scale` | Eye separation multiplier. `1.00` means your headset's measured IPD at 1 world unit = 1 metre. **v0.11.0 ships `0.90`**, which a tester found made the scale feel right. Lower values flatten depth and make the world read larger; some people prefer that. It hot reloads, and Numpad `/` and `*` step it while you play, so find your own value with the headset on |
 | `ipd_swap` | **If the stereo looks wrong, try this first.** `1` (the shipped value) swaps which eye gets which offset. See the note below the table |
 | `fullscreen_fov` | Rendered field of view in radians (default 1.92) |
 | `upsize_width` / `upsize_height` | Internal render size (default 3840x2160). Lower it, for example 3200x1800, to trade sharpness for frame rate |
@@ -584,7 +618,7 @@ key in comments. The ones most worth knowing:
 > [!NOTE]
 > **About `ipd_swap` and the shipped stereo values.** A controlled A/B in the headset
 > on 2026-08-22, toggling only this one key three times, came out in favour of
-> `ipd_swap = 1` at `ipd_scale = 1.00`. That is what this release ships. The
+> `ipd_swap = 1`. This release ships that swap at `ipd_scale = 0.90`. The
 > practical reading is that the eye sign was inverted, and that people running a very
 > small `ipd_scale` because "everything looks huge" were compensating for it. **This
 > is "better", tested once, and not declared correct**, which is exactly why the
@@ -604,8 +638,7 @@ key in comments. The ones most worth knowing:
   2026-08-13 title update removed Easy Anti-Cheat from the game, and that changes
   nothing about this rule: the mod is built and tested for the solo campaign only,
   and it must never run in a competitive context.
-- For now, playing in offline mode is recommended (Steam offline mode, or Ubisoft
-  Connect set to offline). It keeps the session unambiguously single-player while
+- Keep play to the campaign, solo or with friends in a private session, while
   the mod is under development.
 - This repository ships source code only. It contains no game files, no Ubisoft
   binaries, and no anti-cheat components, and it never patches any file of your

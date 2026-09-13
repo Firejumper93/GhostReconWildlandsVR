@@ -63,7 +63,7 @@ injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
 >
 > **Especially wanted: anyone the mod has never worked for.** Startup failures
 > have been the hardest thing to chase precisely because they do not happen here,
-> and every log sent in has moved it forward - the crash work in v0.11.0 exists
+> and every log sent in has moved it forward - the crash work in v0.11.1 exists
 > because of them.
 >
 > [Open an issue](https://github.com/Firejumper93/GhostReconWildlandsVR/issues)
@@ -347,7 +347,7 @@ first table once it has been watched working in a headset.
 | **The head, helmet and night vision hidden** | At all times, in every state, with no aiming needed. Holds through movement, firing and cover |
 | **The weapon in your hands** | The game's own weapon, held at the pistol grip, moved by writing the bone the engine mounts it on |
 | **Rounds go where the barrel points** | Fired down the muzzle rather than down your gaze, confirmed on both axes, with a green dot showing you where that is. This was the project's biggest open problem for months |
-| **The magnified overlay** | Click the left thumbstick (L3). Large enough to aim through as of v0.11.0. Built for iron sights and red dots |
+| **The magnified overlay** | Click the left thumbstick (L3). Large enough to aim through as of v0.11.1. Built for iron sights and red dots |
 | **Full stereo, head tracked, 72 Hz** | A wide field of view, with the sky and clouds fixed to the world |
 | **Touch controllers as a gamepad** | Sticks, triggers, grips, buttons and menus, so no physical gamepad is needed |
 | **Settings you can change with the headset on** | An in-headset panel on F1, and a config that reloads about a second after you save it |
@@ -359,7 +359,7 @@ first table once it has been watched working in a headset.
 | **Driving** | The view is inverted while driving and the camera can be left off after you get out. Both causes are found: the viewpoint is dropped at a hardcoded distance, and an aim value is not reset when you leave the vehicle. This is the next thing being worked on |
 | **The two-handed hold** | It works and ships on, and it is the part of the build most worth trying. It is not flipping on jitter as older notes said: when it does misbehave it is consistently inverted, because the mod tests how far apart your hands are rather than whether your off hand is on the weapon. A real on-weapon test is the fix |
 | **A magnified scope you can look through** | A scope fitted to a weapon still shows you the scope body rather than the target. The game keeps only one camera and has no separate scope render to borrow, so the picture has to be built; the approach other VR shooters use is identified and the groundwork is in |
-| **The startup crash on some machines** | A possible fix ships in v0.11.0 and needs reports from affected machines to confirm. If yours still fails, the log is what helps |
+| **The startup crash on some machines** | A possible fix ships in v0.11.1 and needs reports from affected machines to confirm. If yours still fails, the log is what helps |
 
 ### Coming
 
@@ -392,7 +392,7 @@ table. This release carries FIVE; they are listed with their provenance in
 identifies which one it is running inside from the executable's own headers.
 
 If the mod meets a `GRW.exe` it does not recognize (a future game patch, or a build
-we have not analysed), it says so in its log, names the builds it knows, and
+not yet analysed), it says so in its log, names the builds it knows, and
 **installs nothing**: your game runs completely unmodified. The symptom of that state
 is a small flat window in the headset that does not respond to head movement, with
 controllers possibly still working. Check `GRWVR\grwxr-<pid>.log` for the
@@ -443,7 +443,7 @@ the graphics baseline, troubleshooting, and how to report a problem. To remove
 the mod, run `uninstall.bat`.
 
 **If the mod has never started for you** - black screen, then the game closes a
-few seconds later - v0.11.0 carries a possible fix for that. See the release
+few seconds later - v0.11.1 carries a possible fix for that. See the release
 notes, and send the log if it still happens.
 
 The sections below are for building from source.
@@ -489,7 +489,7 @@ sent in, the machines that die almost always have one and the machines that play
 have none. One machine that dies has none either, so it is a strong lead rather
 than a proven cause.
 
-**v0.11.0 acts on it.** The mod now reads the layers actually installed on your
+**v0.11.1 acts on it.** The mod now reads the layers actually installed on your
 machine and disables each one by the name that layer itself declares, instead of
 guessing at two names as it used to — a guess that never matched ReShade's real
 one, so for ReShade users that suppression had been doing nothing at all. And if a
@@ -611,7 +611,7 @@ key in comments. The ones most worth knowing:
 
 | Key | Meaning |
 |---|---|
-| `ipd_scale` | Eye separation multiplier. `1.00` means your headset's measured IPD at 1 world unit = 1 metre. **v0.11.0 ships `0.90`**, which a tester found made the scale feel right. Lower values flatten depth and make the world read larger; some people prefer that. It hot reloads, and Numpad `/` and `*` step it while you play, so find your own value with the headset on |
+| `ipd_scale` | Eye separation multiplier. `1.00` means your headset's measured IPD at 1 world unit = 1 metre. **v0.11.1 ships `0.90`**, which a tester found made the scale feel right. Lower values flatten depth and make the world read larger; some people prefer that. It hot reloads, and Numpad `/` and `*` step it while you play, so find your own value with the headset on |
 | `ipd_swap` | **If the stereo looks wrong, try this first.** `1` (the shipped value) swaps which eye gets which offset. See the note below the table |
 | `fullscreen_fov` | Rendered field of view in radians (default 1.92) |
 | `upsize_width` / `upsize_height` | Internal render size (default 3840x2160). Lower it, for example 3200x1800, to trade sharpness for frame rate |

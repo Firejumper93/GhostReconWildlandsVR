@@ -8,6 +8,10 @@ injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
 
 > [!IMPORTANT]
 >YOU MUST DISABLE UBISOFT CONNECT OVERLAY AND STEAM OVERLAY OR THIS WILL CRASH!!!!!
+> The Ubisoft Connect in-game overlay freezes the mod's first frame (black screen, then the game closes);
+> the Steam overlay is suspected too. `install.bat` (v0.13.0) reads both settings and warns you. Ubisoft
+> Connect: Settings, General, untick the in-game overlay. Steam: Settings, In Game, untick the overlay, and
+> untick it in the game's Properties as well.
 
 > [!WARNING]
 > **SINGLEPLAYER OR PRIVATE CO-OP ONLY, never PvP, never matchmaking.**
@@ -17,7 +21,7 @@ injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
 > and competitive play stays out of scope.
 
 > [!NOTE]
-> ### This is not a complete VR experience yet, and it is getting close to beta
+> ### This is not a complete VR experience yet, and v0.13.0 is the body
 >
 > It is a real, playable VR mod rather than a proof of concept: stereo depth, a
 > fullscreen head-tracked view, first person that turns itself on, your head and
@@ -31,8 +35,13 @@ injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
 > looking. A green dot shows you where the barrel is aimed. That last part was
 > the project's largest open problem for months.
 >
-> **There are still rough edges and they are listed honestly below.** Driving is
-> unfinished and is the next thing being worked on. A magnified scope fitted to a
+> **v0.13.0 adds the body:** your upper body turns with your head, you lean, step and
+> crouch with your real body, the view is level, and recoil kicks the gun and hands,
+> not your head. Cars, bikes and boats work in first person; helicopters and planes
+> still show the outside camera.
+>
+> **There are still rough edges and they are listed honestly below.** Holsters and
+> gesture reload are next. A magnified scope fitted to a
 > weapon does not work yet. The mod is right-handed only for now.
 >
 > Each release has closed more of that list than it has opened, and the
@@ -305,10 +314,8 @@ watched working through a headset rather than inferred from a log.
   right controller. Left-handed support is a known gap and is on the roadmap.
 - The camera can occasionally attach to the wrong body after a respawn or fast travel.
   Toggling first person off and on while facing your character re-acquires it.
-- **Vehicles in first person are unfinished, and driving is the next thing being
-  worked on.** The view is inverted while driving and the camera can be left off
-  after you get out. Both causes have been found; the fixes are being built. Walk
-  or fast travel where you can for now.
+- **Cars, bikes and boats work in first person and follow your head.** Helicopters
+  and planes are not wired up yet and show the game's outside camera.
 - Wide-angle rendering can look warped or "off" toward the edges; the projection
   geometry is under active tuning.
 - Sky and cloud registration at wide field of view is still imperfect.
@@ -342,7 +349,7 @@ first table once it has been watched working in a headset.
 
 | | |
 |---|---|
-| **Driving** | The view is inverted while driving and the camera can be left off after you get out. Both causes are found: the viewpoint is dropped at a hardcoded distance, and an aim value is not reset when you leave the vehicle. This is the next thing being worked on |
+| **Driving** | Done since v0.12: cars, bikes and boats in first person, the view following the head. Helicopters and planes are the open part |
 | **The two-handed hold** | It works and ships on, and it is the part of the build most worth trying. It is not flipping on jitter as older notes said: when it does misbehave it is consistently inverted, because the mod tests how far apart your hands are rather than whether your off hand is on the weapon. A real on-weapon test is the fix |
 | **A magnified scope you can look through** | A scope fitted to a weapon still shows you the scope body rather than the target. The game keeps only one camera and has no separate scope render to borrow, so the picture has to be built; the approach other VR shooters use is identified and the groundwork is in |
 | **The startup crash on some machines** | A possible fix ships in v0.11.1 and needs reports from affected machines to confirm. If yours still fails, the log is what helps |
@@ -359,8 +366,8 @@ first table once it has been watched working in a headset.
 
 **This release (v0.11.1)** carries a possible fix for the startup crash and a
 magnified overlay big enough to shoot through, with the two-handed hold on.
-**The next release** is about driving. A public **beta** follows once driving is solid and a
-previously broken machine has confirmed it starts.
+**The next release** is about holsters and gesture reload on the new body. A public **beta** follows
+once a previously broken machine has confirmed it starts with the overlays off.
 
 ## Which version of the game do I need?
 

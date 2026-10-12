@@ -1,5 +1,5 @@
 @echo off
-REM deploy.bat - the ONLY sanctioned way to put the mod into the game (project rule 4).
+REM deploy.bat - the ONLY sanctioned way to put the mod into the game (CLAUDE.md rule 4).
 REM
 REM Verifies the game is closed, builds Release, copies, and byte-compares the
 REM deployed DLL against the built one. Refuses to proceed on any failure.
@@ -70,9 +70,11 @@ REM 2026-08-19: repinned to the 2026-08-19 update (Steam buildid 24821571,
 REM TimeDateStamp 6A7C5143, SizeOfImage unchanged 18B09000). Offline scan
 REM (tools\scratch_update_port_20260819.py) proved all 51 pinned sites are
 REM byte-identical to Last Rites at the same RVAs; GameBuild.cpp carries the
-REM kUpdate20260819 row. The Last Rites exe (sha 4b222677...) is archived off
-REM the build machine; game binaries are never redistributed with this mod.
-set "PINNED=33d58d9763264d4f2734f2939e928af74f167a57f6c88c4c7fde39014c022f63"
+REM kUpdate20260819 row. The Last Rites exe is archived OFF this machine at
+REM E:\GRW-GAME-BUILD-BACKUP\LastRites-0x6A75F2F4\GRW.exe (sha 4b222677...).
+REM 2026-10-05: repinned to Title Update 25 (Steam buildid 25120584, TimeDateStamp
+REM 6A99768A, SizeOfImage 185BA000). GameBuild.cpp carries kTU25 (F-248).
+set "PINNED=1284e4d5aad5f1ca5d2832b6c46707b1d043205e929b5810ffe1caf61cbdf751"
 certutil -hashfile "%GAME%\GRW.exe" SHA256 | findstr /i /c:"%PINNED%" >nul
 if errorlevel 1 goto err_exe_changed
 echo     GRW.exe matches the pinned build.
@@ -108,7 +110,7 @@ echo     byte-for-byte identical.
 echo.
 echo ======================================================================
 echo  DEPLOYED. Match this SHA256 against the FIRST LINE of GRWVR\grwxr.log
-echo  before interpreting any test result (project rule 5).
+echo  before interpreting any test result (CLAUDE.md rule 5).
 echo ======================================================================
 certutil -hashfile "%DST%" SHA256 | findstr /r "^[0-9a-f][0-9a-f]*$"
 for %%F in ("%DST%") do echo  mtime: %%~tF

@@ -36,7 +36,7 @@ namespace d3d11 {
 
 // Install the Present/ResizeBuffers vtable hooks. Safe to call once.
 // Returns false and logs loudly on failure; the game keeps running either way
-// (project rule 7).
+// (CLAUDE.md rule 7).
 bool install();
 
 // Undo the vtable patches.
@@ -61,7 +61,7 @@ const State& state();
 // BEFORE the frame is presented. This is where phase 3 will copy the backbuffer
 // into the OpenXR swapchain.
 //
-// project rule 8: no logging, file I/O, locks, COM creation or allocation in
+// CLAUDE.md rule 8: no logging, file I/O, locks, COM creation or allocation in
 // here. It runs on the render thread every single frame.
 using PresentCallback = void (*)(const State&);
 void set_present_callback(PresentCallback cb);
@@ -75,6 +75,22 @@ bool has_present_callback();
 void drain_capture_log();
 
 unsigned long long frame_count();
+
+// BUILD 239: THE RENDER THREAD'S OWN FACTS, for the stall watchdog.
+//
+// frame_count() counts Present ENTRIES. On every wedged tester machine on
+// record it reaches 1 and stops there, and that single number cannot say
+// whether the thread is parked INSIDE the real Present or returned from it and
+// then stopped somewhere else. Entries against returns separates those two
+// outright, and it is the fact five reported logs were missing.
+//
+// All four are written on the render thread as relaxed atomic stores and
+// nothing else: no logging, no locks, no allocation (rule 8). The two times are
+// GetTickCount64() values and 0 means "never happened".
+unsigned long long present_returns();
+unsigned long long first_present_enter_ms();
+unsigned long long first_present_return_ms();
+unsigned long      render_thread_id();
 
 // FRAMES IN FLIGHT. Prior art: "Making 6DOF Mods 3D, Rev 4" section 15.8, which
 // records that Luke Ross's R.E.A.L. caps D3D max frame latency to 1 under

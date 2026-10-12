@@ -1,6 +1,6 @@
 // Log.h - minimal, allocation-light logging for GRW-XR.
 //
-// Rules this file exists to enforce (project rules):
+// Rules this file exists to enforce (CLAUDE.md):
 //   Rule 5: the FIRST line of grwxr.log must carry the deployed DLL's own
 //           SHA256 and timestamp, so a test result can be matched to the exact
 //           binary that produced it. We hash our own module at startup.
@@ -26,7 +26,7 @@ namespace grwxr {
 namespace log {
 
 // Open the log next to the DLL, in <game>\GRWVR\grwxr.log.
-// Writes the identity banner required by project rule 5.
+// Writes the identity banner required by CLAUDE.md rule 5.
 void init(HMODULE self);
 
 void shutdown();
@@ -34,11 +34,27 @@ void shutdown();
 // printf-style. Thread safe via a critical section.
 void write(const char* level, const char* fmt, ...);
 
+// BUILD 227: cfg log_diag. 0 (the shipped default) drops the once-a-second
+// instrument lines; WARN, ERROR, startup, hooks, features and the heartbeat
+// are always written. 1 writes everything, as every build before 227 did.
+void set_diag(int on);
+int  diag();
+
 // Absolute path of the directory holding our DLL (the game root).
 const std::wstring& game_dir();
 
-// Absolute path of our GRWVR data directory.
+// Absolute path of our GRWVR data directory. This is the directory the mod
+// actually WROTE to, which is not always the one next to the game: see the
+// resolver in Log.cpp. Everything that reads or writes grwxr.cfg, presets or
+// any other file of ours must go through this, never rebuild the path itself.
 const std::wstring& data_dir();
+
+// The log file we actually opened, UTF-8, for the panel to show. Empty until
+// init() has opened a file, and empty for good if nothing was writable.
+const std::string& log_path();
+
+// True when the game folder refused a write and data_dir() is the fallback.
+bool data_dir_is_fallback();
 
 }  // namespace log
 }  // namespace grwxr

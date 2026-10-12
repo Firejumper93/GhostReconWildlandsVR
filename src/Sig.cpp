@@ -107,5 +107,61 @@ std::optional<uint8_t*> find_unique(const Image& img, const char* pattern,
     return first;
 }
 
+std::optional<uint8_t*> find_thunk_to(const Image& img, const uint8_t* target,
+                                      size_t* matches_out) {
+    if (matches_out) *matches_out = 0;
+    if (!target || img.size < 5) return std::nullopt;
+
+    // The same committed-page walk find_unique does, and for the same reason:
+    // the image is 369 MB and parts of it are not backed, so a blind sweep
+    // faults. Deliberately duplicated rather than factored out of find_unique,
+    // which is proven code that four builds depend on.
+    uint8_t* first = nullptr;
+    size_t   count = 0;
+
+    const size_t last = img.size - 5;
+    MEMORY_BASIC_INFORMATION mbi{};
+    uint8_t* region_end = img.base;   // forces a query on the first iteration
+
+    for (size_t i = 0; i <= last; ++i) {
+        uint8_t* here = img.base + i;
+        if (here >= region_end) {
+            if (!VirtualQuery(here, &mbi, sizeof(mbi))) break;
+            region_end = (uint8_t*)mbi.BaseAddress + mbi.RegionSize;
+            const bool readable =
+                mbi.State == MEM_COMMIT &&
+                !(mbi.Protect & PAGE_NOACCESS) &&
+                !(mbi.Protect & PAGE_GUARD);
+            if (!readable) {
+                i = (size_t)(region_end - img.base) - 1;
+                continue;
+            }
+        }
+        if (here[0] != 0xE9) continue;
+        if (here + 5 > region_end) continue;
+
+        int32_t rel;
+        memcpy(&rel, here + 1, sizeof(rel));
+        if (here + 5 + rel != target) continue;
+
+        // ThunkHook needs 9 bytes of CC after the jump to fit its 14-byte
+        // absolute indirect. A thunk without that padding is a real thunk to
+        // this target but is not safe to rewrite, so it is counted (the caller
+        // deserves to know it existed) and then rejected by the count check.
+        if (here + 14 > region_end) continue;
+        bool padded = true;
+        for (int k = 5; k < 14; ++k)
+            if (here[k] != 0xCC) { padded = false; break; }
+        if (!padded) continue;
+
+        if (count == 0) first = here;
+        ++count;
+    }
+
+    if (matches_out) *matches_out = count;
+    if (count != 1) return std::nullopt;
+    return first;
+}
+
 }  // namespace sig
 }  // namespace grwxr

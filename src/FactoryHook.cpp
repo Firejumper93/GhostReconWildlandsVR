@@ -99,8 +99,9 @@ void note(const char* fmt, ...) {
 // ---------------------------------------------------------------------------
 // Config. upsize_width / upsize_height in GRWVR\grwxr.cfg; either 0 disables.
 // Defaults ON at 3840x2160, the session-13 proven-good capture size. Read
-// once, lazily, at the first factory call; log::data_dir() may not exist yet,
-// so the path is derived from this module's own location.
+// once, lazily, at the first factory call. These calls CAN beat the init
+// thread, so log::data_dir() resolves itself on first use behind its own
+// guard (Log.cpp) rather than relying on log::init() having run.
 
 std::atomic<int> g_cfg_state{0};   // 0 unread, 1 reading, 2 ready
 UINT g_up_w = 3840;
@@ -122,18 +123,14 @@ void load_cfg_once() {
         return;
     }
 
-    HMODULE self = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCWSTR)&g_widx, &self);
-    wchar_t p[MAX_PATH] = {};
-    GetModuleFileNameW(self, p, MAX_PATH);
-    std::wstring dir = p;
-    size_t slash = dir.find_last_of(L"\\/");
-    dir = (slash == std::wstring::npos) ? L"." : dir.substr(0, slash);
-
+    // 2026-09-04: this used to rebuild the path from our own module handle,
+    // which disagreed with log::data_dir() the moment the game folder was not
+    // writable and the resolver fell back, so the upsize and force_windowed
+    // keys silently came from a file the rest of the mod was not using.
+    // data_dir() resolves on first use from any thread, so it is safe here even
+    // though this can run before the init thread. One resolver, one answer.
     FILE* f = nullptr;
-    if (_wfopen_s(&f, (dir + L"\\GRWVR\\grwxr.cfg").c_str(), L"rt") == 0 && f) {
+    if (_wfopen_s(&f, (log::data_dir() + L"\\grwxr.cfg").c_str(), L"rt") == 0 && f) {
         char line[256];
         while (fgets(line, sizeof(line), f)) {
             if (line[0] == '#') continue;

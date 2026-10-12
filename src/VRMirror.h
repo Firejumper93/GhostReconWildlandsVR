@@ -34,13 +34,26 @@ bool init(const d3d11::State& st);
 bool poll_start();
 
 // Called every frame from the Present hook. Copies the backbuffer and submits.
-// Must not log (project rule 8).
+// Must not log (CLAUDE.md rule 8).
 void on_present(const d3d11::State& st);
 
 void shutdown();
 
 // True once a session exists and frames are being submitted.
 bool active();
+const char* frame_phase();   // BUILD 228: the last VR step the render thread entered
+
+// BUILD 239: turn VR off for the rest of the run from OUTSIDE the render
+// thread. The stall watchdog calls this when the game has stopped presenting:
+// if that thread ever does come back, it then presents flat and the session
+// survives instead of dying with the process. Idempotent, and safe to call
+// before a session exists.
+void stand_down(const char* why);
+
+// BUILD 239: cfg xr_init_frames. How many Present calls must have RETURNED
+// before OpenXR is allowed to come up at all. 0 disables the gate and restores
+// the pre-239 behaviour, where init fired on the first Present entry.
+int init_frames();
 
 // Drain deferred diagnostics onto the init thread, same pattern as D3D11Hook:
 // the render thread records, our own thread writes the log.
@@ -53,6 +66,7 @@ void drain_input();
 // Build 21: re-read grwxr.cfg when its mtime changes (live tuning without
 // hotkeys). Init thread only: it does file I/O.
 void poll_config();
+bool palette_probe();   // BUILD 227: cfg palette_probe, default 0
 
 // Build 86: live barrel-aim state for the in-headset panel.
 //

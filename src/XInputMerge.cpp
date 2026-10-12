@@ -12,6 +12,23 @@
 #include "HeadPose.h"
 #include "Log.h"
 
+namespace grwxr { namespace camera { void set_ads_input(bool held); int pip_block_ads(); void set_move_input(float lx, float ly, unsigned short buttons); bool ads_pulse_value(unsigned char* p); void pip_toggle_press(); int pip_toggle_enabled(); } }   // BUILD 198, 200, 221, 225, 237
+
+// BUILD 237: the scope latch. L3 (left thumbstick click) flips the scope up
+// and down, and the press is CONSUMED because L3 is sprint and a scope that
+// sprinted every time you raised it would be worse than the held trigger it
+// replaces. One rising-edge detect on the merged button word, so a physical
+// pad and the Touch controllers both work it. pip_toggle = 0 passes L3
+// straight through and restores the pre-237 behaviour exactly.
+static bool g_l3_prev = false;
+static unsigned short pip_latch_buttons(unsigned short buttons) {
+    const bool down = (buttons & 0x0040u) != 0;   // XINPUT_GAMEPAD_LEFT_THUMB
+    if (!grwxr::camera::pip_toggle_enabled()) { g_l3_prev = down; return buttons; }
+    if (down && !g_l3_prev) grwxr::camera::pip_toggle_press();
+    g_l3_prev = down;
+    return (unsigned short)(buttons & ~0x0040u);
+}
+
 namespace grwxr {
 namespace xin {
 namespace {
@@ -50,6 +67,7 @@ std::atomic<bool> g_stick_pitch{true};
 // threshold of 30, so a finger resting on the trigger does not mark every
 // frame as firing.
 constexpr uint8_t kFireGate = 128;
+constexpr uint8_t kAdsGate  = 30;    // BUILD 198: XInput's own trigger threshold; the aim input for the scene fov override
 bool              g_installed = false;
 void**            g_slot = nullptr;
 PFN_GetState      g_orig = nullptr;
@@ -82,7 +100,10 @@ DWORD WINAPI hook_GetState(DWORD idx, State* st) {
     const DWORD r = g_orig ? g_orig(idx, st) : kNotConnected;
     g_calls.fetch_add(1, std::memory_order_relaxed);
     if (!st || idx != 0) return r;
-    if (!g_enabled.load(std::memory_order_relaxed)) return r;
+    if (!g_enabled.load(std::memory_order_relaxed)) {
+        camera::set_ads_input(false);   // BUILD 198: never a stale held value while the merge is off
+        return r;
+    }
 
     uint32_t btn = 0;
     float    ax[6];
@@ -108,6 +129,23 @@ DWORD WINAPI hook_GetState(DWORD idx, State* st) {
             if (!g_stick_pitch.load(std::memory_order_relaxed))
                 st->Gamepad.sThumbRY = 0;     // minus stick pitch (build 49)
             aimtrace::set_firing(st->Gamepad.bRightTrigger > kFireGate);
+            // BUILD 221: with pip_block_ads the left trigger opens the PiP scope
+            // and never reaches the game, so the game never enters its ADS
+            // (no model swap, no camera zoom); the scene fov override stays.
+            if (camera::pip_block_ads()) {
+                camera::set_ads_input(false);
+                st->Gamepad.bLeftTrigger = 0;
+            } else {
+                camera::set_ads_input(st->Gamepad.bLeftTrigger > kAdsGate);   // BUILD 198
+            }
+            {   // BUILD 225: the ADS pulse. The LAST word on this byte, on purpose:
+                // pip_block_ads zeroed it just above, and this lends it back for
+                // the few frames of the pulse. Rule 8: relaxed loads, one byte store.
+                uint8_t p = 0;
+                if (camera::ads_pulse_value(&p)) st->Gamepad.bLeftTrigger = p;
+            }
+            st->Gamepad.wButtons = pip_latch_buttons(st->Gamepad.wButtons);   // BUILD 237
+            camera::set_move_input(st->Gamepad.sThumbLX / 32767.0f, st->Gamepad.sThumbLY / 32767.0f, st->Gamepad.wButtons);   // BUILD 200
     // BUILD 122: hand the merged stick and buttons to the settings panel, so
     // the tester can drive it from the Touch thumbsticks. Three relaxed
     // stores; the panel ignores them unless it is open.
@@ -118,6 +156,8 @@ DWORD WINAPI hook_GetState(DWORD idx, State* st) {
         }
         memset(st, 0, sizeof(*st));
         aimtrace::set_firing(false);
+        camera::set_ads_input(false);   // BUILD 198
+        camera::set_move_input(0.0f, 0.0f, 0);   // BUILD 200
         st->dwPacketNumber = g_pkt.fetch_add(1, std::memory_order_relaxed) + 1;
         g_placeheld.fetch_add(1, std::memory_order_relaxed);
         return kSuccess;
@@ -130,6 +170,7 @@ DWORD WINAPI hook_GetState(DWORD idx, State* st) {
     }
 
     st->Gamepad.wButtons |= (uint16_t)btn;
+    if (headpose::stance_b()) st->Gamepad.wButtons |= 0x2000;   // BUILD 205: the stance loop's B (crouch tap, prone hold)
     const uint8_t lt = trig_u8(ax[4]);
     const uint8_t rt = trig_u8(ax[5]);
     if (lt > st->Gamepad.bLeftTrigger)  st->Gamepad.bLeftTrigger  = lt;
@@ -154,6 +195,33 @@ DWORD WINAPI hook_GetState(DWORD idx, State* st) {
     // Build 50: publish the shot window to the aim-reader census, from the
     // merged value the GAME sees, so Touch and a physical pad both mark it.
     aimtrace::set_firing(st->Gamepad.bRightTrigger > kFireGate);
+    if (camera::pip_block_ads()) {   // BUILD 221: see above
+        camera::set_ads_input(false);
+        st->Gamepad.bLeftTrigger = 0;
+    } else {
+        camera::set_ads_input(st->Gamepad.bLeftTrigger > kAdsGate);   // BUILD 198
+    }
+    {   // BUILD 225: the ADS pulse, see the site above. Same insert, same order.
+        uint8_t p = 0;
+        if (camera::ads_pulse_value(&p)) st->Gamepad.bLeftTrigger = p;
+    }
+    st->Gamepad.wButtons = pip_latch_buttons(st->Gamepad.wButtons);   // BUILD 237
+    camera::set_move_input(st->Gamepad.sThumbLX / 32767.0f, st->Gamepad.sThumbLY / 32767.0f, st->Gamepad.wButtons);   // BUILD 200
+    {   // BUILD 209: the body follow's stick, added only when the user's own is idle (reported above, untouched)
+        float fx = 0.0f, fy = 0.0f;
+        if (headpose::follow_stick(&fx, &fy)) {
+            const float ux = st->Gamepad.sThumbLX / 32767.0f, uy = st->Gamepad.sThumbLY / 32767.0f;
+            if (ux * ux + uy * uy < 0.01f) {
+                if (fx > 1.0f) fx = 1.0f; if (fx < -1.0f) fx = -1.0f;
+                if (fy > 1.0f) fy = 1.0f; if (fy < -1.0f) fy = -1.0f;
+                st->Gamepad.sThumbLX = (int16_t)(fx * 32767.0f);
+                st->Gamepad.sThumbLY = (int16_t)(fy * 32767.0f);
+                headpose::follow_injected(true, st->Gamepad.sThumbLX, st->Gamepad.sThumbLY);   // BUILD 211
+            } else {
+                headpose::follow_injected(false, 0, 0);   // BUILD 211: his own stick had it
+            }
+        }
+    }
     // BUILD 122: hand the merged stick and buttons to the settings panel, so
     // the tester can drive it from the Touch thumbsticks. Three relaxed
     // stores; the panel ignores them unless it is open.

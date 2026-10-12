@@ -5,6 +5,40 @@ so on) are the development ledger's numbering and appear here so bug reports can
 name an exact build. Entries are verified in the headset on the test system unless
 marked otherwise.
 
+## v0.13.0 (2026-10-12): the body
+
+**Builds 132 to 302.** The releases between v0.9.1-test2 and this one (v0.10.0-test1, v0.11.0, v0.11.1,
+v0.11.2-test1, v0.12.0-test1) are described on their release pages; this entry covers what this build adds
+over v0.12.0-test1, all of it played in the headset on the test machine, including a full outpost.
+
+**The upper body turns with the head** (builds 294 to 298). Every bone from the spine up, backpack and gear
+included, rotates about the head with a 45 degree dead zone, catching up to the middle of the zone at 240
+degrees a second, weighted a little toward where the right hand points, clamped at 70 degrees against the legs.
+
+**Lean and limited roomscale** (build 300). The head's tracked offset since the recentre moves the view with a
+soft limit of about 0.40 m horizontally; the upper body hinges about the spine toward it, and the camera takes
+the hinge back out of the head bone it reads so the view never depends on the body. Holding the left menu
+button 800 ms recentres (a short press is still Start).
+
+**Crouch from the real head** (builds 301, 302). The build 205 stance loop is on by default, with its threshold
+in metres of real drop below the standing height (`crouch_drop` 0.25, `crouch_rise` 0.10). The standing height
+is the average 1 to 4 s after a recentre and is accepted only when it is within 0.10 m of the tallest this
+session, so a crouched recentre does not break it. Prone stays on the button.
+
+**The view is level** (builds 290, 291): the engine pitch baseline is taken absolute (gravity referenced) at the
+first live frame and after every recentre, vehicle exit or non-live stretch, with a drift net.
+
+**Recoil on the gun and hands, never the camera** (build 292). **The left elbow leans down two-handed** (299).
+**The arms are placed from the camera that draws them** (282) and **carried toward the hand** so the arm is never
+past full extension (283, 284), with the elbow side low-passed (285).
+
+**Installer: in-game overlay check.** `install.bat` reads the Ubisoft Connect overlay setting (`settings.yaml`)
+and Steam's per-game overlay switch (`localconfig.vdf`) and warns before installing. The Ubisoft overlay plus
+any Present hook freezes the first frame (bisected on a second PC, 2026-10-11); nothing is written to either.
+
+**Known:** sprint on L3 is taken by the overlay toggle; holsters and gesture reload are not built; a fitted
+magnified scope does not work; one run showed rounds pulled toward the gaze, not reproduced since.
+
 ## v0.9.1-test2 (2026-08-22, TEST RELEASE): the current game version works again
 
 **Builds 106-131.** Not tested as a packaged release. Everything below was run in

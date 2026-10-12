@@ -12,7 +12,9 @@
 #include "GameBuild.h"
 #include "Log.h"
 #include "ThunkHook.h"
+#include "Sig.h"           // build 136: SetShotLine is found, never pinned
 #include "CameraProbe.h"   // build 106: base_pos, the world-space control
+#include "D3D11Hook.h"     // build 302: frame_count, the shot ray recorder's window
 #include "Voice.h"         // build 107: spoken test instructions
 
 // --- shared with ProbeStub.asm ---------------------------------------------
@@ -84,6 +86,26 @@ uint64_t grwxr_spawn_orig = 0;
 void grwxr_spawn_entry();
 void grwxr_spawn_pre(void* owner);
 void grwxr_spawn_post(void* owner, void* proj);
+
+// BUILD 136: SetShotLine (see ProbeStub.asm). One call per shot.
+//
+// BUILD 137: `dir` loses its const. The stub saves r8, calls this, restores r8
+// and calls the original with the SAME pointer, so a write through it here is
+// what the engine goes on to use. That is why the direction rewrite needs no
+// change to ProbeStub.asm at all: the buffer was always being passed through,
+// only nobody had written to it.
+uint64_t grwxr_shotline_orig = 0;
+void grwxr_shotline_entry();
+void grwxr_shotline_pre(uint64_t ctx, const float* org, float* dir);
+
+// BUILD 154: the two trajectory generators. Observers in the stub; the bodies
+// are kept because the correction re-invokes them with one argument replaced.
+uint64_t grwxr_gen_a_orig = 0;
+uint64_t grwxr_gen_b_orig = 0;
+void grwxr_gen_a_entry();
+void grwxr_gen_b_entry();
+void grwxr_gen_record(void* bal, float elev, void* arc, uint32_t flag,
+                      uint32_t which);
 }
 
 namespace grwxr {
@@ -156,6 +178,238 @@ float    g_ap_shift_m  = 5.0f;         // cfg aimpoint_ab_m
 float    g_ap_last[3]  = {0,0,0};      // last aim point the engine produced
 float    g_ap_muzzle[3]= {0,0,0};      // last muzzle point, from the twin
 volatile uint32_t g_ap_have_muz = 0;
+
+// ---------------------------------------------------------------------------
+// BUILD 136: SETSHOTLINE, the one call per shot that carries the whole ray.
+//
+// Deliberately a LAPPING RING, not a fill-and-stop table. Build 135's capture
+// printed "TABLE FULL" 665 times in one 47 minute run, which is what a table
+// that stops accepting looks like from the log: the first four shots of the
+// session and then silence for the rest of it. A ring that overwrites keeps
+// the MOST RECENT shots, which are the ones a tester is producing on purpose
+// while watching for the log line, and g_sl_calls records the true total so a
+// lap is visible rather than silent.
+//
+// Rule 8: the recorder does stores and nothing else. Every interpretation
+// (vector lengths, the distances to muzzle and camera) happens in the drain.
+struct ShotLine {
+    uint64_t ctx, orgp, dirp;
+    float    org[4], dir[4];
+    float    ndir[3];                  // build 137: what we wrote, if we wrote
+    float    dpm;                      // build 137: origin to the player muzzle
+    uint32_t why;                      // build 137: kSd* below
+    uint32_t vtwhy;                    // build 154: kSp*, the vertical
+    float    vt_eng;                   // build 154: the elevation the engine used
+    float    vt_our;                   // build 154: the barrel elevation we sent
+    float    vt_fromdir;               // build 154: asin of the engine's own dir,
+                                       // the convention check: it should equal
+                                       // vt_eng, and if it is the negative of it
+                                       // our sign is inverted and the log says so
+                                       // on the very first shot
+    uint32_t seq;
+};
+constexpr uint32_t kSlSlots = 16;      // power of two, masked not modulo
+ShotLine g_sl[kSlSlots] = {};
+volatile uint32_t g_sl_w      = 0;     // monotonic write counter
+volatile uint32_t g_sl_calls  = 0;     // every call, including lapped ones
+volatile uint32_t g_sl_printed= 0;     // how far the drain has reported
+
+// ---------------------------------------------------------------------------
+// BUILD 137: THE DIRECTION WRITE. See AimTrace.h for the argument; this block
+// is the state and the reason codes.
+//
+// Every refusal gets its OWN code, and the code is printed on the shot's own
+// log line. That is deliberate: the recurring failure in this project is a
+// feature that was never actually armed reporting a zero that reads exactly
+// like a feature that ran and did nothing (shots=0 across 494 logs meant the
+// A/B had never been switched on, and nobody could tell from the log). A shot
+// that was not rewritten now says which of the interlocks refused it.
+constexpr uint32_t kSdWrote    = 0;    // the direction is now the barrel's
+constexpr uint32_t kSdOff      = 1;    // cfg shot_dir = 0
+constexpr uint32_t kSdNoPtr    = 2;    // the engine handed us a null
+constexpr uint32_t kSdNoMuzzle = 3;    // no player muzzle has ever resolved
+constexpr uint32_t kSdNotOurs  = 4;    // origin is not at the player's muzzle
+constexpr uint32_t kSdStale    = 5;    // the weapon writer is not running
+constexpr uint32_t kSdBadVec   = 6;    // degenerate or non-finite
+constexpr uint32_t kSdFault    = 7;    // a read faulted; nothing was written
+constexpr uint32_t kSdWroteOrg = 8;    // BUILD 152: origin AND direction; the
+                                       // engine had moved the origin to the
+                                       // camera and it was moved back
+
+const char* sd_why(uint32_t w) {
+    switch (w) {
+        case kSdWrote:    return "WROTE";
+        case kSdOff:      return "off";
+        case kSdNoPtr:    return "nullptr";
+        case kSdNoMuzzle: return "no-player-muzzle";
+        case kSdNotOurs:  return "not-at-our-muzzle";
+        case kSdStale:    return "barrel-stale";
+        case kSdBadVec:   return "bad-vector";
+        case kSdWroteOrg: return "WROTE-ORG";
+        default:          return "faulted";
+    }
+}
+
+// How close the shot origin must sit to the player's own muzzle to be treated
+// as the player's own shot. Build 136 measured 0.019 to 0.020 m for hip fire
+// across five shots, and 0.896 to 0.913 m for ADS (whose origin is the camera).
+// 0.35 m is seventeen times the hip-fire figure and less than half the ADS one,
+// so it separates the two cleanly and still leaves an NPC needing to fire with
+// its barrel inside a 35 cm sphere around our own muzzle to be mistaken for us.
+constexpr float kSdGateM = 0.35f;
+
+// BUILD 152: the relocated-origin signature. The 03:05 session (grwxr-25048)
+// measured the two clusters this gate separates: shots whose origin the
+// engine had relocated to the camera sat at dOrgCam 0.31 to 0.55 m, and
+// healthy muzzle-origin VR hip shots at 0.68 to 1.05 m (the camera is at the
+// head, the gun at arm's length). 0.60 splits them with margin both ways. An
+// AI shot's origin is at the AI's own muzzle, metres from this camera.
+constexpr float kSdCamGateM = 0.60f;
+
+volatile uint32_t g_sd_armed    = 1;   // cfg shot_dir. ON unless turned off.
+volatile uint32_t g_sd_live     = 0;   // did the weapon writer publish recently
+volatile uint32_t g_sd_gen_prev = 0;   // the drain's own liveness baseline
+volatile uint32_t g_sd_wrote_n  = 0;   // shots rewritten, all time
+volatile uint32_t g_sd_left_n   = 0;   // shots left as the engine built them
+volatile uint32_t g_sd_said     = 0;   // the one spoken confirmation, once
+// BUILD 152: the origin write. See AimTrace.h at set_shot_org for the design.
+volatile uint32_t g_sd_org_armed = 1;  // cfg shot_org. ON unless turned off.
+volatile uint32_t g_sd_worg_n    = 0;  // shots repaired origin-and-direction
+volatile uint32_t g_sd_said_org  = 0;  // its one spoken confirmation
+
+// ---------------------------------------------------------------------------
+// BUILD 154: THE VERTICAL.
+//
+// SHOT-2026-09-02: SetShotLine reads [r8] and [r8+4] and NEVER [r8+8]. The
+// engine is z-up, so our written elevation has never reached the shot. It is
+// taken instead from the direction one step earlier, decomposed to a scalar in
+// DEGREES, and handed to a trajectory generator that builds the arc BEFORE
+// SetShotLine runs. SetShotLine then spins that finished arc through a
+// yaw-only frame. Pitch is read before our write, yaw after it, which is
+// exactly the measured asymmetry and is not a bug in our half of the chain.
+//
+// THE CORRECTION, AND WHY IT IS SHAPED THIS WAY. The generators are hooked as
+// pure observers (ProbeStub.asm) because at generator time there is no origin
+// and no weapon pointer, so none of the interlocks that keep AI fire untouched
+// can run there. Instead the recorded arguments are stashed, and the arc is
+// rebuilt from grwxr_shotline_pre AFTER sd_apply has already ruled the shot
+// ours by the same gate that has protected AI since build 137. The rebuild
+// calls THE ENGINE'S OWN generator with its own saved arguments and only the
+// elevation replaced, so no ballistics are reimplemented here.
+//
+// The hard baseline governs this: it moves the round, so it ships with the ray
+// probe on and is re-proven in the headset, never assumed.
+constexpr uint32_t kVtWrote  = 0;   // the arc was rebuilt on the barrel angle
+constexpr uint32_t kVtOff    = 1;   // cfg shot_pitch = 0
+constexpr uint32_t kVtNotOur = 2;   // sd_apply did not rule this shot ours
+constexpr uint32_t kVtNoArc  = 3;   // no generator call matched this shot ctx
+constexpr uint32_t kVtStale  = 4;   // the weapon writer is not running
+constexpr uint32_t kVtBadVec = 5;   // degenerate or non-finite barrel
+constexpr uint32_t kVtNoFn   = 6;   // the generator hook never installed
+constexpr uint32_t kVtFault  = 7;   // the rebuild faulted; arc left as built
+
+const char* vt_why(uint32_t w) {
+    switch (w) {
+        case kVtWrote:  return "PITCH";
+        case kVtOff:    return "off";
+        case kVtNotOur: return "not-ours";
+        case kVtNoArc:  return "no-arc";
+        case kVtStale:  return "barrel-stale";
+        case kVtBadVec: return "bad-vector";
+        case kVtNoFn:   return "no-generator";
+        default:        return "faulted";
+    }
+}
+
+// One recorded generator call. Rule 8: the recorder does plain stores into a
+// fixed ring and nothing else.
+struct GenCall {
+    uint64_t ctx;      // r8 - 0x170, the shot context SetShotLine also receives
+    uint64_t bal;      // rcx, the ballistic data
+    uint64_t arc;      // r8, where the arc is written
+    uint32_t flag;     // r9d, the drop-table flag
+    float    elev;     // xmm1, the ENGINE's own launch elevation, degrees
+    uint32_t which;    // 0 = generator A, 1 = generator B
+};
+
+constexpr int kGenSlots = 16;          // power of two, indexed by a free counter
+GenCall           g_gen[kGenSlots] = {};
+volatile uint32_t g_gen_w     = 0;     // write cursor, free-running
+volatile uint32_t g_gen_calls = 0;     // every generator call, all time
+
+volatile uint32_t g_vt_armed   = 1;    // cfg shot_pitch. ON unless turned off.
+volatile uint32_t g_vt_wrote_n = 0;    // arcs rebuilt on the barrel angle
+volatile uint32_t g_vt_said    = 0;    // its one spoken confirmation
+
+// The generator bodies, for the rebuild call. Its shape is settled by the ABI:
+// arg 2 being a float puts it in xmm1, which is where the disassembly shows
+// the elevation arriving, so this prototype is the register layout rather than
+// a guess about it.
+typedef void (*gen_fn)(void* bal, float elev_deg, void* arc_out, uint32_t flag);
+
+// The player's OWN muzzle. g_ap_muzzle above is "most recent, any owner", which
+// is right for the A/B's lateral axis and wrong for a gate that decides whether
+// to move a bullet, because the muzzle getter runs for AI weapons too.
+float             g_sd_muz[3] = {0, 0, 0};
+volatile uint32_t g_sd_muz_ok = 0;
+
+// BUILD 133: THE HYBRID SHOOT SYSTEM, read out of the live game.
+//
+// WHY THIS EXISTS. The shipped archives say GR_DBWeaponConstants
+// (class 0x05A8E222) carries
+//     v_bEnableHybridShootSystem      1
+//     v_fMinAngleToCancelFocusPoint   120.0
+//     v_fMinAngleToShootFromCamera    60.0
+// byte-exact on two independent records authored nine years apart (the base
+// record closes 459 of 459, the patch record 543 of 543, and they agree on
+// every field they share). If that system is live, the engine is entitled to
+// take the shot from the CAMERA instead of the weapon once the angle between
+// them passes a threshold. In third person the camera and the gun are nearly
+// aligned so 60 degrees is unreachable. In VR you reach it by turning your
+// head, which is the exact condition the owner describes in CX-002, and
+// CX-006 is "the bullet does not go where the gun is pointing". Nothing
+// anywhere in this mod knows this system exists.
+//
+// THE ROUTE. Every offset below was re-derived from the INSTALLED GRW.exe's
+// reflection records (a record's field offset is dword[rec_rva+0x0C] >> 18),
+// not borrowed from a report and not from another binary:
+//     weapon = iface - 0x80   is GR_cWeaponComponent (0x1B15F6FA, size 0x260)
+//       +0x0A8  m_AssociatedEssence  -> WeaponEssence          (kind 18, ptr)
+//                 +0x058  m_WeaponConstants -> GR_DBWeaponConstants
+//       +0x128  sGlaringScopeSubComponent                (kind 20, sub-object)
+//                 +0x020  m_WeaponConstants -> GR_DBWeaponConstants
+//     db +0x13C u8 enable, +0x140 float cancel-focus, +0x144 float from-camera
+//
+// The class identification is not assumed. GR_cWeaponComponent is the ONLY
+// class in the whole 5,439-class registry carrying m_bPlayerOrReplica at
+// +0xEA, which is the byte the owner gate above already reads. It is
+// corroborated a second way: the registry says +0xB0/+0xC0/+0xD0 are three
+// 16-byte BoneHandles, which is exactly the 48 raw bytes build 106 already
+// dumps from +0xB0.
+//
+// TWO ROUTES ON PURPOSE. GR_DBWeaponConstants has exactly ONE instance in the
+// entire install, so both routes must land on the SAME pointer. Agreement is
+// the self-check. Disagreement is a real finding and is reported as one
+// rather than averaged away.
+//
+// Rule 8: plain stores only, no logging, no allocation, no lock, no COM. It
+// is ONE-SHOT, so after the first success it costs one load and one branch
+// per call. It runs in its OWN __try so a fault here cannot skip the aim path
+// that wraps it.
+volatile uint32_t g_wc_state   = 0;    // 0 not tried, 1 captured, 2 faulted
+// BUILD 135: the entry claim, separate from g_wc_state because drain() reads
+// g_wc_state to decide whether there is anything to print. Claiming through
+// the state word would publish "captured" before the capture had run.
+volatile long     g_wc_claim   = 0;    // 0 unclaimed, 1 a thread is inside
+volatile uint64_t g_wc_weapon  = 0;    // GR_cWeaponComponent
+volatile uint64_t g_wc_essence = 0;    // WeaponEssence, via +0xA8
+volatile uint64_t g_wc_db_a    = 0;    // datablock via the essence route
+volatile uint64_t g_wc_db_b    = 0;    // datablock via the scope route
+volatile uint32_t g_wc_hybrid  = 0xFFFFFFFFu;   // v_bEnableHybridShootSystem
+float    g_wc_cancel_deg = -1.0f;      // v_fMinAngleToCancelFocusPoint
+float    g_wc_camera_deg = -1.0f;      // v_fMinAngleToShootFromCamera
+volatile uint32_t g_wc_printed = 0;
+
 // BUILD 106.1: the census is PER WEAPON, not one global snapshot. Three
 // reasons, all of which would have made the last run thin:
 //
@@ -189,6 +443,11 @@ volatile uint32_t g_ap_slots_used = 0;
 volatile uint32_t g_ap_slots_full = 0;   // a weapon we had no room for
 // Build 107: the guided protocol. 0 idle, 1 arm requested, 2 running.
 volatile uint32_t g_guide_state = 0;
+// 2026-09-01: cfg voice_guide, default 0. Whether the protocol ANNOUNCES
+// itself once per session. The test itself is unchanged and End still starts
+// it; this only stops it inviting the tester into a different procedure than
+// the one they are actually running.
+volatile uint32_t g_voice_guide = 0;
 uint32_t g_guide_ticks = 0;
 uint32_t g_guide_done  = 0;
 
@@ -274,6 +533,25 @@ struct RayRow {
 volatile RayRow   g_ray[kMaxRay] = {};
 volatile int      g_ray_count = 0;
 volatile uint64_t g_ray_calls = 0;
+
+// BUILD 302: THE SHOT RAY RECORDER (log only, his priority 2026-10-12: "the head orientation controls the bullet trajectory
+// again"). The 301 log proved the shot leaves SetShotLine on the barrel while the engine's own direction followed the head
+// 35 deg away, so the pull is downstream: the trace (TraceSegment builds the ray from ctx+0x190 to ctx+0x1a0 and casts it,
+// HANDOFF-2026-08-28 section 3) or a second cast from the camera. Every raycast whose origin is within kSrNearM of the
+// player's muzzle, in the kSrFrames Presents after one of his shots, is stored with that shot's number; the drain prints
+// each against the barrel we wrote and the engine's head direction. Rule 8: plain stores, one atomic frame read, no calls.
+struct ShotRay { uint32_t tag; uint32_t rva; uint64_t frame; float v[8]; };
+constexpr int      kSrSlots  = 256;            // power of two
+constexpr uint64_t kSrFrames = 10;             // Presents after a shot during which rays are recorded (the trace fires on the next tick)
+constexpr float    kSrNearM  = 4.0f;           // metres from the muzzle the ray's origin must be within
+constexpr uint32_t kSrPerShot = 96;            // rays kept per shot, the FIRST ones (the ring must never lap over the first segment)
+ShotRay            g_sr[kSrSlots] = {};
+volatile uint32_t  g_sr_w       = 0;           // write cursor, free-running
+volatile uint32_t  g_sr_printed = 0;
+volatile uint64_t  g_sr_shot_frame = 0;        // Present count at the last SetShotLine of HIS shot (0 = never)
+volatile uint32_t  g_sr_tag_n   = 0;           // rays stored for the current shot tag
+volatile uint32_t  g_sr_tag     = 0;           // the tag g_sr_tag_n counts for
+volatile uint64_t  g_sr_seen    = 0;           // rays inside the window, before the distance test
 
 // Build 55: the aim orientation quaternion override. The rotation is
 // PRECOMPUTED when the cfg changes, so the hot path is a quaternion multiply
@@ -380,6 +658,15 @@ volatile float    g_cl_pos[3] = {0, 0, 0};
 volatile uint32_t g_cl_pos_ok = 0;
 volatile float    g_cr_up[3]  = {0, 0, 0};
 volatile uint32_t g_cr_up_ok  = 0;
+// BUILD 158: the LEFT controller's forward and up, for the free hand's wrist.
+volatile float    g_cl_fwd[3] = {0, 0, 0};
+volatile float    g_cl_up[3]  = {0, 0, 0};
+volatile uint32_t g_cl_vec_ok = 0;
+// BUILD 162: the LEFT controller's GRIP-pose +Y and +Z axes, engine world
+// space, for the absolute wrist. Same contract: ok=false is a dropout.
+volatile float    g_cl_gy[3]   = {0, 0, 0};
+volatile float    g_cl_gz[3]   = {0, 0, 0};
+volatile uint32_t g_cl_grip_ok = 0;
 volatile uint32_t g_cr_armed  = 0;           // cfg bullet_ctrl
 volatile uint32_t g_fly_on    = 0;           // this flight is being relocated
 volatile float    g_fly_org[3]   = {};       // ray origin = spawn origin
@@ -444,6 +731,46 @@ bool verify_site(const uint8_t* base, uintptr_t site, uintptr_t stub,
              what, (unsigned long long)site);
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// BUILD 136: SetShotLine's prologue, 24 bytes.
+//
+//   48 89 E0              mov  rax, rsp
+//   53                    push rbx
+//   41 56                 push r14
+//   41 57                 push r15
+//   48 81 EC E0 00 00 00  sub  rsp, 0E0h
+//   F3 41 0F 10 50 04     movss xmm2, [r8+4]
+//   48 89 CB              mov  rbx, rcx
+//
+// NO absolute address and NO rip-relative displacement anywhere in it, which
+// is what lets it survive a rebase and, per method rule 6.3, a different store
+// of the same game version. The `movss xmm2,[r8+4]` is also the proof that r8
+// is a pointer being dereferenced rather than a scalar argument.
+//
+// This is matched against the BODY. The hook then goes on the body's single
+// jmp thunk, found by sig::find_thunk_to, because the prologue begins
+// `mov rax, rsp` and ThunkHook.h hazard 2 is precisely that an rsp-relative
+// prologue cannot be safely stolen into a trampoline.
+constexpr const char* kShotLineSig =
+    "48 89 E0 53 41 56 41 57 48 81 EC E0 00 00 00 F3 41 0F 10 50 04 48 89 CB";
+
+hook::ThunkHook g_shotline_hook;
+
+// BUILD 154: the two trajectory generator bodies. Both were confirmed UNIQUE
+// in this build, and both prologues are free of absolute and rip-relative
+// bytes, so they survive a rebase for the same reason kShotLineSig does. Each
+// reaches its callers through exactly one padded thunk (method rule 6.2), so
+// the hook goes on the thunk exactly as SetShotLine's does.
+constexpr const char* kGenASig =
+    "40 53 56 57 41 54 41 55 48 81 EC B0 00 00 00 31 FF 0F 29 B4 24 A0 00 00 "
+    "00 45 0F B6 E9 4C 89 C6";
+constexpr const char* kGenBSig =
+    "40 53 56 57 41 54 41 55 48 81 EC A0 00 00 00 31 F6 0F 29 B4 24 90 00 00 "
+    "00 45 89 CD 4C 89 C7 0F";
+
+hook::ThunkHook g_gen_a_hook;
+hook::ThunkHook g_gen_b_hook;
 
 }  // namespace
 }  // namespace aimtrace
@@ -639,7 +966,7 @@ extern "C" void grwxr_wfire_record(uint64_t ret_addr, uint64_t self,
 
 // Build 54's recorder. This runs on the hottest path in the process, so it is
 // deliberately dull: a bounded scan of 12 rows, eight float loads, plain
-// stores. No logging, no locks, no allocation, no calls out (project rule 8).
+// stores. No logging, no locks, no allocation, no calls out (CLAUDE.md rule 8).
 extern "C" void grwxr_ray_record(uint64_t ret_addr, const float* ray) {
     using namespace grwxr::aimtrace;
     g_ray_calls = g_ray_calls + 1;
@@ -670,6 +997,28 @@ extern "C" void grwxr_ray_record(uint64_t ret_addr, const float* ray) {
             for (int k = 0; k < 8; ++k) g_ray[slot].v[k] = ray[k];
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
+    // BUILD 302: the shot ray recorder. Inside the window after his shot, a ray starting near his muzzle is stored.
+    const uint64_t sf = g_sr_shot_frame;
+    if (sf && ray && g_sd_muz_ok) {
+        const uint64_t now = grwxr::d3d11::frame_count();
+        if (now >= sf && now - sf <= kSrFrames) {
+            g_sr_seen = g_sr_seen + 1;
+            __try {
+                const float dx = ray[0] - g_sd_muz[0], dy = ray[1] - g_sd_muz[1], dz = ray[2] - g_sd_muz[2];
+                if (dx * dx + dy * dy + dz * dz < kSrNearM * kSrNearM) {
+                    const uint32_t tag = g_sl_w;
+                    if (tag != g_sr_tag) { g_sr_tag = tag; g_sr_tag_n = 0; }
+                    if (g_sr_tag_n >= kSrPerShot) return;
+                    g_sr_tag_n = g_sr_tag_n + 1;
+                    const uint32_t wi = g_sr_w;
+                    ShotRay* r = &g_sr[wi & (kSrSlots - 1)];
+                    r->tag = g_sl_w; r->rva = rva; r->frame = now;
+                    for (int k = 0; k < 8; ++k) r->v[k] = ray[k];
+                    g_sr_w = wi + 1;               // published last
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
 }
 
 // Build 55. Post-multiplies the engine's own aim quaternion by our rotation,
@@ -693,6 +1042,22 @@ extern "C" void grwxr_muzpt_post(const float* out, uint64_t iface) {
         g_ap_muzzle[1] = out[1];
         g_ap_muzzle[2] = out[2];
         g_ap_have_muz  = 1;
+
+        // BUILD 137: the same point, published separately and ONLY when the
+        // weapon belongs to the player. m_bPlayerOrReplica is at +0xEA of
+        // GR_cWeaponComponent and weapon = iface - 0x80, exactly as the aim
+        // getter's own owner gate reads them; the census in this file pairs
+        // aim to muzzle by iface, so the two getters agree on what iface is.
+        //
+        // This is the gate that keeps the direction write off AI. It is inside
+        // the enclosing __try, so a bad read costs the publish, not the shot.
+        if (*(const uint8_t*)(iface - 0x80 + 0xEA)) {
+            g_sd_muz[0] = out[0];
+            g_sd_muz[1] = out[1];
+            g_sd_muz[2] = out[2];
+            _ReadWriteBarrier();       // vector before the flag, as elsewhere
+            g_sd_muz_ok = 1;
+        }
         if (ApSlot* sl = ap_slot_for(iface)) {
             if (!sl->printed) {
                 sl->muz[0] = out[0]; sl->muz[1] = out[1];
@@ -705,6 +1070,332 @@ extern "C" void grwxr_muzpt_post(const float* out, uint64_t iface) {
 }
 
 // ---------------------------------------------------------------------------
+// BUILD 137: the direction write. Called from the recorder, inside its __try.
+//
+// Arithmetic and stores only, like everything else on this path, and it runs
+// once per shot rather than once per frame. Returns the reason code the drain
+// prints, and writes the new vector through `dir`, which is the engine's own
+// buffer: the stub hands the same pointer to the real SetShotLine afterwards.
+//
+// WHAT IS NOT DONE HERE, and it is deliberate. The ORIGIN is left alone. In hip
+// fire it is already the muzzle, and in ADS it is the camera, which cannot be
+// repaired by a direction alone and is a separate question with its own build.
+// The magnitude is preserved too: build 136 measured |dir| = 0.9847 in hip fire
+// and exactly 1.0000 in ADS, so the engine does not always hand this function a
+// unit vector, and normalising it here would be a second, unasked change riding
+// along with the first.
+static uint32_t sd_apply(float* org, float* dir, float out_new[3],
+                         float* out_dpm) {
+    using namespace grwxr::aimtrace;
+    if (!g_sd_armed)   return kSdOff;
+    if (!org || !dir)  return kSdNoPtr;
+
+    // Interlock 1: is this shot ours? The only shot in the game that begins at
+    // the player's own muzzle is the player's own, and the same test excludes
+    // ADS, whose origin is the camera about a metre away.
+    if (!g_sd_muz_ok) return kSdNoMuzzle;
+    const float mx = org[0] - g_sd_muz[0];
+    const float my = org[1] - g_sd_muz[1];
+    const float mz = org[2] - g_sd_muz[2];
+    const float dpm = sqrtf(mx * mx + my * my + mz * mz);
+    *out_dpm = dpm;
+    if (!(dpm < kSdGateM)) {                    // !( < ) also rejects NaN
+        // BUILD 152: THE ORIGIN WRITE. "Not at our muzzle" is no longer the
+        // end of it. The 03:05 session (grwxr-25048) caught live what the
+        // build-133 comment predicted: the engine relocates the PLAYER's shot
+        // origin to the camera in ordinary play (eleven shots WROTE, then ten
+        // straight with the origin at dOrgCam 0.31..0.55 while the barrel sat
+        // as little as 5.6 deg off the gaze). Refusing those hands the round
+        // to the engine's camera-converged aim, which is the owner's "acts
+        // right for the first couple of shots but it misses".
+        //
+        // Repair instead of refuse, but ONLY when the shot is PROVEN ours,
+        // and every test an AI shot could pass is paired with one it cannot:
+        // its origin is at ITS muzzle (metres from our camera), and even one
+        // fired point-blank AT the player's head points AGAINST the view.
+        if (!g_sd_org_armed) return kSdNotOurs;
+        float cam[3];
+        if (!grwxr::camera::base_pos(cam)) return kSdNotOurs;
+        const float ox = org[0] - cam[0];
+        const float oy = org[1] - cam[1];
+        const float oz = org[2] - cam[2];
+        const float dcam = sqrtf(ox * ox + oy * oy + oz * oz);
+        if (!(dcam < kSdCamGateM)) return kSdNotOurs;
+        float vf[3];
+        if (!view_fwd(vf)) return kSdNotOurs;
+        const float dn0 = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] +
+                                dir[2] * dir[2]);
+        if (!(dn0 > 1e-4f)) return kSdBadVec;
+        const float conv = (dir[0] * vf[0] + dir[1] * vf[1] +
+                            dir[2] * vf[2]) / dn0;
+        if (!(conv > 0.5f)) return kSdNotOurs;
+        if (!g_sd_live) return kSdStale;
+        float bd2[3];
+        uint32_t gen2 = 0;
+        if (!barrel_dir_peek(bd2, &gen2) || gen2 == 0) return kSdStale;
+        const float bn2 = sqrtf(bd2[0] * bd2[0] + bd2[1] * bd2[1] +
+                                bd2[2] * bd2[2]);
+        if (!(bn2 > 1e-4f)) return kSdBadVec;
+        const float k2 = dn0 / bn2;
+        const float rx = bd2[0] * k2, ry = bd2[1] * k2, rz = bd2[2] * k2;
+        if (!(rx == rx) || !(ry == ry) || !(rz == rz)) return kSdBadVec;
+        // Origin back to the player's own muzzle (the getter published it
+        // fresh this frame, at the hands, while the engine's copy sat at the
+        // camera: the 03:05 refused shots carried dPlayerMuz 0.65..1.52 with
+        // the muzzle tracking live). Direction onto the barrel with the
+        // engine's own magnitude, w components untouched: org and dir are
+        // rows of one engine struct (dPtr = 16) and both rows are writable.
+        org[0] = g_sd_muz[0];
+        org[1] = g_sd_muz[1];
+        org[2] = g_sd_muz[2];
+        dir[0] = rx;
+        dir[1] = ry;
+        dir[2] = rz;
+        out_new[0] = rx;
+        out_new[1] = ry;
+        out_new[2] = rz;
+        g_sd_worg_n = g_sd_worg_n + 1;
+        return kSdWroteOrg;
+    }
+
+    // Interlock 2: is the barrel direction from this second, or from whenever
+    // the weapon writer last ran? Liveness is sampled by the drain, so there is
+    // no clock call here.
+    if (!g_sd_live) return kSdStale;
+    float bd[3];
+    uint32_t gen = 0;
+    if (!barrel_dir_peek(bd, &gen) || gen == 0) return kSdStale;
+
+    const float bn = sqrtf(bd[0] * bd[0] + bd[1] * bd[1] + bd[2] * bd[2]);
+    if (!(bn > 1e-4f)) return kSdBadVec;
+
+    // Interlock 3: finite and non-degenerate, carrying the engine's own length.
+    const float dn = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+    const float k  = (dn > 1e-4f) ? (dn / bn) : (1.0f / bn);
+    const float nx = bd[0] * k, ny = bd[1] * k, nz = bd[2] * k;
+    if (!(nx == nx) || !(ny == ny) || !(nz == nz)) return kSdBadVec;
+
+    dir[0] = nx;
+    dir[1] = ny;
+    dir[2] = nz;
+    out_new[0] = nx;
+    out_new[1] = ny;
+    out_new[2] = nz;
+    g_sd_wrote_n = g_sd_wrote_n + 1;
+    return kSdWrote;
+}
+
+// ---------------------------------------------------------------------------
+// BUILD 136: the SetShotLine recorder. Rule 8: stores only.
+//
+// Both vectors are read as float4 because the disassembled prologue reads
+// [r8+4] as an SSE scalar, so the direction is at least a float2 and the
+// engine's own vector type here is 16 bytes. Reading four keeps the option of
+// seeing a w component that distinguishes a point from a direction, which is
+// question 2 in HANDOFF-2026-08-28 section 5.
+//
+// The pointers are recorded as well as the values. dPtr = dirp - orgp answers,
+// for free, whether the caller handed us two rows of one transform (a small
+// constant like 16 or 32) or two unrelated buffers.
+//
+// BUILD 137: it is no longer only a recorder. The engine's own vectors are
+// captured FIRST and unmodified, so `dir=` in the log still means what it has
+// always meant, and only then is sd_apply given the chance to replace one.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// BUILD 154: the generator recorder. RULE 8, and it is the strictest case in
+// this file because it runs on the engine's own shot path: a handful of plain
+// aligned stores into a fixed ring, no logging, no allocation, no locks, no
+// calls out, and NO modification of anything the engine owns.
+//
+// Unsynchronised on purpose, like every other recorder here. A race can only
+// cost one stashed call, and a lost stash degrades to why=no-arc on that shot
+// rather than to a wrong arc.
+// ---------------------------------------------------------------------------
+extern "C" void grwxr_gen_record(void* bal, float elev, void* arc,
+                                 uint32_t flag, uint32_t which) {
+    using namespace grwxr::aimtrace;
+    g_gen_calls = g_gen_calls + 1;
+    if (!arc) return;
+    const uint32_t i = g_gen_w;
+    GenCall* g = &g_gen[i & (kGenSlots - 1)];
+    g->ctx   = (uint64_t)arc - 0x170;   // the disassembled r8 = shotctx + 0x170
+    g->bal   = (uint64_t)bal;
+    g->arc   = (uint64_t)arc;
+    g->flag  = flag;
+    g->elev  = elev;
+    g->which = which;
+    g_gen_w  = i + 1;                   // published last
+}
+
+namespace grwxr {
+namespace aimtrace {
+namespace {
+
+// BUILD 154: rebuild the arc on the barrel's own elevation.
+//
+// Called ONLY after sd_apply has ruled the shot ours, so every AI-safety
+// interlock build 137 established has already passed. It re-invokes the
+// engine's own generator with the arguments that generator was given, and the
+// elevation replaced. Same output buffer, so the arc is rebuilt in place and
+// SetShotLine, running next, transforms the corrected one.
+//
+// out_eng receives the elevation the engine used, out_our what we substituted.
+// Logging both is what makes the sign convention self-proving in the first
+// shot of the first session rather than an argument afterwards.
+uint32_t vt_apply(uint64_t ctx, float* out_eng, float* out_our) {
+    if (!g_vt_armed) return kVtOff;
+
+    // Most recent stashed generator call for THIS shot context. Newest first,
+    // because a ctx can be reused across shots and the live one is the last.
+    const uint32_t w = g_gen_w;
+    const GenCall* hit = nullptr;
+    for (uint32_t k = 0; k < (uint32_t)kGenSlots; ++k) {
+        const GenCall* g = &g_gen[(w - 1 - k) & (kGenSlots - 1)];
+        if (g->arc && g->ctx == ctx) { hit = g; break; }
+    }
+    if (!hit) return kVtNoArc;
+
+    gen_fn fn = (gen_fn)(hit->which == 0 ? (void*)grwxr_gen_a_orig
+                                         : (void*)grwxr_gen_b_orig);
+    if (!fn) return kVtNoFn;
+
+    // The same barrel the direction write uses, and the same freshness gate,
+    // so the two halves of one shot can never come from different frames.
+    float bd[3];
+    uint32_t gen = 0;
+    if (!g_sd_live) return kVtStale;
+    if (!barrel_dir_peek(bd, &gen) || gen == 0) return kVtStale;
+    const float bn = sqrtf(bd[0] * bd[0] + bd[1] * bd[1] + bd[2] * bd[2]);
+    if (!(bn > 1e-4f)) return kVtBadVec;
+
+    float s = bd[2] / bn;                       // engine is z-up
+    if (s > 1.0f) s = 1.0f; else if (s < -1.0f) s = -1.0f;
+    float deg = asinf(s) * 57.29577951f;
+    if (!(deg == deg)) return kVtBadVec;
+    // The engine's own clamp, matched rather than guessed: the disassembled
+    // path clamps to +-89.99 before the generator ever sees the value.
+    if (deg > 89.99f) deg = 89.99f; else if (deg < -89.99f) deg = -89.99f;
+
+    *out_eng = hit->elev;
+    *out_our = deg;
+
+    __try {
+        fn((void*)hit->bal, deg, (void*)hit->arc, hit->flag);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return kVtFault;
+    }
+    g_vt_wrote_n = g_vt_wrote_n + 1;
+    return kVtWrote;
+}
+
+}  // namespace
+}  // namespace aimtrace
+}  // namespace grwxr
+
+extern "C" void grwxr_shotline_pre(uint64_t ctx, const float* org, float* dir) {
+    using namespace grwxr::aimtrace;
+    g_sl_calls = g_sl_calls + 1;
+
+    const uint32_t i = g_sl_w;
+    ShotLine* s = &g_sl[i & (kSlSlots - 1)];
+    s->ctx  = ctx;
+    s->orgp = (uint64_t)org;
+    s->dirp = (uint64_t)dir;
+    for (int k = 0; k < 4; ++k) { s->org[k] = 0.0f; s->dir[k] = 0.0f; }
+    s->ndir[0] = s->ndir[1] = s->ndir[2] = 0.0f;
+    s->dpm = -1.0f;
+    s->vtwhy = kVtNotOur;
+    s->vt_eng = s->vt_our = s->vt_fromdir = 0.0f;
+    // Set before the guarded section, so a fault reports itself as a fault
+    // rather than inheriting whatever the previous occupant of this slot said.
+    s->why = kSdFault;
+    __try {
+        if (org) for (int k = 0; k < 4; ++k) s->org[k] = org[k];
+        if (dir) for (int k = 0; k < 4; ++k) s->dir[k] = dir[k];
+        // BUILD 152: org is handed on writable. It is the engine's own shot
+        // descriptor (orgp and dirp sit 16 bytes apart in one struct), and
+        // the direction row has been written through since build 137; the
+        // const on this signature was documentation, not a property of the
+        // memory.
+        s->why = sd_apply(const_cast<float*>(org), dir, s->ndir, &s->dpm);
+        // BUILD 154: THE VERTICAL, and it runs here for a reason. sd_apply has
+        // just ruled on whether this shot is the player's, using the interlocks
+        // that have kept AI fire untouched since build 137. Only a shot that
+        // passed them gets its arc rebuilt, which is why the generators
+        // themselves modify nothing.
+        if (s->why == kSdWrote || s->why == kSdWroteOrg) {
+            // The convention check, from the engine's OWN direction as captured
+            // above, before anything was written through it.
+            const float ex = s->dir[0], ey = s->dir[1], ez = s->dir[2];
+            const float en = sqrtf(ex * ex + ey * ey + ez * ez);
+            if (en > 1e-4f) {
+                float t = ez / en;
+                if (t > 1.0f) t = 1.0f; else if (t < -1.0f) t = -1.0f;
+                s->vt_fromdir = asinf(t) * 57.29577951f;
+            }
+            s->vtwhy = vt_apply(ctx, &s->vt_eng, &s->vt_our);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    if (s->why != kSdWrote && s->why != kSdWroteOrg)
+        g_sd_left_n = g_sd_left_n + 1;
+    else
+        g_sr_shot_frame = grwxr::d3d11::frame_count();   // BUILD 302: open the ray recorder's window on HIS shot only
+    s->seq = i;
+    // Published last, so the drain never reads a half-written slot.
+    g_sl_w = i + 1;
+}
+
+// ---------------------------------------------------------------------------
+// BUILD 133: one-shot read of the hybrid-shoot constants. See the state block
+// at g_wc_state for the derivation of every offset and why two routes.
+//
+// Own __try, and every dereference is a separate step so a fault names itself
+// by which pointer is still zero in the log rather than reporting a blanket
+// failure. Returns nothing: the log is written by drain(), never from here.
+static void wc_capture_once(uint64_t weapon) {
+    using namespace grwxr::aimtrace;
+    if (g_wc_state != 0 || !weapon) return;
+
+    // BUILD 135: the guard is a CLAIM, not a bare read. Build 133 read
+    // g_wc_state, ran the whole body, then stored, so three threads entered
+    // before the first store and took three access violations inside our own
+    // DLL (dxgi.dll+0xA7D18, all at 03:28:09.113 in grwxr-28604). __except
+    // contained them and the run continued 68 s, but three faults per run is
+    // noise in a probe, and the next reuse of this machinery is the O-7
+    // handle build. Same idiom as WeaponProbe.cpp:156. The loser returns
+    // immediately: this is a one-shot, so there is nothing to wait for.
+    if (InterlockedCompareExchange(&g_wc_claim, 1, 0) != 0) return;
+
+    __try {
+        g_wc_weapon = weapon;
+
+        // Route A: the associated essence. kind 18, an ordinary class pointer.
+        const uint64_t essence = *(const uint64_t*)(weapon + 0xA8);
+        g_wc_essence = essence;
+        const uint64_t db_a = essence ? *(const uint64_t*)(essence + 0x58) : 0;
+        g_wc_db_a = db_a;
+
+        // Route B: the glaring-scope sub-component. kind 20 is a sub-object
+        // HANDLE, which may be a pointer or may need resolving, so this is the
+        // cross-check and never the primary. A zero here is not a failure of
+        // the read, it is an answer about what kind 20 means.
+        const uint64_t scope = *(const uint64_t*)(weapon + 0x128);
+        const uint64_t db_b = scope ? *(const uint64_t*)(scope + 0x20) : 0;
+        g_wc_db_b = db_b;
+
+        // Route A is authoritative. Nothing is read out of a null.
+        if (!db_a) { g_wc_state = 2; return; }
+        g_wc_hybrid     = *(const uint8_t*)(db_a + 0x13C);
+        g_wc_cancel_deg = *(const float*)  (db_a + 0x140);
+        g_wc_camera_deg = *(const float*)  (db_a + 0x144);
+        g_wc_state = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_wc_state = 2;
+    }
+}
+
 // BUILD 105: the aiming-point world getter. This is the A/B.
 //
 // Contract, fully known and verified in all four binaries:
@@ -756,6 +1447,10 @@ extern "C" void grwxr_aimpt_post(float* out, uint64_t iface) {
 
         if (!is_player) { g_ap_ai = g_ap_ai + 1; return; }
         g_ap_player = g_ap_player + 1;
+
+        // BUILD 133: one-shot, player weapons only. Costs one load and one
+        // branch per call once it has answered.
+        wc_capture_once(weapon);
 
         if (!g_ap_armed) return;
 
@@ -981,6 +1676,143 @@ bool install_aimpoint() {
         g_muzpt_hook.install(base + gb->muzzlept_thunk, base + gb->muzzlept_impl,
                              (void*)&grwxr_muzpt_entry, "muzzle anchor");
     }
+
+    // -----------------------------------------------------------------------
+    // BUILD 136: SETSHOTLINE. The only hook in this file with no pinned RVA.
+    //
+    // The whole image is scanned, not one section. HANDOFF-2026-08-28 section
+    // 5 said "scan .link only", but method rule 6.3 in the same document
+    // records that Denuvo RENAMES SECTIONS PER BUILD, and Sig.h standing rule
+    // 3 forbids filtering by section name because Wildlands' real code already
+    // lives in a section called .sbss. Scanning by name would be the one
+    // choice guaranteed to break on the next update. find_unique skips
+    // uncommitted pages, so a full sweep is safe and costs a moment on the
+    // init thread.
+    //
+    // Every failure path below installs NOTHING and logs why (CLAUDE.md rule
+    // 7). A missing probe must never stop the game.
+    // -----------------------------------------------------------------------
+    {
+        size_t m = 0;
+        auto img = sig::main_image();
+        if (!img) {
+            LOG_WARN("shotline: main image headers unreadable. Probe NOT "
+                     "installed; the game runs normally.");
+        } else if (auto body = sig::find_unique(*img, kShotLineSig, &m)) {
+            const size_t body_rva = (size_t)((uint8_t*)*body - base);
+            size_t tm = 0;
+            auto thunk = sig::find_thunk_to(*img, *body, &tm);
+            if (!thunk) {
+                LOG_WARN("shotline: body found at RVA 0x%08zX, but %zu padded "
+                         "thunks jump to it and exactly 1 was expected "
+                         "(method rule 6.2). Probe NOT installed; the game "
+                         "runs normally.", body_rva, tm);
+            } else {
+                const size_t thunk_rva = (size_t)((uint8_t*)*thunk - base);
+                grwxr_shotline_orig = (uint64_t)*body;
+                if (g_shotline_hook.install(*thunk, (void*)*body,
+                                            (void*)&grwxr_shotline_entry,
+                                            "SetShotLine")) {
+                    LOG_INFO("shotline: INSTALLED. body RVA 0x%08zX, thunk RVA "
+                             "0x%08zX, 1 signature match, 1 thunk. Fires once "
+                             "per shot.", body_rva, thunk_rva);
+                    // BUILD 137: say the arming state HERE, at install, rather
+                    // than leaving it to be inferred from a counter later. A
+                    // feature that is off looks identical in the log to a
+                    // feature that is on and never triggered, and this project
+                    // has spent whole sessions on exactly that ambiguity.
+                    LOG_INFO("shot_dir: %s at startup (cfg shot_dir, "
+                             "hot-reloadable, default 1). Gate: the shot must "
+                             "start within %.2f m of your own muzzle, and the "
+                             "weapon writer (cfg wgun) must be publishing.",
+                             g_sd_armed ? "ARMED" : "off", kSdGateM);
+                } else {
+                    grwxr_shotline_orig = 0;
+                    LOG_WARN("shotline: the thunk at RVA 0x%08zX refused the "
+                             "rewrite. Probe NOT installed; the game runs "
+                             "normally.", thunk_rva);
+                }
+            }
+        } else {
+            LOG_WARN("shotline: prologue signature matched %zu times, exactly "
+                     "1 expected. Probe NOT installed; the game runs normally. "
+                     "%s", m,
+                     m == 0 ? "0 matches usually means the game was updated."
+                            : ">1 means the pattern is too short for this "
+                              "binary.");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // BUILD 154: THE TWO TRAJECTORY GENERATORS. Same discipline as SetShotLine
+    // above: signature to body, body to its single padded thunk, and every
+    // failure path installs NOTHING and says why (rule 7). The vertical simply
+    // stays broken if either is missing, which is exactly today's behaviour.
+    // -----------------------------------------------------------------------
+    {
+        auto img = sig::main_image();
+        if (!img) {
+            LOG_WARN("shot_pitch: main image headers unreadable. The vertical "
+                     "correction is NOT installed; the game runs normally.");
+        } else {
+            struct GenTarget {
+                const char*      sig;
+                uint64_t*        orig;
+                void             (*entry)();
+                hook::ThunkHook* hook;
+                const char*      name;
+            } targets[2] = {
+                { kGenASig, &grwxr_gen_a_orig, &grwxr_gen_a_entry,
+                  &g_gen_a_hook, "trajectory generator A" },
+                { kGenBSig, &grwxr_gen_b_orig, &grwxr_gen_b_entry,
+                  &g_gen_b_hook, "trajectory generator B" },
+            };
+            int installed = 0;
+            for (int i = 0; i < 2; ++i) {
+                size_t gm = 0;
+                auto body = sig::find_unique(*img, targets[i].sig, &gm);
+                if (!body) {
+                    LOG_WARN("shot_pitch: %s signature matched %zu times, 1 "
+                             "expected. NOT installed. %s", targets[i].name, gm,
+                             gm == 0 ? "0 usually means the game was updated."
+                                     : ">1 means the pattern is too short.");
+                    continue;
+                }
+                const size_t body_rva = (size_t)((uint8_t*)*body - base);
+                size_t tm = 0;
+                auto thunk = sig::find_thunk_to(*img, *body, &tm);
+                if (!thunk) {
+                    LOG_WARN("shot_pitch: %s body at RVA 0x%08zX, but %zu "
+                             "padded thunks jump to it and exactly 1 was "
+                             "expected (method rule 6.2). NOT installed.",
+                             targets[i].name, body_rva, tm);
+                    continue;
+                }
+                *targets[i].orig = (uint64_t)*body;
+                if (targets[i].hook->install(*thunk, (void*)*body,
+                                             (void*)targets[i].entry,
+                                             targets[i].name)) {
+                    ++installed;
+                    LOG_INFO("shot_pitch: %s INSTALLED. body RVA 0x%08zX, "
+                             "thunk RVA 0x%08zX. Observer only: it records the "
+                             "launch elevation and modifies nothing.",
+                             targets[i].name, body_rva,
+                             (size_t)((uint8_t*)*thunk - base));
+                } else {
+                    *targets[i].orig = 0;
+                    LOG_WARN("shot_pitch: %s thunk refused the rewrite. NOT "
+                             "installed.", targets[i].name);
+                }
+            }
+            LOG_INFO("shot_pitch: %s at startup (cfg shot_pitch, "
+                     "hot-reloadable, default 1), %d of 2 generators hooked. "
+                     "SetShotLine never reads the vertical (it reads [r8] and "
+                     "[r8+4] only), so the arc is rebuilt on the barrel angle "
+                     "AFTER the shot has already passed the same player gate "
+                     "that protects AI fire. why=PITCH means it ran.",
+                     g_vt_armed ? "ARMED" : "off", installed);
+        }
+    }
     return g_aimpt_hook.installed();
 }
 
@@ -988,6 +1820,218 @@ bool install_aimpoint() {
 // cfg aim_trace AND on the getyaw/getpitch hooks being installed, and neither
 // is true in the configuration this experiment runs in.
 void drain_aimpoint() {
+    // -----------------------------------------------------------------------
+    // BUILD 136: THE SHOT LINES. Drained BEFORE the aim-point guard below,
+    // because this hook installs independently of the aim-point getter and a
+    // probe that installed must never be silenced by a sibling that did not.
+    //
+    // A distance of -1.000 means the input it needed was absent, never a real
+    // measurement: dOrgMuzzle needs a muzzle anchor to have resolved this run,
+    // dOrgCam needs camera::base_pos to succeed. Real distances cannot be
+    // negative, so the sentinel is unambiguous to sweep_logs.py.
+    // -----------------------------------------------------------------------
+    // BUILD 137: barrel liveness, sampled here rather than read from a clock
+    // inside the shot hook. grwxr_wgun_apply publishes at frame rate whenever a
+    // player skeleton is armed, so a generation that has not moved since the
+    // last drain means the weapon writer is not running at all (cfg wgun = 0,
+    // the gun holstered, no VR, or no player pin) and whatever direction it
+    // left behind is not where the barrel points any more. Worst case staleness
+    // is therefore one drain interval, which is one second.
+    {
+        float bd[3];
+        uint32_t gen = 0;
+        barrel_dir_peek(bd, &gen);
+        const uint32_t live = (gen != g_sd_gen_prev) ? 1u : 0u;
+        g_sd_gen_prev = gen;
+        // Report the EDGE, not the state, so this is silent in the normal case
+        // and loud at the moment the direction write loses its input. Without
+        // it, "the barrel stopped publishing" is only visible on a line that is
+        // printed when a shot happens, which is exactly when it is too late.
+        static uint32_t s_live_said = 2;      // 2 = nothing said yet
+        if (live != s_live_said) {
+            s_live_said = live;
+            if (g_sd_armed) {
+                LOG_INFO("shot_dir: the barrel direction is %s (cfg wgun is "
+                         "%s publishing). wrote=%u worg=%u left=%u",
+                         live ? "LIVE" : "NOT being published",
+                         live ? "" : "not",
+                         (unsigned)g_sd_wrote_n, (unsigned)g_sd_worg_n,
+                         (unsigned)g_sd_left_n);
+            }
+        }
+        g_sd_live = live;
+    }
+
+    // BUILD 302: the shot ray drain. Each stored ray against the shot it followed: the barrel we wrote (new), the engine's
+    // head-following direction (eng), and the view forward. A ray family that sits on eng while new is far from it is the pull.
+    {
+        const uint32_t w = g_sr_w;
+        uint32_t p = g_sr_printed;
+        if (w != p) {
+            if (w - p > (uint32_t)kSrSlots) {
+                LOG_INFO("SHOTRAY lapped: %u rays since the last drain, the ring holds %d; the oldest are lost.", w - p, kSrSlots);
+                p = w - (uint32_t)kSrSlots;
+            }
+            float vf[3] = {0, 0, 0};
+            const bool have_vf = view_fwd(vf);
+            auto angle = [](const float a[3], const float b[3]) {
+                const float na = sqrtf(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
+                const float nb = sqrtf(b[0]*b[0] + b[1]*b[1] + b[2]*b[2]);
+                if (!(na > 1e-6f) || !(nb > 1e-6f)) return -1.0f;
+                float c = (a[0]*b[0] + a[1]*b[1] + a[2]*b[2]) / (na * nb);
+                if (c > 1.0f) c = 1.0f; else if (c < -1.0f) c = -1.0f;
+                return acosf(c) * 57.29577951f;
+            };
+            int printed = 0;
+            for (; p != w; ++p) {
+                const ShotRay* r = &g_sr[p & (kSrSlots - 1)];
+                if (printed >= 48) { LOG_INFO("SHOTRAY: %u more rays this drain not shown", w - p); break; }
+                ++printed;
+                const uint32_t seq = r->tag ? r->tag - 1 : 0;
+                const ShotLine* s = &g_sl[seq & (kSlSlots - 1)];
+                const bool have_s = r->tag != 0 && s->seq == seq && (s->why == kSdWrote || s->why == kSdWroteOrg);
+                // the ray's own direction: `to` minus origin when `to` is a point, else `to` as a direction
+                float d[3] = {r->v[4] - r->v[0], r->v[5] - r->v[1], r->v[6] - r->v[2]};
+                const float dl = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+                const float tl = sqrtf(r->v[4]*r->v[4] + r->v[5]*r->v[5] + r->v[6]*r->v[6]);
+                const bool as_dir = tl > 0.5f && tl < 1.5f && dl > 2.0f * tl;
+                if (as_dir) { d[0] = r->v[4]; d[1] = r->v[5]; d[2] = r->v[6]; }
+                float om[3] = {0, 0, 0};
+                float dmuz = -1.0f;
+                if (have_s) {
+                    om[0] = r->v[0] - s->org[0]; om[1] = r->v[1] - s->org[1]; om[2] = r->v[2] - s->org[2];
+                    dmuz = sqrtf(om[0]*om[0] + om[1]*om[1] + om[2]*om[2]);
+                }
+                LOG_INFO("SHOTRAY seq=%u rva=0x%08X frame=+%llu org=(%.3f %.3f %.3f) to=(%.3f %.3f %.3f) %s len=%.2f "
+                         "dOrgShot=%.3f | vs_new=%.1f vs_eng=%.1f vs_view=%.1f new_vs_eng=%.1f deg "
+                         "(build 302: rays cast within 4 m of your muzzle in the 60 Presents after your shot; new = the barrel we "
+                         "wrote, eng = the engine's own head-following direction, view = the view forward now; the pull is a ray on eng)",
+                         seq, (unsigned)r->rva,
+                         (unsigned long long)(have_s && r->frame >= g_sr_shot_frame ? r->frame - g_sr_shot_frame : 0),
+                         r->v[0], r->v[1], r->v[2], r->v[4], r->v[5], r->v[6], as_dir ? "dir" : "point", as_dir ? tl : dl, dmuz,
+                         have_s ? angle(d, s->ndir) : -1.0f, have_s ? angle(d, s->dir) : -1.0f,
+                         have_vf ? angle(d, vf) : -1.0f, have_s ? angle(s->ndir, s->dir) : -1.0f);
+            }
+            g_sr_printed = w;
+        }
+    }
+
+    {
+        const uint32_t w = g_sl_w;
+        uint32_t p = g_sl_printed;
+        if (w != p) {
+            // Section 4.5's lesson: say what was dropped rather than printing a
+            // silent subset. A lapped ring that reports quietly reads exactly
+            // like a ring that caught everything.
+            if (w - p > kSlSlots) {
+                LOG_INFO("SHOTLINE lapped: %u shots since the last drain but "
+                         "the ring holds %u. Reporting the most recent %u; the "
+                         "rest are lost.",
+                         w - p, kSlSlots, kSlSlots);
+                p = w - kSlSlots;
+            }
+            float cam[3] = {0, 0, 0};
+            const bool have_cam = camera::base_pos(cam);
+            for (; p != w; ++p) {
+                const ShotLine* s = &g_sl[p & (kSlSlots - 1)];
+                const float dl = sqrtf(s->dir[0] * s->dir[0] +
+                                       s->dir[1] * s->dir[1] +
+                                       s->dir[2] * s->dir[2]);
+                float dmuz = -1.0f, dcam = -1.0f;
+                if (g_ap_have_muz) {
+                    const float ax = s->org[0] - g_ap_muzzle[0];
+                    const float ay = s->org[1] - g_ap_muzzle[1];
+                    const float az = s->org[2] - g_ap_muzzle[2];
+                    dmuz = sqrtf(ax * ax + ay * ay + az * az);
+                }
+                if (have_cam) {
+                    const float bx = s->org[0] - cam[0];
+                    const float by = s->org[1] - cam[1];
+                    const float bz = s->org[2] - cam[2];
+                    dcam = sqrtf(bx * bx + by * by + bz * bz);
+                }
+                // BUILD 137: dir= is what the ENGINE built, which is what this
+                // line has always meant, and new= is what the shot actually
+                // left with. They are equal only when why=WROTE. Keeping the
+                // old fields in the old order matters: every sweep pattern in
+                // tools/sweep_logs.py that already matches SHOTLINE keeps
+                // working, and the new columns are additions on the end.
+                LOG_INFO("SHOTLINE seq=%u ctx=%012llX orgp=%012llX "
+                         "dirp=%012llX org=(%.4f %.4f %.4f %.4f) "
+                         "dir=(%.4f %.4f %.4f %.4f) |dir|=%.4f dPtr=%lld "
+                         "dOrgMuzzle=%.3f dOrgCam=%.3f why=%s dPlayerMuz=%.3f "
+                         "new=(%.4f %.4f %.4f)",
+                         s->seq, (unsigned long long)s->ctx,
+                         (unsigned long long)s->orgp,
+                         (unsigned long long)s->dirp,
+                         s->org[0], s->org[1], s->org[2], s->org[3],
+                         s->dir[0], s->dir[1], s->dir[2], s->dir[3],
+                         dl, (long long)s->dirp - (long long)s->orgp,
+                         dmuz, dcam, sd_why(s->why), s->dpm,
+                         s->ndir[0], s->ndir[1], s->ndir[2]);
+
+                // BUILD 154: the vertical, on its own line so every existing
+                // sweep pattern that matches SHOTLINE keeps working untouched.
+                //
+                // eng= is the elevation the engine handed its own arc builder,
+                // fromdir= is that same angle recomputed from the engine's own
+                // direction vector, and our= is what we substituted. eng and
+                // fromdir agreeing proves the decode; eng and fromdir being
+                // NEGATIVES of each other proves our sign is inverted, which
+                // is the one convention risk in this build and is settled by
+                // reading a single line rather than by another session.
+                if (s->why == kSdWrote || s->why == kSdWroteOrg)
+                    LOG_INFO("SHOTPITCH seq=%u ctx=%012llX why=%s "
+                             "eng=%+.2f fromdir=%+.2f our=%+.2f delta=%+.2f "
+                             "deg | arcs=%u rebuilt=%u",
+                             s->seq, (unsigned long long)s->ctx,
+                             vt_why(s->vtwhy), s->vt_eng, s->vt_fromdir,
+                             s->vt_our, s->vt_our - s->vt_eng,
+                             g_gen_calls, g_vt_wrote_n);
+
+                // BUILD 137: say it ONCE, the first time a shot is actually
+                // rewritten. The tester is in a headset and cannot read any of
+                // the above, and "did the feature even arm" is the question
+                // that has wasted the most sessions in this project. The drain
+                // is one of the two callers Voice.h names as intended.
+                if (s->why == kSdWrote && !g_sd_said) {
+                    g_sd_said = 1;
+                    voice::say("Gun aim is live. The shot now follows the "
+                               "barrel.");
+                }
+
+                // BUILD 152: same rule for the origin write. The first shot
+                // the engine tried to fire from the camera and had moved back
+                // to the muzzle announces itself, once.
+                if (s->why == kSdWroteOrg && !g_sd_said_org) {
+                    g_sd_said_org = 1;
+                    voice::say("Shot origin repaired. The round leaves the "
+                               "muzzle even when the game moves it.");
+                }
+
+                // BUILD 137: the false negative this build is most likely to
+                // produce, said out loud the first time it happens.
+                //
+                // An ADS shot does not start at the muzzle, it starts at the
+                // camera, roughly 0.9 m away as build 136 measured it. This
+                // build deliberately does not touch those, because a direction
+                // alone cannot fix a shot that begins behind your shoulder. So
+                // a tester who holds ADS out of habit gets a build that does
+                // nothing and no way to know why, and the session is spent.
+                // The distance band is what separates it from a genuine
+                // stranger's shot, which would be metres out, not one metre.
+                static uint32_t s_ads_said = 0;
+                if (s->why == kSdNotOurs && !s_ads_said &&
+                    s->dpm > 0.40f && s->dpm < 2.00f) {
+                    s_ads_said = 1;
+                    voice::say("That shot started at the camera, not the gun. "
+                               "Do not aim down sights for this test.");
+                }
+            }
+            g_sl_printed = w;
+        }
+    }
+
     if (!g_aimpt_hook.installed()) return;
 
     // The 7b census, once, as soon as a weapon has been seen. idx == -1 means
@@ -1007,10 +2051,21 @@ void drain_aimpoint() {
     // in the world. Saying it during the loading screen means saying it to
     // nobody, and the whole point of this module is that the tester should not
     // have to remember anything.
+    //
+    // 2026-09-01: GATED BEHIND cfg voice_guide, DEFAULT 0. The anchor test it
+    // advertises belongs to the build 106/107 aim-point question, which build
+    // 137 answered and the headset confirmed. It was still announcing itself
+    // 17 seconds into every session, and the protocol it offers talks the
+    // tester through drawing and switching weapons, which collides with any
+    // other spoken procedure running that session (the wingspan capture, for
+    // one). The owner asked whether the old voice tests were still live. They
+    // were. This silences the invitation without removing the test: End still
+    // starts it, and voice_guide = 1 brings the prompt back.
     {
         static uint32_t said_ready = 0;
         float probe[3];
-        if (!said_ready && !g_guide_state && camera::base_pos(probe)) {
+        if (!said_ready && !g_guide_state && g_voice_guide &&
+            camera::base_pos(probe)) {
             said_ready = 1;
             voice::say_key("End", "to start the anchor test.");
         }
@@ -1061,9 +2116,27 @@ void drain_aimpoint() {
     const uint32_t used = g_ap_slots_used;
     for (uint32_t k = 0; k < used && k < (uint32_t)kApSlots; ++k) {
         ApSlot* sl = &g_ap_slot[k];
-        if (sl->printed || !sl->have_aim) continue;
+        if (sl->printed >= 2 || !sl->have_aim) continue;
         if (!sl->have_muz && ap_ticks < 6) continue;   // give it ~6 s
-        sl->printed = 1;
+        // BUILD 135: print ONCE MORE if the muzzle point ever arrives late.
+        //
+        // The freeze below made every muzzle reading a six-second window. All
+        // 59 captures in the 497-log corpus say "NO MUZZLE POINT", and that was
+        // being read as "the engine never resolves a muzzle anchor". It does
+        // not support that: NO capture window in the whole corpus overlaps a
+        // logged trigger pull. In grwxr-24876 the captures printed at 20:07:46
+        // and 20:08:46 and the first pull was at 20:08:58, twelve seconds after
+        // the slot froze.
+        //
+        // So the historical negative is about the first six seconds of a weapon
+        // being drawn, NOT about firing, and the muzzle getter is exactly the
+        // sort of thing that would run per shot. One extra line per weapon
+        // converts a six-second window into a session-long answer.
+        //
+        // printed: 0 never, 1 printed without a muzzle point, 2 final.
+        // Rule 8 safe for the same reason the first print is: drain thread.
+        if (sl->printed == 1 && !sl->have_muz) continue;
+        sl->printed = sl->have_muz ? 2u : 1u;
 
         char hex[3 * 48 + 8];
         for (int i2 = 0; i2 < 48; ++i2) {
@@ -1077,8 +2150,11 @@ void drain_aimpoint() {
         LOG_INFO("aimanchor[%u]: iface=%016llX weapon=%016llX player=%u%s",
                  k, (unsigned long long)sl->iface,
                  (unsigned long long)(sl->iface - 0x80), sl->player,
-                 sl->have_muz ? "" : "  (NO MUZZLE POINT: that getter never "
-                                     "ran for this weapon)");
+                 sl->have_muz
+                     ? "  (MUZZLE POINT ARRIVED: the getter DID run)"
+                     : "  (NO MUZZLE POINT YET: not in the first ~6 s. This "
+                       "line reprints if it ever arrives, so keep playing and "
+                       "FIRE before believing this is a negative)");
         LOG_INFO("aimanchor[%u]: weapon+0xB0 raw, 3 x 16 bytes "
                  "(gunroot|muzzle|aimpoint): %s", k, hex);
         LOG_INFO("aimanchor[%u]: aim=(%.4f %.4f %.4f %.4f) "
@@ -1130,6 +2206,46 @@ void drain_aimpoint() {
             voice::say("Five.");
         }
         if (sh == 0) said_shots = 0;       // re-arm resets the count
+    }
+
+    // BUILD 133: the hybrid-shoot read, printed ONCE and never repeated. It
+    // is deliberately above the idle early-return: this line is the whole
+    // question the build carries and it must not be suppressed by a quiet
+    // frame. The archives predict enable=1 cancel=120.0 camera=60.0.
+    if (g_wc_state != 0 && !g_wc_printed) {
+        g_wc_printed = 1;
+        if (g_wc_state == 1) {
+            LOG_INFO("hybrid: ENABLE=%u cancel_focus=%.2fdeg "
+                     "shoot_from_camera=%.2fdeg | weapon=%012llX "
+                     "essence=%012llX db=%012llX",
+                     (unsigned)g_wc_hybrid, g_wc_cancel_deg, g_wc_camera_deg,
+                     (unsigned long long)g_wc_weapon,
+                     (unsigned long long)g_wc_essence,
+                     (unsigned long long)g_wc_db_a);
+            // The self-check. One instance exists install-wide, so the two
+            // routes must agree. Say which way it failed, never average.
+            if (g_wc_db_b == g_wc_db_a)
+                LOG_INFO("hybrid: route check AGREE (scope route reached the "
+                         "same datablock %012llX)",
+                         (unsigned long long)g_wc_db_b);
+            else if (!g_wc_db_b)
+                LOG_INFO("hybrid: route check scope route was NULL "
+                         "(sub-object handle at +0x128 is not a raw pointer). "
+                         "The essence route stands alone but is unrefuted.");
+            else
+                LOG_WARN("hybrid: route check DISAGREE, essence=%012llX "
+                         "scope=%012llX. One instance exists install-wide, so "
+                         "one of these two offsets is wrong. Trust neither.",
+                         (unsigned long long)g_wc_db_a,
+                         (unsigned long long)g_wc_db_b);
+        } else {
+            LOG_WARN("hybrid: read FAULTED or hit a null pointer. "
+                     "weapon=%012llX essence=%012llX db=%012llX. The zero "
+                     "names the step that failed.",
+                     (unsigned long long)g_wc_weapon,
+                     (unsigned long long)g_wc_essence,
+                     (unsigned long long)g_wc_db_a);
+        }
     }
 
     static uint32_t last_seen = 0;
@@ -1488,6 +2604,9 @@ void drain() {
 
 void set_logging(bool on) { g_logging = on; }
 
+// 2026-09-01: whether the guided anchor test announces itself. Default off.
+void set_voice_guide(int on) { g_voice_guide = on ? 1u : 0u; }
+
 void set_shot_offset(float yaw_rad, float pitch_rad) {
     uint32_t y = 0, p = 0;
     if (g_shot_yaw_site   && yaw_rad   != 0.0f) memcpy(&y, &yaw_rad,   4);
@@ -1526,6 +2645,8 @@ void set_view_fwd(const float dir[3], bool ok) {
     }
 }
 
+uint32_t shots_total() { return (uint32_t)(g_sd_wrote_n + g_sd_left_n); }
+
 bool view_fwd(float out[3]) {
     if (!g_vf_ok || !out) return false;
     out[0] = g_vf_dir[0];
@@ -1555,6 +2676,122 @@ void set_barrel_dir(const float dir[3], bool ok) {
     _ReadWriteBarrier();
     g_bd_gen = g_bd_gen + 1;
 }
+
+// BUILD 153b: THE BARREL DIRECTION IN THE CAMERA'S OWN AXES.
+//
+// 2026-09-02, owner: "turning the character left or right made the green
+// reticle go the opposite way and be misaligned from the barrel", while the
+// gaze ring behaved. That is a TIMING bug, not an aim bug, and the asymmetry
+// is the proof: the gaze ring is DEFINED by the camera basis so it cannot
+// disagree with itself, while the barrel ring was a WORLD vector re-projected
+// through a basis captured at a different instant. Turn the view and the two
+// instants differ by the rotation you just made, so the ring swings by exactly
+// that, opposite the turn.
+//
+// The fix is to stop re-projecting. The weapon writer already holds the basis
+// it used, so it publishes the direction in camera axes at the same moment and
+// the drawing side consumes it with no conversion of its own: x right,
+// y forward, z up, one instant, no round trip.
+//
+// It is deliberately NOT a replacement for g_bd_dir. That stays world space
+// because the shot chain needs a world vector, and the hard baseline guards
+// that path. This is a drawing convenience and nothing may aim from it.
+volatile uint32_t g_bl_gen = 0;
+float             g_bl_dir[3] = {};
+
+void set_barrel_local(const float dir[3], bool ok) {
+    if (!ok || !dir) return;
+    g_bl_dir[0] = dir[0];
+    g_bl_dir[1] = dir[1];
+    g_bl_dir[2] = dir[2];
+    _ReadWriteBarrier();
+    g_bl_gen = g_bl_gen + 1;
+}
+
+bool barrel_local_peek(float out[3], uint32_t* gen) {
+    if (!out) return false;
+    const uint32_t g0 = g_bl_gen;
+    out[0] = g_bl_dir[0];
+    out[1] = g_bl_dir[1];
+    out[2] = g_bl_dir[2];
+    _ReadWriteBarrier();
+    const uint32_t g1 = g_bl_gen;
+    if (gen) *gen = g1;
+    return g0 == g1 && g1 != 0;
+}
+
+// BUILD 137: the non-consuming form. See AimTrace.h for why a second consumer
+// could not share the accessor below. Reads the generation AFTER the vector,
+// against the barrier in the publisher, so a generation that matches on both
+// sides of the copy means the three floats belong together.
+bool barrel_dir_peek(float out[3], uint32_t* gen) {
+    if (!out) return false;
+    const uint32_t g0 = g_bd_gen;
+    out[0] = g_bd_dir[0];
+    out[1] = g_bd_dir[1];
+    out[2] = g_bd_dir[2];
+    _ReadWriteBarrier();
+    const uint32_t g1 = g_bd_gen;
+    if (gen) *gen = g1;
+    return g0 == g1 && g1 != 0;
+}
+
+// BUILD 153: the player's own muzzle in world space, for the evidence
+// reticle. g_sd_muz is already maintained for build 137's interlock 1, the
+// gate that decides whether to move a bullet, so it is the PLAYER-FLAGGED
+// muzzle rather than g_ap_muzzle's "most recent, any owner". This only
+// exposes it, and it is deliberately NOT a gate: the consumer is a drawing
+// path, so a torn read costs a marker a few centimetres for one frame, which
+// is invisible next to the blob it draws. Anything deciding where a BULLET
+// goes must use the interlock, never this.
+bool player_muzzle(float out[3]) {
+    if (!out || !g_sd_muz_ok) return false;
+    out[0] = g_sd_muz[0];
+    out[1] = g_sd_muz[1];
+    out[2] = g_sd_muz[2];
+    return true;
+}
+
+void set_shot_pitch(bool on) {
+    const uint32_t want = on ? 1u : 0u;
+    if (g_vt_armed == want) return;
+    g_vt_armed = want;
+    LOG_INFO("shot_pitch: %s. %s",
+             want ? "ARMED" : "off",
+             want ? "The ballistic arc is now rebuilt on the barrel's own "
+                    "elevation, on shots that already passed the player gate."
+                  : "The engine's own launch elevation is left alone, which "
+                    "is build 153 behaviour: the round's up and down follows "
+                    "the camera.");
+}
+
+void set_shot_dir(bool on) {
+    const uint32_t want = on ? 1u : 0u;
+    if (g_sd_armed == want) return;
+    g_sd_armed = want;
+    LOG_INFO("shot_dir: %s. %s",
+             want ? "ARMED" : "off",
+             want ? "The shot direction now follows the barrel on any shot "
+                    "that starts at your own muzzle."
+                  : "The engine's own shot direction is left alone.");
+}
+
+bool shot_dir() { return g_sd_armed != 0; }
+
+// BUILD 152: the origin write. See AimTrace.h.
+void set_shot_org(bool on) {
+    const uint32_t want = on ? 1u : 0u;
+    if (g_sd_org_armed == want) return;
+    g_sd_org_armed = want;
+    LOG_INFO("shot_org: %s. %s",
+             want ? "ARMED" : "off",
+             want ? "A player shot the engine builds at the CAMERA is moved "
+                    "back to the muzzle, origin and direction both."
+                  : "Camera-origin shots are refused, never repaired (the "
+                    "build 137 behaviour).");
+}
+
+bool shot_org() { return g_sd_org_armed != 0; }
 
 bool barrel_dir(float out[3]) {
     // Starts at 0, which is also the generation before anything has ever been
@@ -1633,6 +2870,39 @@ bool ctrl_pos_l(float out[3]) {
     out[0] = g_cl_pos[0];
     out[1] = g_cl_pos[1];
     out[2] = g_cl_pos[2];
+    return true;
+}
+
+// BUILD 158: the LEFT controller's forward and up, same contract as the rest
+// of this file: ok=false is a dropout, never a held stale frame.
+void set_ctrl_vecs_l(const float fwd[3], const float up[3], bool ok) {
+    if (ok && fwd && up) {
+        g_cl_fwd[0] = fwd[0]; g_cl_fwd[1] = fwd[1]; g_cl_fwd[2] = fwd[2];
+        g_cl_up[0]  = up[0];  g_cl_up[1]  = up[1];  g_cl_up[2]  = up[2];
+    }
+    g_cl_vec_ok = ok ? 1u : 0u;
+}
+
+bool ctrl_vecs_l(float fwd[3], float up[3]) {
+    if (!g_cl_vec_ok || !fwd || !up) return false;
+    fwd[0] = g_cl_fwd[0]; fwd[1] = g_cl_fwd[1]; fwd[2] = g_cl_fwd[2];
+    up[0]  = g_cl_up[0];  up[1]  = g_cl_up[1];  up[2]  = g_cl_up[2];
+    return true;
+}
+
+// BUILD 162: the LEFT controller's grip-pose frame, +Y and +Z axes.
+void set_ctrl_gripf_l(const float y[3], const float z[3], bool ok) {
+    if (ok && y && z) {
+        g_cl_gy[0] = y[0]; g_cl_gy[1] = y[1]; g_cl_gy[2] = y[2];
+        g_cl_gz[0] = z[0]; g_cl_gz[1] = z[1]; g_cl_gz[2] = z[2];
+    }
+    g_cl_grip_ok = ok ? 1u : 0u;
+}
+
+bool ctrl_gripf_l(float y[3], float z[3]) {
+    if (!g_cl_grip_ok || !y || !z) return false;
+    y[0] = g_cl_gy[0]; y[1] = g_cl_gy[1]; y[2] = g_cl_gy[2];
+    z[0] = g_cl_gz[0]; z[1] = g_cl_gz[1]; z[2] = g_cl_gz[2];
     return true;
 }
 

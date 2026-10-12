@@ -176,7 +176,7 @@ alignas(16) unsigned char       g_cam_before[kCamBytes] = {};
 alignas(16) unsigned char       g_cam_after[kCamBytes]  = {};
 
 // Called once per frame while a photo session is live. No logging, no locks,
-// no allocation (project rule 8): two small memcpys and a counter.
+// no allocation (CLAUDE.md rule 8): two small memcpys and a counter.
 void __cdecl hooked_updatecam(void* cam) {
     if (!cam) {
         if (g_orig_updatecam) g_orig_updatecam(cam);

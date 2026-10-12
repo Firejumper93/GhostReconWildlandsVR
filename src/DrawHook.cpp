@@ -8,7 +8,9 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <intrin.h>
 
+#include "Anatomy.h"
 #include "DrawHook.h"
 #include "Log.h"
 
@@ -24,10 +26,22 @@ constexpr int kSlotDrawIndexedInstanced = 20;
 constexpr int kSlotDrawInstanced        = 21;
 constexpr int kSlotDispatch             = 41;
 constexpr int kSlotDispatchIndirect     = 42;
+constexpr int kSlotOMSetRenderTargets   = 33;   // BUILD 216
+constexpr int kSlotOMSetRTsAndUAVs      = 34;   // BUILD 216
+// BUILD 241 (slots counted from d3d11.h and d3d11_1.h: Map 14, Unmap 15,
+// UpdateSubresource 48, ExecuteCommandList 58, FinishCommandList 114, and
+// ID3D11DeviceContext1::UpdateSubresource1 116; the immediate context carries the
+// 11.1 vtable, verified by QueryInterface on this machine).
+constexpr int kSlotMap                  = 14;
+constexpr int kSlotUnmap                = 15;
+constexpr int kSlotUpdateSubresource    = 48;
+constexpr int kSlotExecuteCommandList   = 58;
+constexpr int kSlotFinishCommandList    = 114;
+constexpr int kSlotUpdateSubresource1   = 116;
 
 constexpr size_t kMinSteal   = 8;    // one aligned atomic store
 constexpr size_t kMaxSteal   = 24;
-constexpr int    kMaxTargets = 12;   // 6 kinds x 2 context classes
+constexpr int    kMaxTargets = 64;   // 6 draw kinds + 2 render-target binds (BUILD 216) + 6 anatomy functions (BUILD 241), x 2 context classes
 
 Recorder g_rec = nullptr;
 std::atomic<uint64_t> g_counts[(int)Kind::kCount] = {};
@@ -69,6 +83,9 @@ constexpr Shape kShapes[] = {
     {5, 4, {0x48, 0x89, 0x4C, 0x24}}, {5, 4, {0x48, 0x89, 0x54, 0x24}},
     {5, 4, {0x48, 0x89, 0x6C, 0x24}}, {5, 4, {0x48, 0x89, 0x74, 0x24}},
     {5, 4, {0x48, 0x89, 0x7C, 0x24}}, {5, 4, {0x4C, 0x89, 0x44, 0x24}},
+    // BUILD 241: the two spills ExecuteCommandList and FinishCommandList start
+    // with (probed offline 2026-10-05): mov [rsp+disp8], r8d ; mov [rsp+disp8], edx.
+    {5, 4, {0x44, 0x89, 0x44, 0x24}}, {4, 3, {0x89, 0x54, 0x24}},
 };
 
 // Length of the instruction at p, or 0 if it is not on the whitelist.
@@ -138,6 +155,10 @@ struct Target {
 };
 Target g_targets[kMaxTargets];
 int    g_ntargets = 0;
+bool   g_draw_done  = false;   // install() ran (whatever it detoured)
+int    g_draw_count = 0;
+bool   g_rt_done    = false;   // BUILD 216: install_rt() ran
+int    g_rt_count   = 0;
 
 // Write an absolute indirect jump: FF 25 00 00 00 00 <qword target>.
 void write_abs_jmp(uint8_t* at, void* to) {
@@ -192,12 +213,25 @@ using FnDInst       = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT,
 using FnDisp        = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT);
 using FnDispInd     = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*, UINT);
 
-FnDrawIndexed g_t_di[2]    = {};
-FnDraw        g_t_d[2]     = {};
-FnDII         g_t_dii[2]   = {};
-FnDInst       g_t_dinst[2] = {};
-FnDisp        g_t_disp[2]  = {};
-FnDispInd     g_t_dispi[2] = {};
+FnDrawIndexed g_t_di[5]    = {};
+FnDraw        g_t_d[5]     = {};
+FnDII         g_t_dii[5]   = {};
+FnDInst       g_t_dinst[5] = {};
+FnDisp        g_t_disp[5]  = {};
+FnDispInd     g_t_dispi[5] = {};
+
+// BUILD 216: the render-target binds. Same two-class shape as the draws.
+using FnOMRT  = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
+                                         ID3D11RenderTargetView* const*,
+                                         ID3D11DepthStencilView*);
+using FnOMRTU = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
+                                         ID3D11RenderTargetView* const*,
+                                         ID3D11DepthStencilView*, UINT, UINT,
+                                         ID3D11UnorderedAccessView* const*,
+                                         const UINT*);
+FnOMRT     g_t_omrt[5]  = {};
+FnOMRTU    g_t_omrtu[5] = {};
+RtRecorder g_rt_rec     = nullptr;
 
 inline void tally(Kind k) {
     g_counts[(int)k].fetch_add(1, std::memory_order_relaxed);
@@ -206,12 +240,14 @@ inline void tally(Kind k) {
 template <int N>
 void STDMETHODCALLTYPE hk_di(ID3D11DeviceContext* c, UINT i, UINT s, INT b) {
     tally(Kind::DrawIndexed);
+    if (anatomy::capturing()) anatomy::tap_draw(c);   // BUILD 241
     if (g_rec) g_rec(c, Kind::DrawIndexed, i);
     g_t_di[N](c, i, s, b);
 }
 template <int N>
 void STDMETHODCALLTYPE hk_d(ID3D11DeviceContext* c, UINT v, UINT s) {
     tally(Kind::Draw);
+    if (anatomy::capturing()) anatomy::tap_draw(c);   // BUILD 241
     if (g_rec) g_rec(c, Kind::Draw, v);
     g_t_d[N](c, v, s);
 }
@@ -219,6 +255,7 @@ template <int N>
 void STDMETHODCALLTYPE hk_dii(ID3D11DeviceContext* c, UINT i, UINT n, UINT s,
                               INT b, UINT si) {
     tally(Kind::DrawIndexedInstanced);
+    if (anatomy::capturing()) anatomy::tap_draw(c);   // BUILD 241
     if (g_rec) g_rec(c, Kind::DrawIndexedInstanced, i);
     g_t_dii[N](c, i, n, s, b, si);
 }
@@ -226,6 +263,7 @@ template <int N>
 void STDMETHODCALLTYPE hk_dinst(ID3D11DeviceContext* c, UINT v, UINT n, UINT s,
                                 UINT si) {
     tally(Kind::DrawInstanced);
+    if (anatomy::capturing()) anatomy::tap_draw(c);   // BUILD 241
     if (g_rec) g_rec(c, Kind::DrawInstanced, v);
     g_t_dinst[N](c, v, n, s, si);
 }
@@ -245,12 +283,103 @@ void STDMETHODCALLTYPE hk_dispi(ID3D11DeviceContext* c, ID3D11Buffer* b,
     g_t_dispi[N](c, b, off);
 }
 
-// Detour one function. `slot_index` is 0 for the immediate-context set and 1
-// for the deferred-context set, which selects the trampoline storage.
-bool detour(uint8_t* fn, Kind kind, int set, const char* tag) {
+// BUILD 216: the recorder runs AFTER the real bind, so the state it acts on
+// (the shading rate for the target just bound) is set against the target
+// the draws that follow will use.
+template <int N>
+void STDMETHODCALLTYPE hk_omrt(ID3D11DeviceContext* c, UINT n,
+                               ID3D11RenderTargetView* const* r,
+                               ID3D11DepthStencilView* d) {
+    g_t_omrt[N](c, n, r, d);
+    if (anatomy::capturing()) anatomy::tap_rt(c, n, r, d);   // BUILD 241
+    if (g_rt_rec) g_rt_rec(c, n, r);
+}
+template <int N>
+void STDMETHODCALLTYPE hk_omrtu(ID3D11DeviceContext* c, UINT n,
+                                ID3D11RenderTargetView* const* r,
+                                ID3D11DepthStencilView* d, UINT us, UINT nu,
+                                ID3D11UnorderedAccessView* const* u,
+                                const UINT* ic) {
+    g_t_omrtu[N](c, n, r, d, us, nu, u, ic);
+    if (anatomy::capturing()) anatomy::tap_rt(c, n, r, d);   // BUILD 241
+    if (g_rt_rec) g_rt_rec(c, n, r);
+}
+
+// BUILD 241: the frame-anatomy hooks (Anatomy.h). Same two-class shape. The taps
+// are gated by anatomy::capturing(), one relaxed load, so outside the window
+// each hook costs a load and a branch on top of the trampoline.
+using FnMap    = HRESULT(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT,
+                                             D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE*);
+using FnUnmap  = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT);
+using FnUpdate = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT,
+                                          const D3D11_BOX*, const void*, UINT, UINT);
+using FnUpdate1 = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT,
+                                           const D3D11_BOX*, const void*, UINT, UINT, UINT);
+using FnExec   = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11CommandList*, BOOL);
+using FnFinish = HRESULT(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, BOOL, ID3D11CommandList**);
+FnMap     g_t_map[5]     = {};
+FnUnmap   g_t_unmap[5]   = {};
+FnUpdate  g_t_upd[5]     = {};
+FnUpdate1 g_t_upd1[5]    = {};
+FnExec    g_t_exec[5]    = {};
+FnFinish  g_t_finish[5]  = {};
+
+template <int N>
+HRESULT STDMETHODCALLTYPE hk_map(ID3D11DeviceContext* c, ID3D11Resource* r, UINT sub,
+                                 D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* ms) {
+    const HRESULT hr = g_t_map[N](c, r, sub, type, flags, ms);
+    if (anatomy::capturing()) anatomy::tap_map(c, r, sub, type, ms, hr);
+    return hr;
+}
+template <int N>
+void STDMETHODCALLTYPE hk_unmap(ID3D11DeviceContext* c, ID3D11Resource* r, UINT sub) {
+    if (anatomy::capturing()) anatomy::tap_unmap(c, r, sub);   // BEFORE: the mapped data is still valid
+    g_t_unmap[N](c, r, sub);
+}
+template <int N>
+void STDMETHODCALLTYPE hk_upd(ID3D11DeviceContext* c, ID3D11Resource* r, UINT sub,
+                              const D3D11_BOX* box, const void* src, UINT rp, UINT dp) {
+    if (anatomy::capturing()) anatomy::tap_update(c, r, sub, box, src);
+    g_t_upd[N](c, r, sub, box, src, rp, dp);
+}
+template <int N>
+void STDMETHODCALLTYPE hk_upd1(ID3D11DeviceContext* c, ID3D11Resource* r, UINT sub,
+                               const D3D11_BOX* box, const void* src, UINT rp, UINT dp, UINT cf) {
+    if (anatomy::capturing()) anatomy::tap_update(c, r, sub, box, src);
+    g_t_upd1[N](c, r, sub, box, src, rp, dp, cf);
+}
+template <int N>
+void STDMETHODCALLTYPE hk_exec(ID3D11DeviceContext* c, ID3D11CommandList* cl, BOOL restore) {
+    const bool cap = anatomy::capturing();
+    const uint64_t t0 = cap ? __rdtsc() : 0;
+    if (cap) anatomy::exec_enter();
+    g_t_exec[N](c, cl, restore);
+    if (cap) { anatomy::exec_leave(); anatomy::tap_execute(c, cl, restore, t0); }
+}
+template <int N>
+HRESULT STDMETHODCALLTYPE hk_finish(ID3D11DeviceContext* c, BOOL restore, ID3D11CommandList** pp) {
+    const bool cap = anatomy::capturing();
+    const uint64_t t0 = cap ? __rdtsc() : 0;
+    const HRESULT hr = g_t_finish[N](c, restore, pp);
+    if (cap) anatomy::tap_finish(c, restore, (SUCCEEDED(hr) && pp) ? *pp : nullptr, hr, t0);
+    return hr;
+}
+
+// The machinery for one detour: whitelist the prologue, build the trampoline
+// (stolen bytes plus a jump back) and the bridge (an absolute jump to our
+// hook), store the trampoline where the hook reads it BEFORE the entry is
+// patched (the hook may run at once on another thread), then patch the entry
+// atomically. Returns true if fn is now detoured, or already was: the two
+// context classes may share an implementation, in which case the first hook
+// serves both and tramp_slot for the second is left untouched.
+bool detour_at(uint8_t* fn, void* hook, void** tramp_slot, const char* tag) {
     if (!fn) return false;
     for (int i = 0; i < g_ntargets; ++i)
         if (g_targets[i].fn == fn) return true;   // shared implementation
+    if (g_ntargets >= kMaxTargets) {
+        LOG_ERROR("draw: target table full, refusing %s.", tag);
+        return false;
+    }
 
     const size_t steal = steal_len(fn);
     if (!steal) {
@@ -271,35 +400,7 @@ bool detour(uint8_t* fn, Kind kind, int set, const char* tag) {
     memcpy(tramp, fn, steal);
     write_abs_jmp(tramp + steal, fn + steal);
 
-    void* hook = nullptr;
-    switch (kind) {
-        case Kind::DrawIndexed:
-            g_t_di[set] = (FnDrawIndexed)tramp;
-            hook = set ? (void*)&hk_di<1> : (void*)&hk_di<0>;
-            break;
-        case Kind::Draw:
-            g_t_d[set] = (FnDraw)tramp;
-            hook = set ? (void*)&hk_d<1> : (void*)&hk_d<0>;
-            break;
-        case Kind::DrawIndexedInstanced:
-            g_t_dii[set] = (FnDII)tramp;
-            hook = set ? (void*)&hk_dii<1> : (void*)&hk_dii<0>;
-            break;
-        case Kind::DrawInstanced:
-            g_t_dinst[set] = (FnDInst)tramp;
-            hook = set ? (void*)&hk_dinst<1> : (void*)&hk_dinst<0>;
-            break;
-        case Kind::Dispatch:
-            g_t_disp[set] = (FnDisp)tramp;
-            hook = set ? (void*)&hk_disp<1> : (void*)&hk_disp<0>;
-            break;
-        case Kind::DispatchIndirect:
-            g_t_dispi[set] = (FnDispInd)tramp;
-            hook = set ? (void*)&hk_dispi<1> : (void*)&hk_dispi<0>;
-            break;
-        default:
-            return false;
-    }
+    *tramp_slot = (void*)tramp;   // before the patch: the hook may run at once
     write_abs_jmp(bridge, hook);
     FlushInstructionCache(GetCurrentProcess(), g_arena, kArenaSize);
 
@@ -314,6 +415,42 @@ bool detour(uint8_t* fn, Kind kind, int set, const char* tag) {
     return true;
 }
 
+// The draw kinds: the hook and the trampoline slot for this kind and context
+// class (0 immediate, 1 deferred), then the machinery above.
+bool detour(uint8_t* fn, Kind kind, int set, const char* tag) {
+    void*  hook = nullptr;
+    void** slot = nullptr;
+    switch (kind) {
+        case Kind::DrawIndexed:
+            slot = (void**)&g_t_di[set];
+            hook = set ? (void*)&hk_di<1> : (void*)&hk_di<0>;
+            break;
+        case Kind::Draw:
+            slot = (void**)&g_t_d[set];
+            hook = set ? (void*)&hk_d<1> : (void*)&hk_d<0>;
+            break;
+        case Kind::DrawIndexedInstanced:
+            slot = (void**)&g_t_dii[set];
+            hook = set ? (void*)&hk_dii<1> : (void*)&hk_dii<0>;
+            break;
+        case Kind::DrawInstanced:
+            slot = (void**)&g_t_dinst[set];
+            hook = set ? (void*)&hk_dinst<1> : (void*)&hk_dinst<0>;
+            break;
+        case Kind::Dispatch:
+            slot = (void**)&g_t_disp[set];
+            hook = set ? (void*)&hk_disp<1> : (void*)&hk_disp<0>;
+            break;
+        case Kind::DispatchIndirect:
+            slot = (void**)&g_t_dispi[set];
+            hook = set ? (void*)&hk_dispi<1> : (void*)&hk_dispi<0>;
+            break;
+        default:
+            return false;
+    }
+    return detour_at(fn, hook, slot, tag);
+}
+
 uint8_t* slot_fn(void* obj, int slot) {
     if (!obj) return nullptr;
     void** vt = *(void***)obj;
@@ -323,8 +460,10 @@ uint8_t* slot_fn(void* obj, int slot) {
 }  // namespace
 
 int install(ID3D11Device* dev, ID3D11DeviceContext* ctx, Recorder rec) {
-    if (g_ntargets || !ctx) return g_ntargets;
-    g_rec = rec;
+    if (rec) g_rec = rec;   // BUILD 241: a later caller still gets its recorder when install_anatomy ran first
+    if (g_draw_done || !ctx) return g_draw_count;
+    g_draw_done = true;
+    const int before = g_ntargets;
 
     uint8_t* anchor = slot_fn(ctx, kSlotDrawIndexed);
     if (!anchor) {
@@ -341,7 +480,7 @@ int install(ID3D11Device* dev, ID3D11DeviceContext* ctx, Recorder rec) {
              d3d11 ? (size_t)(anchor - (uint8_t*)d3d11) : (size_t)0,
              (void*)*(void***)ctx);
 
-    g_arena = alloc_near(anchor);
+    if (!g_arena) g_arena = alloc_near(anchor);   // shared with install_rt (BUILD 216)
     if (!g_arena) {
         LOG_ERROR("draw: no free page within 2 GB of d3d11.dll for the "
                   "bridges. Nothing patched.");
@@ -382,9 +521,269 @@ int install(ID3D11Device* dev, ID3D11DeviceContext* ctx, Recorder rec) {
         }
     }
 
+    g_draw_count = g_ntargets - before;
     LOG_INFO("draw: %d function(s) detoured in d3d11.dll. This catches EVERY "
-             "context object, whenever it was created.", g_ntargets);
-    return g_ntargets;
+             "context object, whenever it was created.", g_draw_count);
+    return g_draw_count;
+}
+
+// BUILD 216: the render-target binds, for the foveation mask (Foveate.cpp).
+// The same machinery as the draws, on the two implementations (immediate and
+// deferred class) of OMSetRenderTargets and
+// OMSetRenderTargetsAndUnorderedAccessViews, read from a live context and a
+// throwaway deferred context. Their prologues were probed offline on this
+// machine's d3d11.dll (2026-09-07: push runs, 40 53 55 56 57 41 54 41 55 and
+// 40 55 53 56 57 41 54 41 55, nine bytes stolen each) and are on the
+// whitelist; anything else is refused and logged, nothing patched (rule 7).
+int install_rt(ID3D11Device* dev, ID3D11DeviceContext* ctx, RtRecorder rec) {
+    if (rec) g_rt_rec = rec;   // BUILD 241: see install()
+    if (g_rt_done || !ctx) return g_rt_count;
+    g_rt_done = true;
+
+    uint8_t* anchor = slot_fn(ctx, kSlotOMSetRenderTargets);
+    if (!anchor) {
+        LOG_ERROR("draw: could not read OMSetRenderTargets from the context vtable.");
+        return 0;
+    }
+    if (!g_arena) g_arena = alloc_near(anchor);
+    if (!g_arena) {
+        LOG_ERROR("draw: no free page within 2 GB of d3d11.dll for the "
+                  "bridges. Nothing patched.");
+        return 0;
+    }
+
+    // Where the implementation lives, as install() reports it: with a
+    // context-wrapping layer (ReShade) the slot can resolve outside d3d11.dll,
+    // and then the whitelist is the only guard.
+    HMODULE d3d11 = GetModuleHandleW(L"d3d11.dll");
+    LOG_INFO("draw: d3d11.dll base 0x%p, OMSetRenderTargets impl 0x%p (RVA 0x%zX)",
+             (void*)d3d11, (void*)anchor,
+             d3d11 ? (size_t)(anchor - (uint8_t*)d3d11) : (size_t)0);
+
+    // All four or nothing: a partial set would miss the binds through the
+    // unhooked function (a stale rate carried into a pass, or the scene's
+    // deferred binds never masked) and the verdict would read wrong for the
+    // wrong reason. On any refusal the count is -1; what was patched passes
+    // through untouched while the recorder's owner stays inactive.
+    const int before = g_ntargets;
+    bool ok = true;
+    if (!detour_at(slot_fn(ctx, kSlotOMSetRenderTargets), (void*)&hk_omrt<0>,
+                   (void**)&g_t_omrt[0], "immediate OMSetRenderTargets")) ok = false;
+    if (!detour_at(slot_fn(ctx, kSlotOMSetRTsAndUAVs), (void*)&hk_omrtu<0>,
+                   (void**)&g_t_omrtu[0], "immediate OMSetRTsAndUAVs")) ok = false;
+    if (dev) {
+        ID3D11DeviceContext* dc = nullptr;
+        const HRESULT hr = dev->CreateDeferredContext(0, &dc);
+        if (SUCCEEDED(hr) && dc) {
+            if (!detour_at(slot_fn(dc, kSlotOMSetRenderTargets), (void*)&hk_omrt<1>,
+                           (void**)&g_t_omrt[1], "deferred  OMSetRenderTargets")) ok = false;
+            if (!detour_at(slot_fn(dc, kSlotOMSetRTsAndUAVs), (void*)&hk_omrtu<1>,
+                           (void**)&g_t_omrtu[1], "deferred  OMSetRTsAndUAVs")) ok = false;
+            dc->Release();
+        } else {
+            LOG_WARN("draw: CreateDeferredContext failed (0x%08X); the deferred-class "
+                     "bind functions cannot be resolved, so the set is incomplete.", (unsigned)hr);
+            ok = false;
+        }
+    } else {
+        ok = false;
+    }
+    g_rt_count = ok ? g_ntargets - before : -1;
+    LOG_INFO("draw: %d render-target bind function(s) detoured in d3d11.dll "
+             "(build 216: the foveation mask rides these; -1 = incomplete, the owner stays off).", g_rt_count);
+    return g_rt_count;
+}
+
+// BUILD 241: the frame-anatomy hook set. See DrawHook.h.
+//
+// THE FACT THIS IS BUILT AROUND (measured 2026-10-05 with variants.exe, on both a
+// hardware and a WARP device): the IMMEDIATE context does not have one set of
+// entry points. ID3D11DeviceContext::Flush rewrites the context's own heap vtable
+// so that DrawIndexed, Draw, DrawIndexedInstanced, DrawInstanced, UpdateSubresource
+// and UpdateSubresource1 point at a SECOND set of functions in d3d11.dll, and the
+// next ExecuteCommandList puts the first set back. A detour on whichever set the
+// vtable shows at install time therefore misses every immediate draw made in the
+// other state (the first harness run saw dI = 0 for exactly this reason). So this
+// installer samples the live vtable for a while and detours EVERY distinct entry
+// it sees per slot, in both context classes, and Anatomy.cpp watches at Present
+// that the vtable still only points at hooked entries.
+//
+// ALL OR NOTHING: every distinct target is decoded against the whitelist BEFORE
+// the first byte is written; any refusal returns -1 with d3d11.dll untouched.
+namespace {
+struct AnRow {
+    int         slot;
+    const char* name;
+    void*       hook[5];     // by trampoline index N
+    void**      tramp[5];
+};
+#define AN_ROW(S, NAME, H, A)                                                                  \
+    { S, NAME, { (void*)&H<0>, (void*)&H<1>, (void*)&H<2>, (void*)&H<3>, (void*)&H<4> },      \
+      { (void**)&A[0], (void**)&A[1], (void**)&A[2], (void**)&A[3], (void**)&A[4] } }
+const AnRow kAnRows[] = {
+    AN_ROW(kSlotDrawIndexed,          "DrawIndexed",          hk_di,     g_t_di),
+    AN_ROW(kSlotDraw,                 "Draw",                 hk_d,      g_t_d),
+    AN_ROW(kSlotDrawIndexedInstanced, "DrawIndexedInstanced", hk_dii,    g_t_dii),
+    AN_ROW(kSlotDrawInstanced,        "DrawInstanced",        hk_dinst,  g_t_dinst),
+    AN_ROW(kSlotOMSetRenderTargets,   "OMSetRenderTargets",   hk_omrt,   g_t_omrt),
+    AN_ROW(kSlotOMSetRTsAndUAVs,      "OMSetRTsAndUAVs",      hk_omrtu,  g_t_omrtu),
+    AN_ROW(kSlotMap,                  "Map",                  hk_map,    g_t_map),
+    AN_ROW(kSlotUnmap,                "Unmap",                hk_unmap,  g_t_unmap),
+    AN_ROW(kSlotUpdateSubresource,    "UpdateSubresource",    hk_upd,    g_t_upd),
+    AN_ROW(kSlotUpdateSubresource1,   "UpdateSubresource1",   hk_upd1,   g_t_upd1),
+    AN_ROW(kSlotExecuteCommandList,   "ExecuteCommandList",   hk_exec,   g_t_exec),
+    AN_ROW(kSlotFinishCommandList,    "FinishCommandList",    hk_finish, g_t_finish),
+};
+#undef AN_ROW
+constexpr int kAnRowCount = (int)(sizeof(kAnRows) / sizeof(kAnRows[0]));
+// Trampoline index per variant: immediate class 0, 2, 3; deferred class 1, 4.
+constexpr int kImmN[3] = {0, 2, 3};
+constexpr int kDefN[2] = {1, 4};
+constexpr DWORD kSampleMs = 1500;
+
+bool an_note(uint8_t** list, int& n, int cap, uint8_t* fn) {   // false when the list overflowed
+    if (!fn) return true;
+    for (int i = 0; i < n; ++i)
+        if (list[i] == fn) return true;
+    if (n >= cap) return false;
+    list[n++] = fn;
+    return true;
+}
+}  // namespace
+
+int install_anatomy(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+    if (!dev || !ctx) {
+        LOG_ERROR("anatomy: no device or context, nothing patched.");
+        return -1;
+    }
+    uint8_t* anchor = slot_fn(ctx, kSlotDrawIndexed);
+    if (!anchor) {
+        LOG_ERROR("anatomy: could not read DrawIndexed from the context vtable, nothing patched.");
+        return -1;
+    }
+    ID3D11DeviceContext* dc = nullptr;
+    const HRESULT hr = dev->CreateDeferredContext(0, &dc);
+    if (FAILED(hr) || !dc) {
+        LOG_ERROR("anatomy: CreateDeferredContext failed (0x%08X); the deferred class cannot be resolved, "
+                  "nothing patched.", (unsigned)hr);
+        return -1;
+    }
+    if (!g_arena) g_arena = alloc_near(anchor);
+    if (!g_arena) {
+        LOG_ERROR("anatomy: no free page within 2 GB of d3d11.dll for the bridges. Nothing patched.");
+        dc->Release();
+        return -1;
+    }
+
+    // Phase 0: sample the live vtables (read only) and collect every distinct entry
+    // per slot. The immediate context flips between sets on Flush and
+    // ExecuteCommandList, so one read is not enough.
+    uint8_t* imm[kAnRowCount][4] = {};
+    uint8_t* def[kAnRowCount][4] = {};
+    int nimm[kAnRowCount] = {};
+    int ndef[kAnRowCount] = {};
+    bool overflow = false;
+    const ULONGLONG t_end = GetTickCount64() + kSampleMs;
+    unsigned long long samples = 0;
+    do {
+        for (int r = 0; r < kAnRowCount; ++r) {
+            overflow |= !an_note(imm[r], nimm[r], 3, slot_fn(ctx, kAnRows[r].slot));
+            overflow |= !an_note(def[r], ndef[r], 2, slot_fn(dc, kAnRows[r].slot));
+        }
+        ++samples;
+        for (int i = 0; i < 40; ++i) YieldProcessor();
+    } while (GetTickCount64() < t_end);
+    LOG_INFO("anatomy: sampled the context vtables %llu times over %lu ms.", samples, (unsigned long)kSampleMs);
+    for (int r = 0; r < kAnRowCount; ++r)
+        LOG_INFO("anatomy:   %-22s slot %3d: %d immediate entry point(s), %d deferred%s", kAnRows[r].name,
+                 kAnRows[r].slot, nimm[r], ndef[r], nimm[r] > 1 ? "   <-- the immediate context flipped sets" : "");
+    if (overflow) {
+        LOG_ERROR("anatomy: more distinct entry points than the hook table holds (immediate 3, deferred 2). Nothing patched.");
+        dc->Release();
+        return -1;
+    }
+
+    // Phase 1: decode everything, write nothing.
+    bool ok = true;
+    for (int r = 0; r < kAnRowCount; ++r) {
+        for (int cls = 0; cls < 2; ++cls) {
+            const int n = cls ? ndef[r] : nimm[r];
+            if (n == 0) {
+                LOG_ERROR("anatomy: %s %s did not resolve.", cls ? "deferred" : "immediate", kAnRows[r].name);
+                ok = false;
+            }
+            for (int k = 0; k < n; ++k) {
+                uint8_t* fn = cls ? def[r][k] : imm[r][k];
+                bool have = false;
+                for (int i = 0; i < g_ntargets; ++i)
+                    if (g_targets[i].fn == fn) have = true;
+                if (have) continue;   // already detoured (shared, or installed by another caller)
+                if (((uintptr_t)fn & 7) != 0) {
+                    LOG_ERROR("anatomy: %s %s entry 0x%p is not 8-byte aligned.", cls ? "deferred" : "immediate",
+                              kAnRows[r].name, (void*)fn);
+                    ok = false;
+                } else if (!steal_len(fn)) {
+                    LOG_ERROR("anatomy: %s %s prologue not on the whitelist. First 16 bytes: %02X %02X %02X %02X %02X "
+                              "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                              cls ? "deferred" : "immediate", kAnRows[r].name, fn[0], fn[1], fn[2], fn[3], fn[4],
+                              fn[5], fn[6], fn[7], fn[8], fn[9], fn[10], fn[11], fn[12], fn[13], fn[14], fn[15]);
+                    ok = false;
+                }
+            }
+        }
+    }
+    if (!ok) {
+        LOG_ERROR("anatomy: at least one target was refused, so NOTHING was written (rule 7).");
+        dc->Release();
+        return -1;
+    }
+
+    // Phase 2: patch.
+    const int before = g_ntargets;
+    char tag[96];
+    bool all = true;
+    for (int r = 0; r < kAnRowCount; ++r) {
+        const AnRow& row = kAnRows[r];
+        for (int k = 0; k < nimm[r]; ++k) {
+            sprintf_s(tag, "anatomy immediate %s v%d", row.name, k);
+            all &= detour_at(imm[r][k], row.hook[kImmN[k]], row.tramp[kImmN[k]], tag);
+        }
+        for (int k = 0; k < ndef[r]; ++k) {
+            sprintf_s(tag, "anatomy deferred  %s v%d", row.name, k);
+            all &= detour_at(def[r][k], row.hook[kDefN[k]], row.tramp[kDefN[k]], tag);
+        }
+    }
+    dc->Release();
+    const int added = g_ntargets - before;
+    if (!all) {
+        // Phase 1 passed, so this is a VirtualProtect or arena failure. What was
+        // patched is a complete detour with a live trampoline and passes through.
+        LOG_ERROR("anatomy: a detour failed AFTER every target decoded (see above); %d function(s) were patched and "
+                  "pass through. No capture will run.", added);
+        return -1;
+    }
+    LOG_INFO("anatomy: %d function(s) newly detoured in d3d11.dll (every distinct entry point seen in both context "
+             "classes: draws, render-target binds, Map/Unmap/UpdateSubresource(1), Execute/FinishCommandList). The taps "
+             "are inert until the window opens.", added);
+    return added;
+}
+
+// BUILD 241: the Present-time check that the immediate context's vtable still
+// points only at hooked entries. Plain reads, no COM, render thread safe.
+// Returns the first slot whose entry is NOT detoured (and the entry in *bad), or -1.
+int anatomy_vtable_unhooked(ID3D11DeviceContext* ctx, void** bad) {
+    if (!ctx) return -1;
+    for (int r = 0; r < kAnRowCount; ++r) {
+        uint8_t* fn = slot_fn(ctx, kAnRows[r].slot);
+        bool have = false;
+        for (int i = 0; i < g_ntargets; ++i)
+            if (g_targets[i].fn == fn) { have = true; break; }
+        if (!have) {
+            if (bad) *bad = fn;
+            return kAnRows[r].slot;
+        }
+    }
+    return -1;
 }
 
 void restore() {
@@ -402,6 +801,9 @@ void restore() {
     }
     g_ntargets = 0;
     g_rec = nullptr;
+    g_rt_rec = nullptr;
+    g_draw_done = g_rt_done = false;
+    g_draw_count = g_rt_count = 0;
 }
 
 void counts(uint64_t out[(int)Kind::kCount]) {

@@ -3,6 +3,8 @@
 #include "HeadPose.h"
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cstring>
 
 namespace grwxr {
@@ -67,6 +69,7 @@ std::atomic<bool>         g_cam_selector_pose{false};
 // this defaults ON. cfg turns it off for the selector stand-in, where a second
 // rotation authority is exactly what makes the camera fight.
 std::atomic<bool>         g_cam_pose_rot{true};
+std::atomic<unsigned>     g_ref_epoch{0};   // BUILD 261
 // Build 91: the placement trio. Defaults are the flat FP mod's tuned values.
 std::atomic<float>        g_fp_fwd{0.07f};
 std::atomic<float>        g_fp_clamp{0.45f};
@@ -121,8 +124,20 @@ void publish(const float R[9], const float q_xr[4]) {
     g_live.store(true, std::memory_order_release);
 }
 
+// BUILD 209: the body follow's left stick, published by the present thread
+// and applied by the XInput merge. BUILD 210: stamped, so a stick nothing has
+// re-published for 250 ms is not applied (the present path stopped: a session
+// loss, a failed frame state, a failed locate), and disable() clears it.
+static std::atomic<float> g_fl_x{0.0f}, g_fl_y{0.0f};
+static std::atomic<int>   g_fl_active{0};
+static std::atomic<uint64_t> g_fl_ms{0};
+static uint64_t fl_now_ms() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 void disable() {
     g_live.store(false, std::memory_order_release);
+    g_fl_active.store(0, std::memory_order_relaxed);   // BUILD 210: no follow stick survives a stand-down
 }
 
 bool read(float R[9], float q_xr[4]) {
@@ -226,6 +241,69 @@ float fp_forward() {
     return g_fp_forward.load(std::memory_order_relaxed);
 }
 
+// BUILD 204: the head offset channel. Three floats and a flag, relaxed; a
+// torn read costs a millimetre for one call and nothing else.
+static std::atomic<float> g_ho_x{0.0f}, g_ho_f{0.0f}, g_ho_u{0.0f}, g_ho_uh{0.0f};
+static std::atomic<int>   g_ho_ok{0}, g_ho_use_h{0};
+void set_head_offset(float x, float f, float u, float uh, bool use_h, bool ok) {
+    g_ho_x.store(x, std::memory_order_relaxed);
+    g_ho_f.store(f, std::memory_order_relaxed);
+    g_ho_u.store(u, std::memory_order_relaxed);
+    g_ho_uh.store(uh, std::memory_order_relaxed);
+    g_ho_use_h.store(use_h ? 1 : 0, std::memory_order_relaxed);
+    g_ho_ok.store(ok ? 1 : 0, std::memory_order_relaxed);
+}
+static std::atomic<float> g_hdz{0.0f};
+static std::atomic<int>   g_hdz_ok{0};
+static std::atomic<int>   g_stance_b{0};
+void set_head_dz(float dz, bool anchored) {
+    g_hdz.store(dz, std::memory_order_relaxed);
+    g_hdz_ok.store(anchored ? 1 : 0, std::memory_order_relaxed);
+}
+bool head_dz(float* dz) {
+    if (!g_hdz_ok.load(std::memory_order_relaxed)) return false;
+    if (dz) *dz = g_hdz.load(std::memory_order_relaxed);
+    return true;
+}
+void set_stance_b(bool held) { g_stance_b.store(held ? 1 : 0, std::memory_order_relaxed); }
+void set_follow_stick(float x, float y, bool active) {
+    g_fl_x.store(x, std::memory_order_relaxed);
+    g_fl_y.store(y, std::memory_order_relaxed);
+    g_fl_ms.store(fl_now_ms(), std::memory_order_relaxed);   // BUILD 210: the stamp
+    g_fl_active.store(active ? 1 : 0, std::memory_order_relaxed);
+}
+static std::atomic<uint64_t> g_inj_applied{0}, g_inj_blocked{0};
+static std::atomic<int> g_inj_max{0};
+void follow_injected(bool applied, int lx, int ly) {   // BUILD 211, the game's input thread
+    if (!applied) { g_inj_blocked.fetch_add(1, std::memory_order_relaxed); return; }
+    g_inj_applied.fetch_add(1, std::memory_order_relaxed);
+    const int a = lx < 0 ? -lx : lx, b = ly < 0 ? -ly : ly;
+    const int m = a > b ? a : b;
+    if (m > g_inj_max.load(std::memory_order_relaxed)) g_inj_max.store(m, std::memory_order_relaxed);
+}
+void follow_inj_counts(unsigned long long* applied, unsigned long long* blocked, int* maxabs) {
+    if (applied) *applied = (unsigned long long)g_inj_applied.load(std::memory_order_relaxed);
+    if (blocked) *blocked = (unsigned long long)g_inj_blocked.load(std::memory_order_relaxed);
+    if (maxabs)  *maxabs  = g_inj_max.load(std::memory_order_relaxed);
+}
+bool follow_stick(float* x, float* y) {
+    if (!g_fl_active.load(std::memory_order_relaxed)) return false;
+    if (fl_now_ms() - g_fl_ms.load(std::memory_order_relaxed) > 250) return false;   // BUILD 210: stale, the present path stopped
+    if (x) *x = g_fl_x.load(std::memory_order_relaxed);
+    if (y) *y = g_fl_y.load(std::memory_order_relaxed);
+    return true;
+}
+bool stance_b() { return g_stance_b.load(std::memory_order_relaxed) != 0; }
+bool head_offset(float out[4], bool* use_h) {
+    if (!g_ho_ok.load(std::memory_order_relaxed) || !out) return false;
+    out[0] = g_ho_x.load(std::memory_order_relaxed);
+    out[1] = g_ho_f.load(std::memory_order_relaxed);
+    out[2] = g_ho_u.load(std::memory_order_relaxed);
+    out[3] = g_ho_uh.load(std::memory_order_relaxed);
+    if (use_h) *use_h = g_ho_use_h.load(std::memory_order_relaxed) != 0;
+    return true;
+}
+
 void set_fp_side(float meters) {
     g_fp_side.store(meters, std::memory_order_relaxed);
 }
@@ -281,6 +359,9 @@ void set_cam_selector_pose(bool on) {
 bool cam_selector_pose() {
     return g_cam_selector_pose.load(std::memory_order_relaxed);
 }
+
+void note_recenter() { g_ref_epoch.fetch_add(1, std::memory_order_relaxed); }
+unsigned ref_epoch() { return g_ref_epoch.load(std::memory_order_relaxed); }
 
 void set_cam_pose_rot(bool on) {
     g_cam_pose_rot.store(on, std::memory_order_relaxed);

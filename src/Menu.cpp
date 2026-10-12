@@ -182,6 +182,44 @@ Setting g_set[] = {
      "Blue and orange dots on your tracked controller positions.",
      1.0f, 0.0f, 1.0f, true, 1.0f, false},
 
+    // Owner 2026-09-08: the scope overlay ships ON as the stand-in for
+    // magnified optics, and both it and the barrel dot have to be
+    // switchable from here as well as from the desktop settings tool.
+    {"pip", "Scope overlay on magnified optics",
+     "The glass on a magnified optic cannot be seen through in VR, so a "
+     "magnified view is drawn on the scope instead, with a small mark where "
+     "the barrel is pointing. CLICK THE LEFT THUMBSTICK to raise and lower "
+     "it: it stays up with nothing held. While it is down the left trigger is "
+     "the game's own aim again. It is a stand-in and it is soft. For precise "
+     "shooting use iron sights, which aim normally.",
+     1.0f, 0.0f, 1.0f, true, 1.0f, false},
+
+    // BUILD 237, his ask: magnification as a live control, because the right
+    // value depends on the optic and on what you are shooting at, and it can
+    // only be judged while looking through the disc.
+    {"pip_zoom", "Scope magnification",
+     "How much the scope overlay magnifies, 1.2x to 4x. Higher is NOT "
+     "sharper: the overlay is a magnified crop of the picture your eye "
+     "already received, so raising this spreads the same pixels over more "
+     "area. Lower it if the view is too soft, raise it if you need reach. "
+     "2.7 is the ACOG's own value.",
+     2.7f, 1.2f, 4.0f, false, 2.7f, false},
+
+    // BUILD 237: the binding itself, so a user who preferred the old hold can
+    // have it back without editing a file.
+    {"pip_toggle", "Scope opens on thumbstick click",
+     "On: click the left thumbstick to raise the scope and click again to "
+     "lower it, and the left trigger stays the game's own aim throughout. "
+     "Off: the old behaviour, where the scope is open only while you hold "
+     "the left trigger and the game never sees that trigger at all.",
+     1.0f, 0.0f, 1.0f, true, 1.0f, false},
+
+    {"barrel_reticle", "Green dot where the barrel points",
+     "A small green mark showing where the round will actually go. The "
+     "bullet follows the barrel, not your view, so this is the honest aim "
+     "point at any range.",
+     1.0f, 0.0f, 1.0f, true, 1.0f, false},
+
     {"wp_markers", "Show weapon-candidate markers",
      "Research aid. Coloured dots on nearby engine objects, with a legend in "
      "the log once a second. Leave off for normal play.",
@@ -205,10 +243,17 @@ Setting g_set[] = {
      "Needs the motion-controlled weapon switched on.",
      0.0f, 0.0f, 2.0f, false, 0.0f, false},
 
+    // Build 134: the default was 1.0. load_cfg_file() seeds value = def BEFORE
+    // it parses the file, so a cfg missing this key would show and save 1, and
+    // 1 is what splits the gun. O-9 is headset-confirmed: "ok it did stop!"
+    // with this at 0. The default now matches the only value known to be safe.
+    // Put it back to 1 when the re-gate lands, not before.
     {"wgun_twohand", "Two-handed hold",
      "Your rear hand sets where the gun is, your front hand sets where it "
-     "points, like a real rifle. Off means the rear hand alone aims it.",
-     1.0f, 0.0f, 1.0f, true, 1.0f, false},
+     "points, like a real rifle. Off means the rear hand alone aims it. "
+     "KEEP THIS OFF: with it on, the gun splits in two (O-9). It stays off "
+     "until the re-gate lands.",
+     0.0f, 0.0f, 1.0f, true, 0.0f, false},
 
     {"wgun_grip_two", "Front hand grip",
      "How much your FRONT hand actually holds the weapon. At 0 your left hand "
@@ -218,21 +263,96 @@ Setting g_set[] = {
      "sweep while you look at the gun.",
      0.0f, 0.0f, 1.0f, false, 0.0f, false},
 
+    // 2026-08-31: the hands-hold-the-gun work.
+    {"wgun_hands", "Hands hold the gun",
+     "Carries the character's own hands and fingers with the weapon, keeping "
+     "exactly the grip the game's animation gives them, wherever your "
+     "controllers move the gun. Off means the gun moves and the hands stay "
+     "with the animation, which is how every earlier build behaved. This "
+     "cannot move your point of aim.",
+     1.0f, 0.0f, 1.0f, true, 1.0f, false},
+
+    {"wgun_hands_grab", "Off hand grabs, not glued",
+     "The character's left hand lands on the weapon only while your real off "
+     "hand is holding it, and lets go when you drop your hand, instead of the "
+     "idle animation keeping both hands glued on. The grab and release use "
+     "the same distance band as the two-handed hold, so they happen exactly "
+     "when the hold itself engages.",
+     1.0f, 0.0f, 1.0f, true, 1.0f, false},
+
+    {"wgun_pitch_deg", "Barrel-to-bullet trim (degrees)",
+     "The weapon model's barrel points a fixed amount below the line the "
+     "bullets actually fly, which reads as the gun shooting high. Fire a few "
+     "rounds at a wall and raise this until the holes sit where the barrel "
+     "points. This only rotates what the model shows; the bullet's line "
+     "never moves.",
+     0.0f, -45.0f, 45.0f, false, 0.0f, false},
+
+    {"wgun_arms", "Arms follow the hands",
+     "Bends the elbows so each arm actually reaches its hand instead of the "
+     "skin stretching across the gap. The elbow keeps pointing the way the "
+     "game's own animation points it, so nothing needs tuning. Turn it off "
+     "to get the animation's arms back, stretch and all. Hide the arms "
+     "overrides this while it is on.",
+     1.0f, 0.0f, 1.0f, true, 1.0f, false},
+
+    {"wgun_hand_free", "Left hand follows your hand",
+     "When your left hand is not on the weapon, the character's left hand "
+     "follows your controller instead of the animation: reach over your "
+     "shoulder or down to your thigh and watch it go with you. Position "
+     "only for now, so the wrist keeps the animation's angle. This is the "
+     "groundwork for drawing weapons by reaching for them.",
+     1.0f, 0.0f, 1.0f, true, 1.0f, false},
+
+    {"wgun_hide_arms", "Hide the arms (bone level)",
+     "Collapses both arms into the shoulders so the stretched skin between "
+     "the animated arm and the carried hand is never seen. Try stepping Hide "
+     "one body piece first: if a piece removes the arm and LEAVES the hand, "
+     "that is the cleaner cure and this stays off. Turning this off brings "
+     "the stock arms back instantly.",
+     0.0f, 0.0f, 1.0f, true, 0.0f, false},
+
+    {"wgun_two_anchor", "Weapon rests on the rear hand",
+     "When your right hand measures as the FRONT hand, the weapon's position "
+     "follows your rear hand instead, which is how a rifle is actually "
+     "carried. Off is the old behaviour: the weapon always rides the right "
+     "controller, even from the wrong end. Turn this off if the gun seems to "
+     "sit in the wrong hand and say so.",
+     1.0f, 0.0f, 1.0f, true, 1.0f, false},
+
+    {"hide_child", "Hide one body piece",
+     "Steps through the character's render pieces and hides the chosen one. "
+     "-1 is off. The log names every step, so walk it up until the piece you "
+     "want gone disappears. THE QUESTION THIS EXISTS TO ANSWER: when an arm "
+     "vanishes, does the hand vanish with it? Whichever way that goes decides "
+     "how the arms are handled, so say what you see.",
+     -1.0f, -1.0f, 63.0f, false, -1.0f, false},
+
+    {"hide_child2", "Hide a second body piece",
+     "The second hide slot, identical to the first, because you have two "
+     "arms.",
+     -1.0f, -1.0f, 63.0f, false, -1.0f, false},
+
+    // Build 134: both of these used to say "your last run" and then quote
+    // numbers. A full-corpus sweep on 2026-08-27 found the trigger pulled in
+    // 4 of 494 logs, all between 2026-08-01 and 08-07, all of them BEFORE the
+    // aim-point subsystem existed. So "your last run" described something
+    // weeks old and a tester read it as current. Help text says what a setting
+    // DOES; run history lives in the ledger, which can be corrected.
     {"main_hand", "Shooting hand",
      "Which hand holds the grip and pulls the trigger. 1 is right, 0 is left. "
      "Everything else follows from this: which controller the weapon pivots "
-     "on, which trigger aims down sights, and which trigger fires. Your last "
-     "run pulled the LEFT trigger 19 times and the right one once, so aim down "
-     "sights and fire were both watching the wrong hand and neither ever "
-     "engaged.",
+     "on, which trigger aims down sights, and which trigger fires. If aiming "
+     "and firing both seem dead, this is the first thing to check, because "
+     "they will be watching the other hand.",
      1.0f, 0.0f, 1.0f, true, 1.0f, false},
 
     {"wgun_two_auto", "Find the front hand",
      "Works out which of your hands is nearer the muzzle instead of assuming "
-     "it is your left. Your last recorded run measured your RIGHT hand in "
-     "front, which pointed the barrel behind you and made the two-hand gate "
-     "refuse every single frame. Leave this on unless the gun points the wrong "
-     "way, in which case turn it off and say so.",
+     "it is your left. With it off and the assumption wrong, the barrel points "
+     "behind you and the two-hand gate refuses every frame. Leave this on "
+     "unless the gun points the wrong way, in which case turn it off and say "
+     "so.",
      1.0f, 0.0f, 1.0f, true, 1.0f, false},
 
     {"wgun_two_agree", "Two-hand gate",
@@ -243,6 +363,23 @@ Setting g_set[] = {
      "to 0.00 is the worst setting available: it sits exactly on the measured "
      "average, so it would accept and refuse alternately at 72 Hz.",
      0.35f, -1.0f, 1.0f, false, 0.35f, false},
+
+    {"wgun_two_grip", "Squeeze to hold the foregrip",
+     "The two-handed aim only engages while your off hand is actually "
+     "squeezing its grip button, the way native VR shooters work, and lets "
+     "go when you do. This stops the aim from riding a hand that is not "
+     "really on the weapon, which is what walked your shots high. While "
+     "this is on, that squeeze no longer presses a gamepad bumper in game.",
+     0.0f, 0.0f, 1.0f, true, 0.0f, false},
+
+    {"wgun_two_attach", "Off-hand attach range (metres)",
+     "How far your off hand can be from your gun hand and still count as "
+     "holding the weapon. Past this the hold fades out completely, so a hand "
+     "hanging at your side cannot drag or steer the gun, which is the old "
+     "splitting problem: a hold measured from a hand that was holding "
+     "nothing. Real grips measure 0.11 to 0.41 between the hands. Raise it "
+     "only if the weapon lets go while you are genuinely gripping.",
+     0.45f, 0.25f, 3.0f, false, 0.45f, false},
 
     {"wgun_pos_clamp", "Gun reach (metres)",
      "How far the gun may travel from its resting anchor before it stops "
@@ -314,6 +451,53 @@ bool line_is_key(const std::string& line, const char* key, float* out) {
     return true;
 }
 
+// BUILD 134: every cfg key the panel does NOT have a row for.
+//
+// Thirteen live keys were invisible from inside the headset, and one of them
+// matters: aim_probes was set to 1 on 2026-08-24, is not the default, does NOT
+// hot reload, and arms probes on very hot engine functions whose frame cost has
+// never been measured. A tester could not tell it was on. This is read-only on
+// purpose: it reports, it does not offer to change anything.
+//
+// Computed once per load, NOT per frame. render() runs on the render thread and
+// CLAUDE.md rule 8 keeps allocation off it.
+constexpr int kMaxUnknown = 48;
+char g_unknown[kMaxUnknown][96];
+int  g_unknown_count = 0;
+
+// Pull "key" out of a "key = value" line. Returns false for blanks and comments.
+bool line_key_name(const std::string& line, char* out, size_t cap) {
+    size_t i = line.find_first_not_of(" \t");
+    if (i == std::string::npos || line[i] == '#') return false;
+    size_t e = line.find_first_of(" \t=", i);
+    if (e == std::string::npos) return false;
+    size_t eq = line.find_first_not_of(" \t", e);
+    if (eq == std::string::npos || line[eq] != '=') return false;
+    const size_t n = e - i;
+    if (n == 0 || n >= cap) return false;
+    memcpy(out, line.c_str() + i, n);
+    out[n] = '\0';
+    return true;
+}
+
+void rebuild_unknown_list() {
+    g_unknown_count = 0;
+    for (const std::string& l : g_cfg_lines) {
+        char key[64];
+        if (!line_key_name(l, key, sizeof(key))) continue;
+        bool known = false;
+        for (int i = 0; i < kSettingCount && !known; ++i)
+            known = (strcmp(key, g_set[i].key) == 0);
+        if (known) continue;
+        float v = 0.0f;
+        line_is_key(l, key, &v);
+        if (g_unknown_count >= kMaxUnknown) break;
+        snprintf(g_unknown[g_unknown_count], sizeof(g_unknown[0]),
+                 "%s = %g", key, (double)v);
+        ++g_unknown_count;
+    }
+}
+
 // Init thread. Reads the file into memory and seeds every slider from it.
 void load_cfg_file() {
     g_cfg_lines.clear();
@@ -335,6 +519,7 @@ void load_cfg_file() {
             if (line_is_key(l, g_set[i].key, &v)) { g_set[i].value = v; break; }
         }
     }
+    rebuild_unknown_list();
     g_cfg_loaded = true;
 }
 
@@ -385,10 +570,24 @@ void help_marker(const char* text) {
     }
 }
 
+// BUILD 134: a row now commits itself.
+//
+// It used to take two actions: move the control, then find and press "Apply
+// and save". The control moved on screen either way, so a flipped checkbox
+// looked applied when nothing had been written. That is the best available
+// explanation for O-8, where a panel toggle "did not actuate" (frontRIGHT=13477)
+// while the identical change made by hand in grwxr.cfg took immediately (O-9).
+// In a headset there is no glancing at a status line to catch it.
+//
+// A toggle commits on click. A slider commits on RELEASE, not per frame, or a
+// drag would rewrite the file at frame rate. The button stays, because it is
+// still the way to force a write, and it now reads as a fallback rather than
+// as the only route.
 void draw_settings_page() {
     ImGui::TextWrapped(
-        "These write GRWVR\\grwxr.cfg. Nothing changes until you press Apply, "
-        "and the game picks it up about a second later.");
+        "These write GRWVR\\grwxr.cfg. A switch applies as soon as you flip "
+        "it; a slider applies when you let go. The game picks it up about a "
+        "second later, so give it a beat before you judge the change.");
     ImGui::Separator();
 
     bool any_dirty = false;
@@ -397,9 +596,14 @@ void draw_settings_page() {
         ImGui::PushID(i);
         if (s.is_toggle) {
             bool on = s.value != 0.0f;
-            if (ImGui::Checkbox(s.label, &on)) { s.value = on ? 1.0f : 0.0f; s.dirty = true; }
+            if (ImGui::Checkbox(s.label, &on)) {
+                s.value = on ? 1.0f : 0.0f;
+                s.dirty = true;
+                g_want_save.store(true);          // commit on click
+            }
         } else {
             if (ImGui::SliderFloat(s.label, &s.value, s.lo, s.hi, "%.2f")) s.dirty = true;
+            if (ImGui::IsItemDeactivatedAfterEdit()) g_want_save.store(true);  // on release
         }
         help_marker(s.help);
         if (s.dirty) {
@@ -412,12 +616,39 @@ void draw_settings_page() {
 
     ImGui::Separator();
     if (!any_dirty) ImGui::BeginDisabled();
-    if (ImGui::Button("Apply and save", ImVec2(200, 0))) g_want_save.store(true);
+    if (ImGui::Button("Force a write", ImVec2(200, 0))) g_want_save.store(true);
     if (!any_dirty) ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Button("Reload from file", ImVec2(200, 0))) g_want_reload.store(true);
     ImGui::SameLine();
-    ImGui::TextDisabled(any_dirty ? "unsaved changes" : "in sync with the file");
+    ImGui::TextDisabled(any_dirty ? "writing..." : "in sync with the file");
+
+    // BUILD 134: what is live in the file but has no row above. Read-only.
+    if (g_unknown_count > 0) {
+        ImGui::Separator();
+        if (ImGui::CollapsingHeader("Also live in grwxr.cfg, no row here")) {
+            ImGui::TextWrapped(
+                "These are set in the file and this page cannot change them. "
+                "Shown so nothing is running that you cannot see. Edit them "
+                "in GRWVR\\grwxr.cfg with the game closed.");
+            ImGui::Separator();
+            for (int i = 0; i < g_unknown_count; ++i) {
+                const bool probes = strncmp(g_unknown[i], "aim_probes", 10) == 0;
+                if (probes)
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                                       "%s", g_unknown[i]);
+                else
+                    ImGui::TextDisabled("%s", g_unknown[i]);
+            }
+            ImGui::Separator();
+            ImGui::TextWrapped(
+                "aim_probes is the one to watch. It is read ONCE at startup and "
+                "does not hot reload, so changing it needs a restart, and it "
+                "arms probes on very hot engine functions whose frame cost has "
+                "never been measured. Set it back to 0 when the aiming-point "
+                "hook is no longer wanted.");
+        }
+    }
 }
 
 // BUILD 129: whole configs, one numpad digit each. See Presets.h.
@@ -447,6 +678,21 @@ void draw_presets_page() {
         "A preset overwrites grwxr.cfg, which is what keeps the live state "
         "readable in one file. Your cfg is backed up once, before the first "
         "load of each session.");
+
+    // BUILD 134: the presets were seeded 2026-08-22, BEFORE either
+    // headset-confirmed fix existed, so loading one silently reverts both.
+    // STATE.md carries this as a live hazard with the owner's decision still
+    // pending. The panel used to offer them with no warning at all.
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "READ THIS FIRST");
+    ImGui::TextWrapped(
+        "Every preset on disk was written on 2026-08-22, before either "
+        "confirmed fix existed. All of them set the two-handed hold back ON, "
+        "which is what splits the gun (O-9), and four of five also flip the "
+        "eye sign back. Loading one undoes both fixes and the run will look "
+        "broken for reasons that have nothing to do with what you are testing. "
+        "If a run looks wrong, check the log for 'preset:' before concluding "
+        "anything: a load announces itself and logs a key-by-key diff.");
     ImGui::Separator();
 
     const char* cur = presets::current();
@@ -598,10 +844,24 @@ void draw_status_page() {
     ImGui::Text("Backbuffer       : %u x %u  (format %d)", st.width, st.height, (int)st.format);
     ImGui::Text("Device           : %p", (void*)st.device);
     ImGui::Separator();
-    ImGui::TextWrapped(
-        "If you are reporting a problem, the log is GRWVR\\grwxr.log. Its first "
-        "line carries the build hash. Quote that line, otherwise we cannot tell "
-        "which build you actually ran.");
+    // The path, not the assumption. When the game folder is not writable the
+    // log is somewhere else entirely, and a tester told to look in GRWVR finds
+    // an empty folder and reports "there is no log".
+    {
+        const std::string& lp = ::grwxr::log::log_path();
+        ImGui::TextWrapped(
+            "If you are reporting a problem, send this file:");
+        ImGui::TextWrapped("%s", lp.empty() ? "(no log file was opened)" : lp.c_str());
+        ImGui::TextWrapped(
+            "Its first line carries the build hash. Quote that line, otherwise "
+            "we cannot tell which build you actually ran.");
+        if (::grwxr::log::data_dir_is_fallback()) {
+            ImGui::TextWrapped(
+                "NOTE: the game folder is not writable, so the log and your "
+                "grwxr.cfg are in the path above instead of next to the game. "
+                "Edit that copy; the one in the game folder is no longer read.");
+        }
+    }
 }
 
 void draw_ui() {
@@ -692,7 +952,7 @@ bool init(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     // NEVER let ImGui write its own ini. It would land beside the game exe,
-    // and the project's default rule is that we place nothing in the install
+    // and CLAUDE.md's default rule is that we place nothing in the install
     // except the proxy and the GRWVR folder.
     io.IniFilename  = nullptr;
     io.LogFilename  = nullptr;

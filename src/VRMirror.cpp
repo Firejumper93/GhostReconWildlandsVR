@@ -6,7 +6,18 @@
 #include "Log.h"
 #include "Menu.h"
 #include "WeaponProbe.h"
+#include "Perf.h"   // BUILD 215
+#include "Foveate.h"   // BUILD 216
 #include "XInputMerge.h"
+#include "XrLayers.h"   // BUILD 233: the API layer manifest scanner
+#include "StallWatch.h"   // BUILD 235: the thread snapshot when the first frame stalls
+#include "Anatomy.h"      // BUILD 241
+#include "Census.h"       // BUILD 242
+#include "CbDump.h"       // BUILD 246
+#include "Cam2.h"         // BUILD 243: cfg cam2_experiment, cam2_ipd
+#include "PassGuard.h"    // BUILD 259: cfg projshadow_guard
+#include "EyeRec.h"       // BUILD 248: the eye recorder (diagnostic, off by default)
+#include "GtRec.h"        // BUILD 270: the ground-truth stereo recorder (diagnostic, log only, off by default)
 
 #include <cstring>   // memcpy for the overlay-gun constant buffer
 
@@ -15,7 +26,13 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+#include <dxgi1_4.h>   // BUILD 215: IDXGIAdapter3::QueryVideoMemoryInfo, the process's VRAM
+#include <psapi.h>     // BUILD 215: GetProcessMemoryInfo, on the init thread only
+#include <cstdarg>
+#include <cstdio>
+
 #include <atomic>
+#include <string>   // BUILD 233: the API layer manifest scan
 #include <vector>
 #include <cmath>
 
@@ -28,6 +45,7 @@ XrSystemId   g_system     = XR_NULL_SYSTEM_ID;
 XrSession    g_session    = XR_NULL_HANDLE;
 XrSpace      g_space      = XR_NULL_HANDLE;
 XrSpace      g_view_space = XR_NULL_HANDLE;
+XrSpace      g_stage_space = XR_NULL_HANDLE;   // BUILD 205: the floor, for the head's height; may stay null
 
 // BUILD 13b: motion-control step 1, INPUT PLUMBING ONLY. One action set with
 // a per-hand aim pose and a per-hand trigger float, suggested for the Oculus
@@ -39,6 +57,7 @@ XrActionSet g_actionset = XR_NULL_HANDLE;
 XrAction    g_act_aim   = XR_NULL_HANDLE;
 XrAction    g_act_trig  = XR_NULL_HANDLE;
 XrAction    g_act_grip  = XR_NULL_HANDLE;   // build 14e.2, the aim-steer gate
+XrAction    g_act_gpose = XR_NULL_HANDLE;   // BUILD 162, the grip POSE (anatomical frame)
 // Build 22: the rest of the Touch surface, for the XInput merge.
 XrAction    g_act_stick    = XR_NULL_HANDLE;   // vector2f, both hands
 XrAction    g_act_stickclk = XR_NULL_HANDLE;   // boolean, both hands
@@ -49,6 +68,7 @@ XrAction    g_act_btn_y    = XR_NULL_HANDLE;   // left hand
 XrAction    g_act_menu     = XR_NULL_HANDLE;   // left hand
 XrPath      g_hand[2]      = {XR_NULL_PATH, XR_NULL_PATH};
 XrSpace     g_aim_space[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+XrSpace     g_grip_space[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};   // BUILD 162
 bool        g_input_ok = false;
 // Hot path -> heartbeat handoff (rule 8: the present hook only stores plain
 // atomics; the heartbeat thread formats and logs).
@@ -80,6 +100,10 @@ std::atomic<float>    g_in_pos[2][3] = {};
 std::atomic<float>    g_in_ori[2][4] = {};
 std::atomic<float>    g_in_trig[2]   = {};
 std::atomic<float>    g_in_grip[2]   = {};   // build 14e.2
+// BUILD 162: the grip POSE orientation per logical slot, and whether it was
+// located this frame. Orientation only: the aim pose keeps the position.
+std::atomic<float>    g_in_gori[2][4] = {};
+std::atomic<bool>     g_in_gtrack[2]  = {};
 std::atomic<int>      g_in_stick_rc[2] = {}; // build 22.1: (XrResult<<1)|isActive
 
 // BUILD 14d: CONTROLLER AIM STEER. While the RIGHT trigger is held (the game
@@ -151,6 +175,47 @@ float g_ctl_pitch  = 0.0f;
 bool  g_ctl_have   = false;             // never tracked yet: fall back to head
 std::atomic<float> g_ctl_diag[4] = {};  // 23.1: ctl yaw/pitch, head yaw/pitch
 std::atomic<bool>  g_ctl_diag_ok{false};
+
+// 2026-09-01: THE LOOK-REVERSAL PROBE. The owner's 02:39 session report, "the
+// head reversed left and right look", cannot be localized from the existing
+// lines: aim: prints the engine's setter yaw with no head yaw beside it, and
+// ctlaim: is gated on aim_source = 1, which this cfg does not run. One atomic
+// feeds a 1 Hz aimref: line in drain_input that puts the XR head yaw, the
+// engine's own view forward and the setter value side by side, so one slow
+// head turn shows which leg reverses. Log-only; remove when it is explained.
+std::atomic<float> g_aimref_head{0.0f};  // yaw handed to aim_pump, rad
+// BUILD 289: THE RECOIL RECORDER (log only, cfg recoil_rec, code default ON for this measurement build). His word
+// 2026-10-11: the view rides up with recoil and stays; recoil should move the gun and hands, not the head. Before any fix
+// the project needs to know HOW the kick reaches the view: through the pitch the engine passes to SetPitch (aim_lastval),
+// or through the camera base alone (g_base pitch), and how fast it comes back. One row per Present from aim_pump (no I/O
+// there: a plain ring), written to GRWVR\recoil-<pid>.csv by the 1 Hz drain thread.
+struct RcRow {
+    uint32_t t_ms;      // GetTickCount64 low 32 bits
+    uint32_t shots;     // shot-direction hook count, all time
+    float    trig;      // right trigger 0..1
+    float    eng;       // engine SetPitch incoming value, degrees
+    float    base;      // engine camera base pitch (g_base), degrees
+    float    head;      // the pitch handed to the pump (head, plus barrel error when barrel aim is live), degrees
+    uint32_t calls;     // SetPitch calls so far
+    // BUILD 292: the split of the pump's target, so the view following the barrel can be told from the head
+    float    ep;        // barrel pitch error added this frame by aim_barrel (the clamped ep), degrees; 0 if the barrel block did not run
+    float    barrel;    // the barrel's pitch, degrees (asin of its z); 0 if the block did not run
+    float    view;      // the engine view's pitch the barrel block compared against, degrees; 0 if the block did not run
+    float    cum;       // the pump's booked pitch (g_aim_cum[1]), degrees
+    uint8_t  flags;     // bit0 barrel block ran this frame, bit1 pump live, bit2 aimtrace::firing(), bit3 delta in flight
+    float    fov;       // the fov the pump gates on, radians (ADS and optics read low)
+    uint32_t obj;      // BUILD 292: the object SetPitch was last called on (rcx, low 32 bits)
+};
+// BUILD 292: written by the barrel block, read by the recoil recorder (same thread, Present)
+float g_rcx_barrel = 0.0f, g_rcx_view = 0.0f;
+unsigned g_rcx_frames_seen = 0;
+constexpr uint32_t kRcN = 4096;
+RcRow                 g_rc[kRcN];
+std::atomic<uint32_t> g_rc_w{0};            // total rows written by the Present thread
+uint32_t              g_rc_r = 0;           // drain thread's read position
+std::atomic<int>      g_rc_on{1};
+static float g_cfg_aim_pitch_abs = 1.0f;   // BUILD 290: the pitch baseline is absolute (the engine follows the head's own pitch); code default ON
+std::atomic<int>   g_veh_probe{1};       // BUILD 260: cfg veh_probe, the log-only vehicle instrument (the veh: line)
 
 // ---------------------------------------------------------------------------
 // BUILD 84: aim_barrel. THE BULLET LEAVES THE BARREL.
@@ -387,6 +452,8 @@ std::vector<ID3D11RenderTargetView*> g_rtv[2];
 // g_blit_ok stays false and the 10L fixed copy path runs unchanged.
 ID3D11VertexShader*       g_blit_vs   = nullptr;
 ID3D11PixelShader*        g_blit_ps   = nullptr;
+ID3D11PixelShader*        g_pip_ps    = nullptr;   // BUILD 221: the PiP disc
+ID3D11Buffer*             g_pip_cb    = nullptr;   // BUILD 221: its uv centre and half extent
 
 // 2026-08-12: the settings panel. Menu.cpp has always been able to draw itself
 // into an offscreen texture, and dllmain already toggles it on F1, calls
@@ -417,6 +484,116 @@ bool  g_dot_enable = true;    // cfg aim_reticle, 0 hides it
 bool  g_hand_enable  = true;          // cfg hand_markers, 0 hides them
 float g_head_pos[3]  = {0, 0, 0};     // head position, reference space
 bool  g_head_pos_ok  = false;
+// BUILD 204: TRUE 6DOF. The head position at the reference (captured with
+// the yaw reference, so a recenter re-zeroes it), the key, the clamp and the
+// counters of the 1 Hz hpos: line.
+float g_head_ref_pos[3] = {0, 0, 0};
+bool  g_head_ref_ok  = false;
+std::atomic<int>      g_head_pos_on{0};       // cfg head_pos
+std::atomic<float>    g_head_pos_max{0.75f};  // cfg head_pos_max, metres
+// BUILD 300: THE LEAN. cfg lean (code default ON) turns the head offset on with a soft limit instead of the hard head_pos_max clamp:
+// the horizontal offset eases to lean_max, the vertical to lean_down below and lean_up above; lean_soft is the fraction of each limit
+// where the easing begins. Holding the left menu button for lean_hold_ms re-zeroes the lean origin and the view (the Home recenter);
+// a shorter press is still the game's Start, sent on release.
+std::atomic<int>      g_lean_mode{0};
+std::atomic<float>    g_lean_max{0.40f}, g_lean_soft{0.75f}, g_lean_down{0.25f}, g_lean_up{0.10f};
+std::atomic<int>      g_lean_hold_ms{800};
+std::atomic<uint64_t> g_lean_soft_n{0};       // frames the horizontal offset was past where the easing begins
+std::atomic<uint64_t> g_lean_rc_menu{0};      // recentres by holding the left menu button
+std::atomic<uint64_t> g_lean_start_taps{0};   // short presses passed to the game as Start on release
+std::atomic<uint64_t> g_hp_frames{0};         // frames a valid offset was published
+std::atomic<uint64_t> g_hp_clamps{0};         // frames the offset was clamped to head_pos_max
+std::atomic<uint64_t> g_hp_refs{0};           // reference captures
+std::atomic<float>    g_hp_last[3] = {};      // the last published offset (x, f, u)
+// BUILD 205: THE STANCE LOOP. Desired from the physical head height, actual
+// from the character's head bone, the pad's B while they disagree.
+std::atomic<int>      g_stance_on{0};         // cfg stance
+std::atomic<float>    g_stance_height{0.0f};  // cfg stance_height: 0 = the running maximum since the recenter
+std::atomic<float>    g_stance_crouch{0.75f}; // cfg stance_crouch: below this fraction of standing = crouch
+std::atomic<float>    g_stance_prone{0.0f};   // cfg stance_prone: below this fraction = prone; 0 = prone is his (BUILD 208 default)
+// BUILD 301: THE HYBRID CROUCH (his choice 2026-10-12: the view follows the real height, a real crouch past a threshold taps the game's
+// crouch, standing back up releases it by itself, prone stays his). The threshold is in metres of drop below the standing height taken at
+// the recentre (crouch_drop, his to tune), with crouch_rise metres of hysteresis on the way up. crouch_drop 0 = the old 205 ratio.
+std::atomic<float>    g_crouch_drop{0.25f}, g_crouch_rise{0.10f};
+float                 g_st_drop = 0.0f;       // the real drop below standing this frame, metres (log)
+float    g_st_height   = 0.0f;   // the physical head height this frame, metres above the floor
+float    g_st_hstand   = 0.0f;   // the standing height in use
+float    g_st_dzmax    = 0.0f;   // the bone height's running maximum since the recenter (standing, about 1.6)
+bool     g_st_stage_ok = false;
+int      g_st_desired  = 0;      // 0 stand, 1 crouch, 2 prone; -1 unknown
+int      g_st_actual   = -1;
+std::atomic<uint64_t> g_st_taps{0};
+std::atomic<uint64_t> g_st_holds{0};
+std::atomic<uint64_t> g_st_fights{0};       // back-offs after four acts without effect
+std::atomic<uint64_t> g_st_changes{0};      // actual stance changes seen
+// BUILD 206: the standing height, calibrated. Sources in order: cfg
+// stance_height; the F3 capture (four seconds of samples starting one
+// second after the press, averaged); the automatic average over the three
+// seconds starting one second after the recenter. Never the maximum.
+uint64_t g_st_cal_from = 0, g_st_cal_until = 0;   // the F3 window
+double   g_st_cal_sum = 0.0; unsigned g_st_cal_n = 0;
+float    g_st_hf3 = 0.0f; bool g_st_hf3_ok = false;
+uint64_t g_st_ref_ms = 0;                          // when the reference was captured
+double   g_st_auto_sum = 0.0; unsigned g_st_auto_n = 0; bool g_st_auto_done = false;
+int      g_st_src = 0;                             // 0 auto, 1 F4, 2 cfg
+float    g_st_tallest = 0.0f;                      // BUILD 302: the tallest accepted recentre average this session; a new average is taken only within 0.10 m of it
+bool     g_st_seated = false;                      // BUILD 207: the head bone in the seat band (0.55 to 0.85): no B, no compensation
+std::atomic<uint64_t> g_st_manual{0};             // BUILD 207: his own B closed the act window
+// BUILD 209: THE BODY FOLLOW. Beyond a deadband the left stick is pushed
+// toward the head (head-local x and f map straight onto the stick, the
+// game's move is camera-relative and the camera follows the head's yaw),
+// only while his own stick is idle and he is not rushing (the LS click),
+// in first person, with a stereo frame, not in a seat. While the follow
+// moves the body, the 6DOF reference advances by the body's own motion
+// mapped back into XR space (the inverse of the hands' conversion), so
+// the view stays still in the world as the body walks under the head.
+std::atomic<int>      g_follow_on{0};        // cfg follow
+std::atomic<float>    g_follow_dead{0.20f};  // cfg follow_dead, metres
+// BUILD 211: follow_gain and follow_cap are retired. The stick no longer
+// meters speed (the game discarded every magnitude 209 and 210 could produce);
+// one magnitude closes, and the body's own measured speed decides when to stop.
+std::atomic<float>    g_follow_push{0.75f};  // cfg follow_push, the stick while closing
+std::atomic<float>    g_follow_stop{0.10f};  // cfg follow_stop, seconds of stopping distance aimed at
+std::atomic<float>    g_follow_vmax{2.0f};   // cfg follow_vmax, m/s above which it coasts
+std::atomic<float>    g_follow_bleed{0.30f}; // cfg follow_bleed, m/s the settle takes out of the view
+std::atomic<int>      g_fl_state{0};         // 0 idle, 1 closing, 2 coast, 3 settle
+std::atomic<uint64_t> g_fl_closes{0};        // times it set out to close
+std::atomic<uint64_t> g_fl_settles{0};       // times it reached the settle
+std::atomic<uint64_t> g_fl_blocked{0};       // closes abandoned: the body did not move (a wall)
+std::atomic<uint64_t> g_fl_bleeds{0};        // frames the settle moved the reference
+std::atomic<float>    g_fl_bled{0.0f};       // metres taken out of the view by the settle, cumulative
+std::atomic<float>    g_fl_vbody{0.0f};      // the character's horizontal speed, m/s
+std::atomic<float>    g_fl_vhead{0.0f};      // his own head's horizontal speed in XR, m/s
+// BUILD 212: WHERE EVERY RE-ZERO OF THE VIEW CAME FROM. The 211 run took six
+// references in 110 seconds off a single F2 press (grwxr-18104.log, refs=6,
+// five `aim: RESYNC (recenter)`), and a re-zero re-takes the YAW reference,
+// which turns the whole world to wherever his head happens to point: his
+// words, 2026-09-06 22:20, "the head has a weird rotational swivel to it".
+// note() shares one buffer drained once a second, so two notes in a second
+// lose the first and none of this was in the log. These are counters.
+std::atomic<uint64_t> g_rc_local{0};      // runtime changed LOCAL, no usable pose: the view re-zeroed
+std::atomic<uint64_t> g_rc_absorbed{0};   // runtime changed LOCAL with a pose: transformed, the view did not move
+std::atomic<uint64_t> g_rc_stage{0};      // runtime moved the floor: the standing height re-takes, the view untouched
+std::atomic<uint64_t> g_rc_other{0};      // a space we hold nothing in
+std::atomic<uint64_t> g_rc_key{0};        // Home or Space
+std::atomic<uint64_t> g_rc_fp{0};         // F2, the panel, or a hand calibration asking for first person
+std::atomic<uint64_t> g_rc_begin{0};      // the session started
+std::atomic<uint64_t> g_fl_frames{0};        // frames the follow pushed the stick
+std::atomic<uint64_t> g_fl_advances{0};      // reference advances
+std::atomic<uint64_t> g_fl_teleports{0};     // body jumps of 0.35 m or more in a frame, not advanced
+std::atomic<uint64_t> g_fl_user{0};          // frames suspended for his own stick
+std::atomic<uint64_t> g_fl_rush{0};          // frames suspended for the LS click
+std::atomic<float>    g_fl_stick{0.0f};      // the last stick magnitude pushed
+std::atomic<float>    g_fl_dist{0.0f};       // the last horizontal head offset
+std::atomic<float>    g_fl_adv{0.0f};        // the last reference advance, metres
+std::atomic<uint64_t> g_fl_nocam{0};         // BUILD 210: frames the follow stood aside for no camera frame
+std::atomic<uint64_t> g_fl_far{0};           // BUILD 210: frames the offset read 3 m or more (a tracking jump), not followed
+static void stance_calib_start() {
+    const uint64_t now = GetTickCount64();
+    g_st_cal_from = now + 1000;
+    g_st_cal_until = now + 5000;
+    g_st_cal_sum = 0.0; g_st_cal_n = 0;
+}
 bool  g_hand_on[2]   = {false, false};
 float g_hand_tx[2][2] = {};           // [hand][eye] tangent from view centre
 float g_hand_ty[2][2] = {};
@@ -434,11 +611,49 @@ constexpr int kWpm = wp::kWatch;   // slot index = colour index, fixed
 bool  g_wpm_enable = true;              // cfg wp_markers, 0 hides them
 bool  g_wskel_enable = false;           // cfg wskel, build 64: WHITE marker
                                         // rides the weapon-skeleton pick
+bool  g_wskel_marker = false;           // BUILD 227: cfg wskel_marker, the white
+                                        // blob itself; the pick runs without it
+bool  g_palette_probe = false;          // BUILD 227: cfg palette_probe
 bool  g_wpm_on[kWpm] = {};
 float g_wpm_tx[kWpm][2] = {};           // [slot][eye] tangent from centre
 float g_wpm_ty[kWpm][2] = {};
 float g_wpm_tr[kWpm][2] = {};
 ID3D11PixelShader* g_wpm_ps[kWpm] = {};
+
+// BUILD 153: THE EVIDENCE RETICLE. cfg barrel_reticle, default OFF.
+//
+// The owner's ask, 2026-09-01: "a small reticle that appears in vr and on the
+// screen for screen recording evidence". The purpose is to make the standing
+// complaint provable on video instead of arguable. Two headset sessions on
+// build 152 logged 199 shots, every one why=WROTE with the published
+// direction 0.0 degrees off the controller ray, while the gun pointed 76 to
+// 92 degrees away from the head and the round still followed the head.
+//
+// So this draws TWO markers at the SAME distance:
+//   slot 0  BARREL, from the player's muzzle along barrel_dir_peek, which is
+//           the exact vector written into the shot at SetShotLine
+//   slot 1  GAZE, from the camera along the camera's own forward
+// Their on-screen separation IS the divergence, frame by frame, and the round
+// lands on one of them. It is the rayprobe's raw-vs-cam number as a picture.
+//
+// WHAT IT IS NOT, and the log line says so too: a fixed-distance dot does NOT
+// predict an impact at a different range, because the camera and the muzzle
+// are not the same point. Set barrel_reticle_dist to roughly the target range.
+//
+// Angular size is FIXED rather than distance-scaled, unlike the wp markers.
+// A reticle wants to look the same whatever it is over, and a 6 cm blob at
+// 25 m would be invisible on video, which is the whole point of the feature.
+//
+// Purely additive drawing. It reads barrel_dir_peek and base_frame and writes
+// nothing, so it cannot reach the shot chain the hard baseline guards.
+constexpr int kRet = 2;                 // 0 = barrel, 1 = gaze
+int   g_ret_mode   = 0;                 // cfg barrel_reticle: 0 off, 1 barrel, 2 both
+float g_ret_dist   = 20.0f;             // cfg barrel_reticle_dist, metres
+float g_ret_size   = 0.010f;            // half-tangent, about 1.1 deg across
+bool  g_ret_on[kRet] = {};
+float g_ret_tx[kRet][2] = {};
+float g_ret_ty[kRet][2] = {};
+ID3D11PixelShader* g_ret_ps[kRet] = {};
 // BUILD 47: the placement write test (WeaponProbe.h set_write). cfg-driven,
 // hot-reloaded, default OFF. slot picks the colour to write (0 RED 1 GREEN
 // 2 YELLOW 3 MAGENTA 4 CYAN 5 WHITE, -1 off and the kill switch); mode 1
@@ -466,6 +681,30 @@ int   g_aq_axis = 2;
 bool  g_dot_on = false;       // this frame: draw it
 float g_dot_tx = 0.0f;        // tangent offsets from view center
 float g_dot_ty = 0.0f;
+// BUILD 221: the PiP scope, present thread. The disc sits where the eyepiece
+// projects in each eye (the BUILD 45 route: engine world through base_frame,
+// with the per-eye IPD shift), and shows the frame around the barrel's aim
+// tangent (the dot's own numbers) at pip_zoom.
+bool  g_pip_enable = false;   // cfg pip; off in code, the cfg turns it on
+float g_pip_zoom   = 2.7f;    // cfg pip_zoom; 2.7 is the ACOG's own game value
+float g_pip_radius = 0.016f;  // cfg pip_radius, metres, the glass's radius
+bool  g_pip_show   = false;
+float g_pip_tx[2] = {0.0f, 0.0f}, g_pip_ty[2] = {0.0f, 0.0f}, g_pip_tr[2] = {0.0f, 0.0f};
+float g_pip_atx = 0.0f, g_pip_aty = 0.0f;   // the aim tangent, the source centre
+// BUILD 237: THE STALE-EYE WOBBLE. g_pip_atx/aty above are ONE pair, computed
+// once per Present from THIS frame's barrel direction, and then used to sample
+// both eyes' discs. But under alternate-eye rendering only one eye's content
+// is new each Present; the other is re-submitting the image it was given last
+// time. So the stale eye was cropping a one-Present-old picture around this
+// frame's aim point - a 36 Hz oscillation, magnified by the zoom, which is a
+// large part of why the disc reads as unsteady rather than merely soft.
+//
+// The fix is to latch the pair PER EYE at the moment that eye's content is
+// captured, and to sample each eye's disc with the pair its own picture was
+// rendered with. Written on the present thread at the capture, read on the
+// same thread at the draw.
+float g_pip_atx_eye[2] = {0.0f, 0.0f};
+float g_pip_aty_eye[2] = {0.0f, 0.0f};
 ID3D11SamplerState*       g_blit_samp = nullptr;
 ID3D11RasterizerState*    g_blit_rs   = nullptr;
 ID3D11DepthStencilState*  g_blit_dss  = nullptr;
@@ -474,7 +713,7 @@ bool g_blit_ok = false;
 
 // BUILD 118: does the runtime expose XR_KHR_composition_layer_depth, and did
 // we enable it at instance creation. Latched once in init(), read-only after.
-// the project spec names stale-eye reprojection as "the single most important delta
+// CLAUDE.md names stale-eye reprojection as "the single most important delta
 // from the reference"; a submitted depth layer is what lets the compositor do
 // POSITIONAL timewarp instead of orientation-only, which is the architectural
 // half of that requirement we can get without writing our own pass.
@@ -545,6 +784,10 @@ static float g_cfg_wgun_twohand  = 1.0f;
 // BUILD 120: the two-hand agreement gate. 0.35 is the old hard-coded value,
 // so an untouched cfg reproduces build 119 exactly.
 static float g_cfg_wgun_two_agree = 0.35f;
+// 2026-08-31b: the attach band's release edge, metres of hand separation.
+// 0.45 sits above every measured real hold (max 0.409) and below the one
+// documented phantom-hand split (0.507). See CameraProbe.h.
+static float g_cfg_wgun_two_attach = 0.45f;
 // BUILD 123: measure which hand is in front rather than assume the left one.
 // ON by default, because the assumption is verifiably wrong for this tester's
 // hold and a correct hold never trips the flip. See CameraProbe.h.
@@ -557,6 +800,155 @@ static float g_cfg_ipd_swap       = 0.0f;
 // BUILD 126: the blob test. Bypasses the static grip offset so the gun parks on
 // the tracked hand position. Diagnostic, default off, tuned values untouched.
 static float g_cfg_wgun_grip_bypass = 0.0f;
+// 2026-08-31: the hands hold the gun, and the rear-hand anchor. Both ON by
+// default: the hands write degrades to "the animation's own hands" the moment
+// its inputs are missing, and the anchor correction is inert until the front
+// hand measures as the right one, which is the exact case it exists for.
+static float g_cfg_wgun_hands      = 1.0f;
+static float g_cfg_wgun_two_anchor = 1.0f;
+// Build 140: the grab (headset-confirmed hands, owner's correction: idle must
+// not force both hands on) and the bone-level arm hide (diagnostic for the
+// confirmed stretch; hide_child pieces are the cleaner cure if they work).
+static float g_cfg_wgun_hands_grab = 1.0f;
+static float g_cfg_wgun_hide_arms  = 0.0f;
+// Build 141: hand presence. Off the weapon, the left hand follows the left
+// controller, position only. Foundation for the reach interactions.
+static float g_cfg_wgun_hand_free  = 1.0f;
+// Build 142: the arm solve (the cure for the stretch that keeps the arms
+// visible) and the wingspan capture (log only; leave hand_calib at 0 in the
+// file, set it to 1 from the tuner when standing in the pose).
+static float g_cfg_wgun_arms       = 1.0f;
+static float g_cfg_wgun_wrist      = 1.0f;   // BUILD 158, CX-017
+static float g_cfg_wgun_wrist_abs  = 1.0f;   // BUILD 162, absolute palm; 0 = 161 delta
+static float g_cfg_wgun_twist      = 1.0f;   // BUILD 163, forearm roll split; 0 = 162
+static float g_cfg_wgun_twist_share = 0.00f; // BUILD 167/169/170/171, the ForeArm bone's share; 0 since 171
+static float g_cfg_wgun_twist_arm   = 0.00f; // BUILD 169/170, the Arm bone's share
+static float g_cfg_wgun_wristfirst  = 1.0f;  // BUILD 176, the wrist-first arm; 0 = 162
+static float g_cfg_wgun_wrist_limit = 30.0f; // BUILD 178, degrees; 0 = 176, 180 = 162
+static float g_cfg_wgun_shoulder_max = 80.0f; // BUILD 179, mm the shoulder may travel
+static float g_cfg_wgun_clav_max     = 25.0f; // BUILD 180, degrees the collarbone may turn
+static float g_cfg_wgun_mirror       = 1.0f;  // BUILD 183, the mount mirror; 0 = 182, 2 = plus the hand props
+static float g_cfg_wroll_probe       = 1.0f;  // BUILD 184, the roll probes, log only
+static float g_cfg_wgun_roll_unflip  = 0.0f;  // BUILD 189, cancel the gun-up half turn; REFUTED, off
+static float g_cfg_wgun_own          = 1.0f;  // BUILD 190, own the bone
+static float g_cfg_fov_root          = 0.0f;  // BUILD 191, the fov root (the clouds); off until the headset says
+static float g_cfg_fov_root_mode     = 1.0f;  // BUILD 194, 1 = release at the consuming projection call
+static float g_cfg_fov_root_aimk     = 1.0f;  // BUILD 194, gain on injected head-aim deltas while armed; RETIRED in 197
+static float g_cfg_fov_src           = 0.0f;  // BUILD 197, the source fov (the clouds); off until the headset says
+static std::atomic<int> g_cfg_layer_lag{3};   // BUILD 251: cfg layer_pose_lag (whole presents), see the block above submit_halves
+static std::atomic<int> g_cfg_veh_depth{2};   // BUILD 267: cfg veh_build_depth, the Present the vehicle label's build is looked up at: now minus this.
+                                              // BUILD 271: default 2, not 1. The recorder (gtrec) measured the drawn build at K-2 on every resolved frame, depth 1 labelled it with a head one Present newer (label error median 0.26 deg), depth 2 is exact (median 1e-6 deg) and he passed it (F-261, F-262, INV-30).
+static std::atomic<int> g_cfg_veh_lag{2};     // BUILD 266: cfg veh_layer_lag, the layer lag while the vehicle compose is on
+// BUILD 270: gtrec's cfg snapshot for its file header (GtRecFormat.h FileHdr::cfg, log only). The values that have a getter
+// are filled at the end of load_config; mvp_drive, mvp_observe, cam2_ipd, veh_camera and gtrec_cb where their keys are
+// parsed, starting from their code defaults.
+static float g_gt_cfg[16] = {0, 0, 0, 0, 0, 0, 0, 1.0f, 1.0f, 0, 0, 0, 0.064f, 0, 1.0f, 1.0f};
+static float g_cfg_fs_fov_cfg        = 1.92f; // BUILD 249: the fullscreen_fov the cfg asked for; stereo borrows headpose::fs_fov and gives it back
+static bool  g_fs_stereo_applied     = false; // BUILD 249: headpose::fs_fov currently holds the stereo value
+static float g_cfg_fov_scene         = 1.0f;  // BUILD 198, the scene fov override (the clouds); BUILD 199: default 1, the headset said yes 2026-09-06
+static float g_cfg_fov_scene_ads     = 1.0f;  // BUILD 198, release it while the aim trigger is held
+static float g_cfg_ffr               = 0.0f;  // BUILD 216, fixed foveated rendering (NVIDIA VRS); off until the headset says
+static float g_cfg_ffr_inner         = 0.6f;  // BUILD 216, full rate inside this fraction of the visible half-extent
+static float g_cfg_ffr_mid           = 0.8f;  // BUILD 216, half rate to here
+static float g_cfg_ffr_outer         = 1.0f;  // BUILD 216, quarter rate to here, one sixteenth beyond
+static float g_cfg_ffr_horizontal    = 1.0f;  // BUILD 216, 1 = the half-rate ring is 2x1 (vrperfkit favorHorizontal)
+static float g_cfg_ffr_cull          = 0.0f;  // BUILD 216, 1 = tiles beyond the visible edge are culled, not shaded
+static float g_cfg_ffr_margin        = 0.05f; // BUILD 216, tangent units of slack beyond the visible edge
+static float g_cfg_sprint_probe      = 1.0f;  // BUILD 200, the sprint probe, log only
+static float g_cfg_wgun_lead         = 1.0f;  // BUILD 201, the controller lead in frames; 0 = build 200
+static float g_cfg_gpair             = 0.0f;  // BUILD 277, the gun pairing recorder, log only
+static float g_cfg_wgun_pull         = 0.0f;  // BUILD 283, 1 = the limb is carried toward the hand so the arm is never past wgun_pull_k of full extension; 0 = build 282 exactly
+static float g_cfg_wgun_pull_k       = 0.97f; // BUILD 283, the fraction of L1+L2 the arm may reach
+static float g_cfg_wgun_pull_max     = 250.0f; // BUILD 283, mm, the most the limb is carried
+static float g_cfg_wgun_drawcam      = 0.0f;  // BUILD 282, 1 = the hands are placed from the camera that draws them; 0 = build 279 exactly
+static float g_cfg_head_roll_fix     = 0.0f;  // BUILD 202, the head roll: the submitted pose carries no roll; off until the headset says
+static float g_cfg_head_pos          = 0.0f;  // BUILD 204, true 6DOF: the head's translation moves the viewpoint; off until the headset says
+static float g_cfg_head_pos_max      = 0.75f; // BUILD 204, the clamp on that translation, metres
+static float g_cfg_stance            = 1.0f;  // BUILD 205, the stance loop; BUILD 301: code default ON (the hybrid crouch, his choice 2026-10-12)
+static float g_cfg_crouch_drop       = 0.25f; // BUILD 301, metres the real head drops below standing before the game crouch is tapped (0 = the 205 ratio)
+static float g_cfg_crouch_rise       = 0.10f; // BUILD 301, metres back up from that threshold before the game stands again (hysteresis)
+static float g_cfg_stance_height     = 0.0f;  // BUILD 205, standing height override, metres; 0 = auto
+static float g_cfg_stance_crouch     = 0.75f; // BUILD 205
+static float g_cfg_stance_prone      = 0.0f;  // BUILD 205; BUILD 208: 0 = the head picks crouch only, prone stays the pad's
+static float g_cfg_stance_calib      = 0.0f;  // BUILD 207, momentary: 1 starts the four-second standing height capture
+static float g_cfg_follow            = 0.0f;  // BUILD 209, the body follow; off until the headset says
+static float g_cfg_arm_pole          = 0.0f;  // BUILD 214: the elbow's pole falls back to anatomy
+static float g_cfg_arm_pole_min      = 0.06f; // BUILD 214, metres of perpendicular
+static float g_cfg_arm_pole_smooth   = 1.0f;  // BUILD 285: the animated elbow side is low-passed and rate-capped (code default ON)
+static float g_cfg_torso_turn        = 1.0f;  // BUILD 294: the upper body turns with the head (code default ON)
+static float g_cfg_torso_dead        = 45.0f; // BUILD 294, degrees
+static float g_cfg_torso_rate        = 240.0f;// BUILD 294, degrees a second
+static float g_cfg_torso_hand_w      = 0.35f; // BUILD 294, weight of the right controller bearing
+static float g_cfg_torso_max         = 70.0f; // BUILD 294, degrees
+static float g_cfg_lean              = 1.0f;  // BUILD 300: head offset with a soft limit (code default ON)
+static float g_cfg_lean_max          = 0.40f; // BUILD 300, metres, horizontal
+static float g_cfg_lean_soft         = 0.75f; // BUILD 300, fraction of each limit where the easing starts
+static float g_cfg_lean_down         = 0.25f; // BUILD 300, metres of drop the view follows (the crouch is the next build)
+static float g_cfg_lean_up           = 0.10f; // BUILD 300, metres of rise
+static float g_cfg_lean_hold_ms      = 800.0f;// BUILD 300, ms the left menu button is held to recentre; 0 = Start is immediate, no hold
+static float g_cfg_lean_hinge        = 1.0f;  // BUILD 300: the torso hinges toward the lean (0 = the view leans alone)
+static float g_cfg_lean_theta        = 65.0f; // BUILD 300, degrees, the most the hinge turns
+static float g_cfg_lean_slide        = 0.05f; // BUILD 300, metres the upper body may slide beyond the hinge
+static float g_cfg_arm_pole_down_l   = 0.5f;  // BUILD 293: the left (support) elbow leans toward down by this fraction while two-handed
+static float g_cfg_arm_pole_down_r   = 0.0f;  // BUILD 293: the same for the right elbow (off)
+static float g_cfg_arm_pole_tau_ms   = 50.0f; // BUILD 285, low-pass time constant
+static float g_cfg_arm_pole_rate     = 540.0f;// BUILD 285, deg/s, the most the elbow side may turn
+static float g_cfg_arm_anchor        = 0.0f;  // BUILD 213, CX-025: the shoulder rides the view offset
+static float g_cfg_arm_anchor_max    = 0.15f; // BUILD 213, metres (a cfg without the key gets this, not 0.35)
+static float g_cfg_follow_dead       = 0.20f; // BUILD 209, metres
+static float g_cfg_follow_push       = 0.75f; // BUILD 211, the stick while closing
+static float g_cfg_follow_stop       = 0.10f; // BUILD 211, seconds of stopping distance
+static float g_cfg_follow_vmax       = 2.0f;  // BUILD 211, m/s above which it coasts
+static float g_cfg_follow_bleed      = 0.30f; // BUILD 211, m/s the settle takes out of the view
+// BUILD 202: THE HEAD ROLL (CX-022). The content is composed with the camera's
+// own orientation (cam_pose_rot = 0), which never rolls, while the layer pose
+// the mod submits carries the head's full orientation, roll included; the
+// compositor therefore shows a level image at a rolled pose and the horizon
+// rides with the head (HEADROLL-2026-09-05-where-the-roll-sign-lives.md,
+// sections 2, 3 and 5.1). With this on, the submitted orientation loses its
+// twist about the view's own forward axis and keeps the swing (yaw and
+// pitch), so the compositor sees the head rolled relative to the pose the
+// image was rendered for and counter-rotates the image by the head roll: the
+// horizon stays level in the world. Confined to the submit: no camera object,
+// no base frame, no weapon, no aim pump. Cost: a rotated finite image shows
+// black corners at large roll, as every reprojected port does.
+std::atomic<int>      g_head_roll_fix{0};
+std::atomic<uint64_t> g_roll_strips{0};
+std::atomic<float>    g_roll_last_deg{0.0f};   // the roll removed at the last submit, degrees, signed
+static void set_head_roll_fix(int on) {
+    camera::set_head_roll_level(on ? 1 : 0);   // BUILD 261
+    const int want = on ? 1 : 0;
+    static bool s_said = false;
+    const int prev = g_head_roll_fix.exchange(want, std::memory_order_relaxed);
+    if (!s_said || prev != want) {
+        s_said = true;
+        LOG_INFO("roll: head roll fix %s (cfg head_roll_fix; build 203, the level pose: %s)", want ? "ON" : "off",
+                 want ? "the submitted layer pose carries no roll, so the compositor levels "
+                        "the horizon against the head's roll; the content, the camera, the "
+                        "weapon and the aim are untouched"
+                      : "the submitted pose carries the head's roll and the image is "
+                        "head-locked in roll, the state every build before 202 had");
+    }
+}
+static float g_cfg_hand_calib      = 0.0f;
+// Build 143: the visible-barrel pitch trim, degrees. 0 is build-142 exactly.
+static float g_cfg_wgun_pitch_deg  = 0.0f;
+// Build 144: the ray probe, log only, on by default while the aim question
+// is open; costs one log line a second.
+static float g_cfg_ray_probe       = 1.0f;
+// Build 145: the grip-gated hold. 0 is geometry-alone, exactly as before.
+static float g_cfg_wgun_two_grip   = 0.0f;
+// 2026-08-31: the hide-one-piece slots, FP port. -1 is off. Stepped from the
+// tuner to find which array-2 child is which arm, and whether the hand
+// survives hiding it, which is the measurement the hands plan turns on.
+static float g_cfg_hide_child  = -1.0f;
+static float g_cfg_hide_child2 = -1.0f;
+static float g_cfg_head_prelatch = 1.0f;   // BUILD 224
+static float g_cfg_head_reassert = 1.0f;   // BUILD 224
+static float g_cfg_head_always   = 1.0f;   // BUILD 225
+static float g_cfg_head_populate = 1.0f;   // BUILD 226
+static float g_cfg_fp_auto       = 1.0f;   // BUILD 225
+static float g_cfg_head_pulse    = 30.0f;  // BUILD 225, frames per phase; 226: 30 (six did not register)
 static float g_cfg_aimpoint_m    = 5.0f;   // build 105
 static float g_cfg_wgun_roll     = 1.0f;
 static float g_cfg_wgun_roll_deg = 0.0f;
@@ -566,6 +958,17 @@ static float g_cfg_wgun_maxstep = 5.00f;   // build 80, degrees per call
 static float g_cfg_wgun_grip_fwd = 0.0f;
 static float g_cfg_wgun_grip_lat = 0.0f;
 static float g_cfg_wgun_grip_up  = 0.0f;
+static float g_cfg_wgun_grip_bone = 1.0f;  // BUILD 219: the grip bone, on
+static float g_cfg_pip           = 0.0f;   // BUILD 221: the PiP scope; off in code, the cfg turns it on (review 3)
+static float g_cfg_pip_zoom      = 2.7f;
+static float g_cfg_pip_radius    = 0.016f;
+static float g_cfg_pip_lat       = 0.0f;
+static float g_cfg_pip_fwd       = 0.30f;
+static float g_cfg_pip_up        = 0.04f;
+static float g_cfg_pip_block_ads = 0.0f;
+static float g_cfg_pip_toggle    = 1.0f;   // BUILD 237: L3 latches the scope
+static float g_cfg_scope_native  = 0.0f;   // BUILD 238: off by default, it changes aiming
+static float g_cfg_scope_hold    = 6.0f;   // BUILD 238: frames past the gate before it latches
 static float g_cfg_wgun_grip_two = 0.0f;
 static float g_cfg_wgun_pos        = 0.0f;   // build 81, position rides ctrl
 static float g_cfg_wgun_pos_scale  = 1.0f;
@@ -592,6 +995,135 @@ static bool g_cfg_adapter_check = true;
 // restores the old inline wait.
 static std::atomic<int> g_cfg_async_wait{1};
 static std::atomic<int> g_cfg_wait_timeout{100};
+
+// BUILD 228: THE SWAPCHAIN-IMAGE WAIT BOUND (handoff 4.7 item 4).
+//
+// Both xrWaitSwapchainImage call sites waited XR_INFINITE_DURATION on the
+// game's render thread, inside the canvas path that runs for the first time
+// on the first frame. Seven runs from one tester on the shipped build 227
+// wedge identically: the first Present never returns, so frames sticks at 1,
+// xrEndFrame is never reached, the session never leaves READY, and eight to
+// nine seconds later a watchdog kills the process. Measured: startup varies
+// 18.4 to 21.9 s across runs while session-begun-to-death is 9.0, 8.1 and
+// 9.1 s, so the clock starts at the stall, not at launch. xrWaitFrame was
+// given a bound and a thread in 2026-08-12; these two never were.
+//
+// 0 restores the unbounded wait. The default is deliberately generous: a
+// 72 Hz frame is 13.9 ms, so 300 ms is twenty frames of slack and still two
+// orders below the watchdog that is killing the process today.
+static std::atomic<int> g_cfg_img_timeout{300};
+
+// BUILD 229: THE CANVAS CLAMP (handoff 4.7 item 4).
+//
+// Filled from xrEnumerateViewConfigurationViews at init, which this mod had
+// never called. 0 means the enumeration failed or has not run, and the clamp
+// then does nothing at all. canvas_clamp = 0 restores the pre-229 canvas.
+static uint32_t g_clamp_from_w = 0, g_clamp_from_h = 0;  // pre-clamp canvas
+static uint32_t g_rec_w = 0, g_rec_h = 0;   // recommendedImageRectWidth/Height
+static uint32_t g_max_w = 0, g_max_h = 0;   // maxImageRectWidth/Height
+static std::atomic<int> g_cfg_canvas_clamp{1};
+
+// BUILD 233: UNIVERSAL OPENXR API LAYER SUPPRESSION (handoff 4.7).
+//
+// Until now the mod killed TWO layers by hardcoded name (OBS Mirror and
+// Virtual Desktop's Oculus compatibility shim). That was written against one
+// machine, and every machine since has had something else in the chain:
+//
+//   issue #7  (RTX 4070 SUPER, Quest 3, wedges on VDXR *and* SteamVR)
+//             XR_APILAYER_reshade                       survived, 1 run
+//   the AMD tester (RX 9060 XT, Quest 3, VDXR)
+//             XR_APILAYER_MBUCCHIA_quad_views_foveated  survived, 7 runs
+//   the Epic / RTX 5090 tester, which RUNS
+//             nothing survived, 0 layers, 10,699 frames
+//
+// Two unrelated vendors, two unrelated layers, one signature. A hardcoded
+// list cannot be made to cover that, and guessing the disable string is worse
+// than useless: ReShade's has changed twice historically
+// (DISABLE_XR_API_LAYER_reshade_1 -> DISABLE_XR_APILAYER_reshade ->
+// DISABLE_XR_APILAYER_reshade_1), so a guessed name silently does nothing.
+//
+// So stop guessing and read the machine. The loader finds implicit layers
+// through SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit under both HKLM and
+// HKCU: each VALUE NAME is a manifest path and its DWORD is 0 for enabled,
+// non-zero for disabled. Each manifest carries the name of the environment
+// variable that disables it, in its own "disable_environment" field. Walk
+// them, set every one, and log what was found either way - so the next
+// tester's log NAMES the layer instead of us diffing two runs to find it.
+//
+// xr_layer_suppress = 0 restores the pre-233 behaviour (the two hardcoded
+// names only). xr_layer_allow is a comma-separated list of layer names to
+// leave alone, for the user who genuinely wants one in the path.
+static std::atomic<int> g_cfg_layer_suppress{1};
+static char g_cfg_layer_allow[512] = "";
+
+// BUILD 234: if a layer is STILL in the chain after all of the above, do not
+// start VR at all. See the block at the bail-out in init() for why this is
+// decided there and not by a watchdog later.
+static std::atomic<int> g_cfg_layer_bail{1};
+
+// BUILD 235: how long the FIRST VR frame may take before the mod gives up on
+// it, stands VR down and lets the game carry on flat. 0 restores the old
+// unbounded wait, which is the behaviour that kills the game on startup.
+// See the block above on_present() for why 5000 and not more.
+static std::atomic<int> g_cfg_firstframe_ms{5000};
+
+// BUILD 239: HOW MANY FRAMES THE GAME MUST HAVE PRESENTED BEFORE VR COMES UP.
+//
+// Every wedged log on record has the same order: the game enters Present for
+// the very first time, and within a second and a half the init thread has
+// started building an OpenXR session on that same device. The one machine that
+// works had already completed eight presents by then. That ordering is the only
+// structural difference the logs show, and it costs nothing to remove: waiting
+// for thirty RETURNED presents is half a second on a healthy machine, and on a
+// machine whose render thread never comes back it means no session is ever
+// created, no swapchains are built on its device, and the mirror is never armed
+// into a thread that has already gone. If our bring-up is contributing to the
+// wedge, this takes it out of the window; if it is not, the run is unchanged.
+// 0 restores the pre-239 behaviour exactly.
+static std::atomic<int> g_cfg_init_frames{30};
+
+// Render-thread counters, read once a second by drain_input (rule 8: the wait
+// sites do no logging).
+static std::atomic<unsigned> g_img_to_copy{0};
+static std::atomic<unsigned> g_img_to_blit{0};
+
+// BUILD 228: THE FIRST-FRAME PHASE COUNTER (handoff 4.7 item 1).
+//
+// D3D11Hook.cpp:106 increments frames on ENTRY to Present, before the VR
+// callback runs. So a tester log stuck at frames=1 does not mean one frame
+// completed: it means the FIRST frame was entered and never came back. Three
+// instruments agree on that and none of them names the call: the heartbeat
+// (frames frozen at 1), fovroot ticks (frozen at 3), and perf_log, which is
+// silent because its guard pr.n == 0 && rg.n == 0 && cam_n == 0 holds every
+// second. This is the missing name.
+//
+// One relaxed store per step on the render thread, no logging (rule 8). The
+// heartbeat reads it and prints it when a second passes with no frame.
+enum : int {
+    kPhIdle = 0, kPhWaitFrame, kPhBeginFrame, kPhCreateSwapchain,
+    kPhEnumImages, kPhAcquireCopy, kPhWaitCopy, kPhAcquireBlit,
+    kPhWaitBlit, kPhEndFrame, kPhDone,
+    // BUILD 230: the prologue, everything between Present entry and
+    // xrBeginFrame. 228 reported "idle" for every second of every wedged
+    // run, which means the thread never got as far as kPhBeginFrame.
+    kPhEnter, kPhPollEvent, kPhBeginSession, kPhEndSession,
+    kPhLocateView, kPhLocateStage, kPhSyncActions, kPhLocateAim,
+    kPhLocateGrip, kPhActionState,
+    // BUILD 232: the first 37 lines of on_present, which 230 still left
+    // unmarked. A block in any of these also reported "idle".
+    kPhBody, kPhFfrTick, kPhSamples, kPhCount
+};
+static std::atomic<int> g_phase{kPhIdle};
+static std::atomic<int> g_phase_eye{-1};
+inline void ph(int p, int eye = -1) {
+    g_phase.store(p, std::memory_order_relaxed);
+    g_phase_eye.store(eye, std::memory_order_relaxed);
+}
+
+XrDuration img_wait_timeout() {
+    const int ms = g_cfg_img_timeout.load(std::memory_order_relaxed);
+    return ms <= 0 ? XR_INFINITE_DURATION : (XrDuration)ms * 1000000LL;
+}
 
 // Build 10m: the ipd_scale the run started with (cfg value, or 1.0 with no
 // cfg). Numpad * resets to this rather than a hardcoded 1.0, so reset means
@@ -710,6 +1242,11 @@ void load_config() {
         // stops it fighting for a channel it does not own.
         if (sscanf_s(line, " cam_pose_rot = %f", &v) == 1)
             headpose::set_cam_pose_rot(v != 0.0f);
+        // 2026-09-01: the horizon lock, which only bites while the line above
+        // is 1. Levels the ENGINE's roll out of the base; your head's roll
+        // rides in H and is untouched.
+        if (sscanf_s(line, " cam_level_horizon = %f", &v) == 1)
+            camera::set_cam_level(v >= 0.5f ? 1 : 0);
         // Build 91: the viewpoint placement trio. See HeadPose.h for why each
         // exists and what its default was measured against.
         if (sscanf_s(line, " fp_fwd = %f", &v) == 1) {
@@ -749,6 +1286,7 @@ void load_config() {
         if (sscanf_s(line, " fullscreen_fov = %f", &v) == 1) {
             if (v < 0.0f) v = 0.0f;
             if (v > 2.5f) v = 2.5f;
+            g_cfg_fs_fov_cfg = v;
             headpose::set_fs_fov(v);
             headpose::set_fs_enabled(v > 0.0f);
         }
@@ -833,9 +1371,139 @@ void load_config() {
                                    std::memory_order_relaxed);
         if (sscanf_s(line, " hand_markers = %f", &v) == 1)
             g_hand_enable = v > 0.0f;
+        // BUILD 227: the release switches.
+        if (sscanf_s(line, " wskel_marker = %f", &v) == 1)
+            g_wskel_marker = v > 0.0f;
+        if (sscanf_s(line, " log_diag = %f", &v) == 1)
+            ::grwxr::log::set_diag(v > 0.0f ? 1 : 0);
+        if (sscanf_s(line, " palette_probe = %f", &v) == 1)
+            g_palette_probe = v > 0.0f;
+        // BUILD 241: the one-window frame-anatomy capture (Anatomy.h). The code
+        // default is ON; 0 here turns it off for the run.
+        if (sscanf_s(line, " anatomy_capture = %f", &v) == 1)
+            anatomy::set_enabled(v > 0.0f);
+        // BUILD 246: the one-window constant-buffer CONTENT capture (CbDump.h). Code default OFF; 1 turns it
+        // on for the run. It installs the anatomy hooks by itself, so anatomy_capture may stay 0.
+        if (sscanf_s(line, " cbdump_capture = %f", &v) == 1)
+            cbdump::set_enabled(v > 0.0f);
+        // BUILD 242: the one-window camera/view census (Census.h). Code default ON.
+        if (sscanf_s(line, " census_capture = %f", &v) == 1)
+            census::set_enabled(v > 0.0f);
+        // BUILD 243: the second-camera experiment (Cam2.h). Code default OFF; 1 turns it on for the run.
+        // cam2_ipd is the metres camera 2 sits to the right of camera 0 (default 0.064). Any finite value
+        // BUILD 244: a finite value is clamped to [-1.0, 1.0] metres here and again where camera 2 uses it
+        // (Cam2.cpp); anything non-finite is ignored. The value only places camera 2 along camera 0's right
+        // axis, but an extreme one puts the camera far from the player and nobody has tested what the
+        // engine does with that, so it is bounded rather than assumed harmless.
+        if (sscanf_s(line, " cam2_experiment = %f", &v) == 1)
+            cam2::set_enabled(v > 0.0f);
+        if (sscanf_s(line, " cam2_ipd = %f", &v) == 1 && std::isfinite(v))
+            cam2::set_ipd(v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v));
+        // BUILD 245: camera 2 is created only after live gameplay (wgun ARMED, see Cam2.cpp gate_eval) has held
+        // for this many seconds, continuously. Default 45; clamped to [1, 3600] in Cam2.cpp.
+        if (sscanf_s(line, " cam2_arm_seconds = %f", &v) == 1 && std::isfinite(v))
+            cam2::set_arm_seconds(v);
+        // BUILD 245: 1 clears bit 4 of the byte at renderer+0x8C0 at each builder entry, only while camera 2 is
+        // RUNNING (the ProjShadow passes are then not appended). Default 0.
+        if (sscanf_s(line, " cam2_noprojshadow = %f", &v) == 1)
+            cam2::set_noprojshadow(v > 0.0f);
+        // BUILD 261: the vehicle camera. Default 1 (the intended state); 0 is the rollback and applies at once.
+        if (sscanf_s(line, " veh_camera = %f", &v) == 1)
+            camera::set_veh_camera(v > 0.0f ? 1 : 0);
+        // BUILD 262: the alpha of the body-heading tracker (0 = raw heading, build 261; default 0.40).
+        if (sscanf_s(line, " veh_smooth = %f", &v) == 1 && std::isfinite(v))
+            camera::set_veh_smooth(v);
+        // BUILD 260: the log-only vehicle instrument (the veh: line, CameraProbe.h VehSample). Default 1; it changes
+        // no behaviour. 0 silences the line.
+        if (sscanf_s(line, " veh_probe = %f", &v) == 1)
+            g_veh_probe.store(v > 0.0f ? 1 : 0, std::memory_order_relaxed);
+        // BUILD 259: 1 (the default) skips the game's ProjShadow pass body whenever the projector-shadow atlas
+        // (renderer+0xB60) is NULL, which is the vehicle crash's null compare (PassGuard.h). 0 passes straight through.
+        if (sscanf_s(line, " projshadow_guard = %f", &v) == 1)
+            passguard::set_enabled(v > 0.0f);
+        // BUILD 247: TRUE STEREO. The two engine cameras become the two eyes (Cam2.h). Code default OFF. Needs
+        // cam2_experiment = 1 as well (camera 2 must exist); cam2_noprojshadow = 1 is the F-255 condition.
+        //   cam2_stereo_swap_eyes: 1 sends the left half to eye 1 and the right half to eye 0 (wrong-eye-order A/B).
+        //   cam2_stereo_aspect: 0 = each eye's content aspect is its half viewport's own (the default and the
+        //     expected value); a value in [0.2, 5] overrides it, to isolate a squeezed or stretched picture.
+        if (sscanf_s(line, " cam2_stereo = %f", &v) == 1)
+            cam2::set_stereo(v > 0.0f);
+        if (sscanf_s(line, " cam2_stereo_swap_eyes = %f", &v) == 1)
+            cam2::set_stereo_swap_eyes(v > 0.0f);
+        if (sscanf_s(line, " cam2_stereo_aspect = %f", &v) == 1)
+            cam2::set_stereo_aspect(v);
+        //   cam2_stereo_mirror_fov (default 1): camera 0's vertical fov field is copied into camera 2 each frame,
+        //     so an ADS or sprint zoom reaches both eyes. 0 leaves camera 2's field alone (the A/B for a one-eye zoom).
+        if (sscanf_s(line, " cam2_stereo_mirror_fov = %f", &v) == 1)
+            cam2::set_stereo_mirror_fov(v > 0.0f);
+        // BUILD 248: the eye recorder (EyeRec.h). Code default OFF; it records only trusted stereo frames, so never a menu or
+        // a loading screen. eyerec_width = one eye's width in the recording, eyerec_every = every Nth frame,
+        // eyerec_max_mb = hard disk cap. Files: eyerec-<pid> folder in GRWVR, f<frame>.jpg and frames.csv. A diagnostic: it never ships.
+        // BUILD 251: layer_pose_lag, whole presents (see g_cfg_layer_lag). Default 3, the measured depth of this pipeline; 0 = the
+        // tag's orientation as every build before 251. Hot reload.
+        if (sscanf_s(line, " layer_pose_lag = %f", &v) == 1 && std::isfinite(v))
+            g_cfg_layer_lag.store(v < 0.0f ? 0 : (v > 14.0f ? 14 : (int)v), std::memory_order_relaxed);
+        // BUILD 266: the same, while the vehicle compose is on. Measured 2 on the vehicle recording; 0 = the tag's orientation.
+        // BUILD 267: the recompute hook. mvp_observe counts and compares (default 1), mvp_drive composes in the hook while a vehicle is
+        // detected (default 1; 0 = the 262-266 selector path), veh_build_depth is the Present offset of the label's build (default 2 since build 271; it was 1 in builds 267 to 270).
+        if (sscanf_s(line, " mvp_observe = %f", &v) == 1) camera::set_mvp_observe(v > 0.0f ? 1 : 0);
+        if (sscanf_s(line, " mvp_drive = %f", &v) == 1) camera::set_mvp_drive(v > 0.0f ? 1 : 0);
+        if (sscanf_s(line, " veh_build_depth = %f", &v) == 1 && std::isfinite(v))
+            g_cfg_veh_depth.store(v < 0.0f ? 0 : (v > 8.0f ? 8 : (int)v), std::memory_order_relaxed);
+        if (sscanf_s(line, " veh_layer_lag = %f", &v) == 1 && std::isfinite(v))
+            g_cfg_veh_lag.store(v < 0.0f ? 0 : (v > 14.0f ? 14 : (int)v), std::memory_order_relaxed);
+        // BUILD 270: gtrec, the GROUND-TRUTH STEREO RECORDER (GtRec.h). A diagnostic, LOG ONLY: it reads and records, it
+        // writes nothing of the engine's and changes no pose, label or picture. Code default OFF. Hot reload.
+        //   gtrec          0 = off (nothing allocated, no file, every hook pays one atomic load); 1 = record. It goes live
+        //                  once true stereo is live and (with gtrec_cb) the D3D11 hook set exists, then records every
+        //                  recompute entry of camera 0 and 2 (every call site), every mod write of a camera pose, every
+        //                  graph-builder entry, every write of the 1008-byte per-view constant buffer and every Present to
+        //                  GRWVR\gtrec-<pid>.bin (about 1 MB/s; tools\gtrec_analyze.py reads it). Setting it back to 0
+        //                  stops the recording and closes the file. One recording per run.
+        //   gtrec_cb       1 (default) = also tap the per-view constant buffer (needed to resolve which recompute drew each
+        //                  eye; it installs the Anatomy hook set by itself, 20 s after the first stereo layer); 0 = not.
+        //   gtrec_max_mb   the file cap in MB, default 1024, clamped to [16, 20000]; at the cap the recorder stops.
+        //   gtrec_seconds  0 (default) = no time limit; else stop this many seconds after going live, clamped to [0, 86400].
+        if (sscanf_s(line, " gtrec = %f", &v) == 1)
+            gtrec::set_enabled(v > 0.0f);
+        if (sscanf_s(line, " gtrec_cb = %f", &v) == 1) {
+            gtrec::set_cb(v > 0.0f);
+            g_gt_cfg[15] = v > 0.0f ? 1.0f : 0.0f;
+        }
+        if (sscanf_s(line, " gtrec_max_mb = %f", &v) == 1 && std::isfinite(v))
+            gtrec::set_max_mb(v < 16.0f ? 16 : (v > 20000.0f ? 20000 : (int)v));
+        if (sscanf_s(line, " gtrec_seconds = %f", &v) == 1 && std::isfinite(v))
+            gtrec::set_seconds(v < 0.0f ? 0 : (v > 86400.0f ? 86400 : (int)v));
+        // BUILD 270: the keys with no getter, read again here for gtrec's file header only (log only, no setter called).
+        if (sscanf_s(line, " mvp_drive = %f", &v) == 1)   g_gt_cfg[7] = v > 0.0f ? 1.0f : 0.0f;
+        if (sscanf_s(line, " mvp_observe = %f", &v) == 1) g_gt_cfg[8] = v > 0.0f ? 1.0f : 0.0f;
+        if (sscanf_s(line, " cam2_ipd = %f", &v) == 1 && std::isfinite(v)) g_gt_cfg[12] = v;
+        if (sscanf_s(line, " veh_camera = %f", &v) == 1)  g_gt_cfg[14] = v > 0.0f ? 1.0f : 0.0f;
+        if (sscanf_s(line, " eyerec = %f", &v) == 1)
+            eyerec::set_enabled(v > 0.0f);
+        if (sscanf_s(line, " eyerec_width = %f", &v) == 1 && std::isfinite(v))
+            eyerec::set_width((int)v);
+        if (sscanf_s(line, " eyerec_every = %f", &v) == 1 && std::isfinite(v))
+            eyerec::set_every((int)v);
+        if (sscanf_s(line, " eyerec_max_mb = %f", &v) == 1 && std::isfinite(v))
+            eyerec::set_max_mb((int)v);
         // Build 45: weapon-candidate markers. 0 hides them (hot-reload).
         if (sscanf_s(line, " wp_markers = %f", &v) == 1)
             g_wpm_enable = v > 0.0f;
+        // Build 153: the evidence reticle. 0 off, 1 barrel only, 2 barrel and
+        // gaze. Hot-reloads like the markers, so it can be turned on between
+        // takes without leaving the headset.
+        if (sscanf_s(line, " barrel_reticle = %f", &v) == 1)
+            g_ret_mode = (v >= 1.5f) ? 2 : (v >= 0.5f ? 1 : 0);
+        // Metres. Clamped rather than trusted: a zero or a negative would put
+        // the mark at or behind the camera and it would simply vanish, which
+        // reads as "the build is broken" rather than "the value is silly".
+        if (sscanf_s(line, " barrel_reticle_dist = %f", &v) == 1)
+            g_ret_dist = (v >= 1.0f && v <= 500.0f) ? v : 20.0f;
+        // Half-tangent. 0.010 is about 1.1 degrees across, which is a rifle
+        // red dot rather than a dinner plate.
+        if (sscanf_s(line, " barrel_reticle_size = %f", &v) == 1)
+            g_ret_size = (v >= 0.002f && v <= 0.20f) ? v : 0.010f;
         // Build 64: weapon-skeleton identifier. Arms the wskel census in
         // CameraProbe and rides the WHITE marker slot on the picked
         // instance. Read-only; defaults off.
@@ -860,6 +1528,45 @@ void load_config() {
             if (ms > 5000) ms = 5000;   // above this the game is frozen anyway
             g_cfg_wait_timeout.store(ms, std::memory_order_relaxed);
         }
+        if (sscanf_s(line, " xr_img_timeout_ms = %f", &v) == 1) {
+            int ms = (int)v;
+            if (ms < 0)    ms = 0;      // 0 = wait forever, the pre-228 behaviour
+            if (ms > 5000) ms = 5000;   // above this the game is frozen anyway
+            g_cfg_img_timeout.store(ms, std::memory_order_relaxed);
+        }
+        if (sscanf_s(line, " canvas_clamp = %f", &v) == 1)
+            g_cfg_canvas_clamp.store(v > 0.5f ? 1 : 0, std::memory_order_relaxed);
+        if (sscanf_s(line, " xr_layer_suppress = %f", &v) == 1)
+            g_cfg_layer_suppress.store(v > 0.5f ? 1 : 0, std::memory_order_relaxed);
+        if (sscanf_s(line, " xr_layer_bail = %f", &v) == 1)
+            g_cfg_layer_bail.store(v > 0.5f ? 1 : 0, std::memory_order_relaxed);
+        if (sscanf_s(line, " xr_firstframe_ms = %f", &v) == 1) {
+            int ms = (int)v;
+            if (ms < 0)     ms = 0;       // 0 = the old unbounded wait
+            if (ms && ms < 500)  ms = 500;    // below this a slow load would trip it
+            if (ms > 30000) ms = 30000;
+            g_cfg_firstframe_ms.store(ms, std::memory_order_relaxed);
+        }
+        if (sscanf_s(line, " xr_init_frames = %f", &v) == 1) {
+            int n = (int)v;
+            if (n < 0)    n = 0;          // 0 = come up on the first Present, pre-239
+            if (n > 3000) n = 3000;       // a minute of frames is the whole point gone
+            g_cfg_init_frames.store(n, std::memory_order_relaxed);
+        }
+        // BUILD 233: the one string key in this file. It is written here by
+        // whichever thread reloads the cfg and read exactly once, by
+        // suppress_api_layers() on the init thread, immediately after the
+        // load_config() call at the top of init(). Nothing reads it again.
+        {
+            char buf[512] = {0};
+            if (sscanf_s(line, " xr_layer_allow = %511[^\r\n]", buf,
+                         (unsigned)sizeof(buf)) == 1) {
+                // trim the trailing run of spaces sscanf leaves on the tail
+                size_t e = strlen(buf);
+                while (e && (buf[e - 1] == ' ' || buf[e - 1] == '\t')) buf[--e] = 0;
+                strncpy_s(g_cfg_layer_allow, buf, _TRUNCATE);
+            }
+        }
         if (sscanf_s(line, " wbaxis = %f", &v) == 1)
             g_cfg_wbaxis = v;
         if (sscanf_s(line, " wgun_smooth = %f", &v) == 1)
@@ -870,8 +1577,194 @@ void load_config() {
             g_cfg_wgun_twohand = v;
         if (sscanf_s(line, " wgun_two_agree = %f", &v) == 1)
             g_cfg_wgun_two_agree = v;
+        if (sscanf_s(line, " wgun_two_attach = %f", &v) == 1)
+            g_cfg_wgun_two_attach = v;
         if (sscanf_s(line, " wgun_two_auto = %f", &v) == 1)
             g_cfg_wgun_two_auto = v;
+        if (sscanf_s(line, " wgun_hands = %f", &v) == 1)
+            g_cfg_wgun_hands = v;
+        if (sscanf_s(line, " wgun_hands_grab = %f", &v) == 1)
+            g_cfg_wgun_hands_grab = v;
+        if (sscanf_s(line, " wgun_hand_free = %f", &v) == 1)
+            g_cfg_wgun_hand_free = v;
+        if (sscanf_s(line, " wgun_arms = %f", &v) == 1)
+            g_cfg_wgun_arms = v;
+        if (sscanf_s(line, " wgun_wrist = %f", &v) == 1)
+            g_cfg_wgun_wrist = v;
+        if (sscanf_s(line, " wgun_wrist_abs = %f", &v) == 1)
+            g_cfg_wgun_wrist_abs = v;
+        if (sscanf_s(line, " wgun_twist = %f", &v) == 1)
+            g_cfg_wgun_twist = v;
+        if (sscanf_s(line, " wgun_twist_share = %f", &v) == 1)
+            g_cfg_wgun_twist_share = v;
+        if (sscanf_s(line, " wgun_twist_arm = %f", &v) == 1)
+            g_cfg_wgun_twist_arm = v;
+        if (sscanf_s(line, " wgun_wristfirst = %f", &v) == 1)
+            g_cfg_wgun_wristfirst = v;
+        if (sscanf_s(line, " wgun_wrist_limit = %f", &v) == 1)
+            g_cfg_wgun_wrist_limit = v;
+        if (sscanf_s(line, " wgun_shoulder_max = %f", &v) == 1)
+            g_cfg_wgun_shoulder_max = v;
+        if (sscanf_s(line, " wgun_clav_max = %f", &v) == 1)
+            g_cfg_wgun_clav_max = v;
+        if (sscanf_s(line, " wgun_mirror = %f", &v) == 1)
+            g_cfg_wgun_mirror = v;
+        if (sscanf_s(line, " wroll_probe = %f", &v) == 1)
+            g_cfg_wroll_probe = v;
+        if (sscanf_s(line, " wgun_roll_unflip = %f", &v) == 1)
+            g_cfg_wgun_roll_unflip = v;
+        if (sscanf_s(line, " wgun_own = %f", &v) == 1)
+            g_cfg_wgun_own = v;
+        if (sscanf_s(line, " fov_root = %f", &v) == 1)
+            g_cfg_fov_root = v;
+        if (sscanf_s(line, " fov_root_mode = %f", &v) == 1)
+            g_cfg_fov_root_mode = v;
+        if (sscanf_s(line, " fov_root_aimk = %f", &v) == 1)
+            g_cfg_fov_root_aimk = v;
+        if (sscanf_s(line, " fov_src = %f", &v) == 1)
+            g_cfg_fov_src = v;
+        if (sscanf_s(line, " fov_scene = %f", &v) == 1)
+            g_cfg_fov_scene = v;
+        if (sscanf_s(line, " fov_scene_ads = %f", &v) == 1)
+            g_cfg_fov_scene_ads = v;
+        if (sscanf_s(line, " ffr = %f", &v) == 1)                // BUILD 216
+            g_cfg_ffr = v;
+        if (sscanf_s(line, " ffr_inner = %f", &v) == 1)
+            g_cfg_ffr_inner = v;
+        if (sscanf_s(line, " ffr_mid = %f", &v) == 1)
+            g_cfg_ffr_mid = v;
+        if (sscanf_s(line, " ffr_outer = %f", &v) == 1)
+            g_cfg_ffr_outer = v;
+        if (sscanf_s(line, " ffr_horizontal = %f", &v) == 1)
+            g_cfg_ffr_horizontal = v;
+        if (sscanf_s(line, " ffr_cull = %f", &v) == 1)
+            g_cfg_ffr_cull = v;
+        if (sscanf_s(line, " ffr_margin = %f", &v) == 1)
+            g_cfg_ffr_margin = v;
+        if (sscanf_s(line, " sprint_probe = %f", &v) == 1)
+            g_cfg_sprint_probe = v;
+        if (sscanf_s(line, " wgun_lead = %f", &v) == 1)
+            g_cfg_wgun_lead = v;
+        if (sscanf_s(line, " gpair = %f", &v) == 1)
+            g_cfg_gpair = v;
+        if (sscanf_s(line, " wgun_drawcam = %f", &v) == 1)
+            g_cfg_wgun_drawcam = v;
+        if (sscanf_s(line, " wgun_pull = %f", &v) == 1)
+            g_cfg_wgun_pull = v;
+        if (sscanf_s(line, " wgun_pull_k = %f", &v) == 1)
+            g_cfg_wgun_pull_k = v;
+        if (sscanf_s(line, " wgun_pull_max = %f", &v) == 1)
+            g_cfg_wgun_pull_max = v;
+        if (sscanf_s(line, " head_roll_fix = %f", &v) == 1)
+            g_cfg_head_roll_fix = v;
+        if (sscanf_s(line, " head_pos = %f", &v) == 1)
+            g_cfg_head_pos = v;
+        if (sscanf_s(line, " head_pos_max = %f", &v) == 1)
+            g_cfg_head_pos_max = v;
+        if (sscanf_s(line, " stance = %f", &v) == 1)
+            g_cfg_stance = v;
+        if (sscanf_s(line, " stance_height = %f", &v) == 1)
+            g_cfg_stance_height = v;
+        if (sscanf_s(line, " stance_crouch = %f", &v) == 1)
+            g_cfg_stance_crouch = v;
+        if (sscanf_s(line, " stance_prone = %f", &v) == 1)
+            g_cfg_stance_prone = v;
+        if (sscanf_s(line, " stance_calib = %f", &v) == 1)
+            g_cfg_stance_calib = v;
+        if (sscanf_s(line, " crouch_drop = %f", &v) == 1)   // BUILD 301
+            g_cfg_crouch_drop = v;
+        if (sscanf_s(line, " crouch_rise = %f", &v) == 1)   // BUILD 301
+            g_cfg_crouch_rise = v;
+        if (sscanf_s(line, " follow = %f", &v) == 1)
+            g_cfg_follow = v;
+        if (sscanf_s(line, " follow_dead = %f", &v) == 1)
+            g_cfg_follow_dead = v;
+        if (sscanf_s(line, " arm_anchor = %f", &v) == 1)
+            g_cfg_arm_anchor = v;
+        if (sscanf_s(line, " arm_pole = %f", &v) == 1)
+            g_cfg_arm_pole = v;
+        if (sscanf_s(line, " arm_pole_min = %f", &v) == 1)
+            g_cfg_arm_pole_min = v;
+        if (sscanf_s(line, " aim_pitch_abs = %f", &v) == 1)
+            g_cfg_aim_pitch_abs = v;
+        if (sscanf_s(line, " torso_turn = %f", &v) == 1)
+            g_cfg_torso_turn = v;
+        if (sscanf_s(line, " torso_dead = %f", &v) == 1)
+            g_cfg_torso_dead = v;
+        if (sscanf_s(line, " torso_rate = %f", &v) == 1)
+            g_cfg_torso_rate = v;
+        if (sscanf_s(line, " torso_hand_w = %f", &v) == 1)
+            g_cfg_torso_hand_w = v;
+        if (sscanf_s(line, " torso_max = %f", &v) == 1)
+            g_cfg_torso_max = v;
+        if (sscanf_s(line, " lean = %f", &v) == 1)
+            g_cfg_lean = v;
+        if (sscanf_s(line, " lean_max = %f", &v) == 1)
+            g_cfg_lean_max = v;
+        if (sscanf_s(line, " lean_soft = %f", &v) == 1)
+            g_cfg_lean_soft = v;
+        if (sscanf_s(line, " lean_down = %f", &v) == 1)
+            g_cfg_lean_down = v;
+        if (sscanf_s(line, " lean_up = %f", &v) == 1)
+            g_cfg_lean_up = v;
+        if (sscanf_s(line, " lean_hold_ms = %f", &v) == 1)
+            g_cfg_lean_hold_ms = v;
+        if (sscanf_s(line, " lean_hinge = %f", &v) == 1)
+            g_cfg_lean_hinge = v;
+        if (sscanf_s(line, " lean_theta = %f", &v) == 1)
+            g_cfg_lean_theta = v;
+        if (sscanf_s(line, " lean_slide = %f", &v) == 1)
+            g_cfg_lean_slide = v;
+        if (sscanf_s(line, " arm_pole_down_l = %f", &v) == 1)
+            g_cfg_arm_pole_down_l = v;
+        if (sscanf_s(line, " arm_pole_down_r = %f", &v) == 1)
+            g_cfg_arm_pole_down_r = v;
+        if (sscanf_s(line, " arm_pole_smooth = %f", &v) == 1)
+            g_cfg_arm_pole_smooth = v;
+        if (sscanf_s(line, " arm_pole_tau_ms = %f", &v) == 1)
+            g_cfg_arm_pole_tau_ms = v;
+        if (sscanf_s(line, " arm_pole_rate = %f", &v) == 1)
+            g_cfg_arm_pole_rate = v;
+        if (sscanf_s(line, " arm_anchor_max = %f", &v) == 1)
+            g_cfg_arm_anchor_max = v;
+        if (sscanf_s(line, " follow_push = %f", &v) == 1)
+            g_cfg_follow_push = v;
+        if (sscanf_s(line, " follow_stop = %f", &v) == 1)
+            g_cfg_follow_stop = v;
+        if (sscanf_s(line, " follow_vmax = %f", &v) == 1)
+            g_cfg_follow_vmax = v;
+        if (sscanf_s(line, " follow_bleed = %f", &v) == 1)
+            g_cfg_follow_bleed = v;
+        if (sscanf_s(line, " wgun_pitch_deg = %f", &v) == 1)
+            g_cfg_wgun_pitch_deg = v;
+        if (sscanf_s(line, " ray_probe = %f", &v) == 1)
+            g_cfg_ray_probe = v;
+        if (sscanf_s(line, " wgun_two_grip = %f", &v) == 1)
+            g_cfg_wgun_two_grip = v;
+        if (sscanf_s(line, " hand_calib = %f", &v) == 1)
+            g_cfg_hand_calib = v;
+        if (sscanf_s(line, " wgun_hide_arms = %f", &v) == 1)
+            g_cfg_wgun_hide_arms = v;
+        if (sscanf_s(line, " wgun_two_anchor = %f", &v) == 1)
+            g_cfg_wgun_two_anchor = v;
+        // The two keys cannot alias: the literal " = " in each format string
+        // refuses "hide_child2" to the shorter pattern at the '2'.
+        if (sscanf_s(line, " hide_child = %f", &v) == 1)
+            g_cfg_hide_child = v;
+        if (sscanf_s(line, " hide_child2 = %f", &v) == 1)
+            g_cfg_hide_child2 = v;
+        if (sscanf_s(line, " head_prelatch = %f", &v) == 1)
+            g_cfg_head_prelatch = v;
+        if (sscanf_s(line, " head_reassert = %f", &v) == 1)
+            g_cfg_head_reassert = v;
+        if (sscanf_s(line, " head_always = %f", &v) == 1)
+            g_cfg_head_always = v;
+        if (sscanf_s(line, " head_populate = %f", &v) == 1)
+            g_cfg_head_populate = v;
+        if (sscanf_s(line, " fp_auto = %f", &v) == 1)
+            g_cfg_fp_auto = v;
+        if (sscanf_s(line, " head_pulse = %f", &v) == 1)
+            g_cfg_head_pulse = v;
         if (sscanf_s(line, " wgun_grip_bypass = %f", &v) == 1) {
             g_cfg_wgun_grip_bypass = v;
             camera::set_wgun_grip_bypass(v >= 0.5f ? 1 : 0);
@@ -907,6 +1800,20 @@ void load_config() {
             g_cfg_wgun_grip_up = v;
         if (sscanf_s(line, " wgun_grip_two = %f", &v) == 1)
             g_cfg_wgun_grip_two = v;
+        if (sscanf_s(line, " wgun_grip_bone = %f", &v) == 1)   // BUILD 219
+            g_cfg_wgun_grip_bone = v;
+        // BUILD 221: the PiP scope.
+        if (sscanf_s(line, " pip = %f", &v) == 1)            g_cfg_pip = v;
+        if (sscanf_s(line, " pip_zoom = %f", &v) == 1)       g_cfg_pip_zoom = v;
+        if (sscanf_s(line, " pip_radius = %f", &v) == 1)     g_cfg_pip_radius = v;
+        if (sscanf_s(line, " pip_lat = %f", &v) == 1)        g_cfg_pip_lat = v;
+        if (sscanf_s(line, " pip_fwd = %f", &v) == 1)        g_cfg_pip_fwd = v;
+        if (sscanf_s(line, " pip_up = %f", &v) == 1)         g_cfg_pip_up = v;
+        if (sscanf_s(line, " pip_block_ads = %f", &v) == 1)  g_cfg_pip_block_ads = v;
+        if (sscanf_s(line, " pip_toggle = %f", &v) == 1)     g_cfg_pip_toggle = v;   // BUILD 237
+        // BUILD 238: native VR ADS.
+        if (sscanf_s(line, " scope_native = %f", &v) == 1)      g_cfg_scope_native = v;
+        if (sscanf_s(line, " scope_hold_frames = %f", &v) == 1) g_cfg_scope_hold = v;
         if (sscanf_s(line, " wnode = %f", &v) == 1)
             g_cfg_wnode = v;
         if (sscanf_s(line, " wnode_dz = %f", &v) == 1)
@@ -943,6 +1850,13 @@ void load_config() {
             g_ctl_smooth = v;
         }
         // Build 24: the controller-aim reticle dot. 0 hides it.
+        //
+        // NOTE, 2026-09-01: this key is `aim_reticle` and belongs to the
+        // RETIRED controller-aim experiment (aim_source = 1), so it draws
+        // nothing while aim_source is 0. Build 153's evidence rings are a
+        // DIFFERENT feature on `barrel_reticle`. The names were one letter
+        // apart from colliding and two features on one key is exactly the
+        // config sprawl the owner has complained about. Do not merge them.
         if (sscanf_s(line, " aim_reticle = %f", &v) == 1)
             g_dot_enable = v > 0.0f;
         // Build 50: print the aim-reader census (AimTrace.h). Log-only either
@@ -973,6 +1887,16 @@ void load_config() {
         // Build 107: spoken test instructions. 0 silences them.
         if (sscanf_s(line, " voice = %f", &v) == 1)
             voice::set_enabled(v > 0.0f);
+        // 2026-09-01: whether the guided anchor test announces itself. Default
+        // 0: build 137 answered the question it was built for, and the prompt
+        // was still inviting the tester into it 17 seconds into every session.
+        if (sscanf_s(line, " voice_guide = %f", &v) == 1)
+            aimtrace::set_voice_guide(v >= 0.5f ? 1 : 0);
+        // 2026-09-01: the arm scale. F3's capture sets this live; the line
+        // here is how a captured value is made permanent without recalibrating
+        // every session. 1.00 is identity.
+        if (sscanf_s(line, " hand_scale = %f", &v) == 1)
+            camera::set_hand_scale(v);
         // Build 105: the aiming-point A/B. See AimTrace.h.
         if (sscanf_s(line, " aimpoint_ab_m = %f", &v) == 1)
             g_cfg_aimpoint_m = v;
@@ -980,6 +1904,16 @@ void load_config() {
             aimtrace::set_aimpoint_ab(v > 0.0f, g_cfg_aimpoint_m);
         if (sscanf_s(line, " bullet_ctrl = %f", &v) == 1)
             aimtrace::set_bullet_ctrl(v > 0.0f);
+        // BUILD 137: the shot direction follows the barrel. See AimTrace.h.
+        if (sscanf_s(line, " shot_dir = %f", &v) == 1)
+            aimtrace::set_shot_dir(v > 0.0f);
+        // BUILD 152: the origin write, the second half of the hard baseline.
+        if (sscanf_s(line, " shot_org = %f", &v) == 1)
+            aimtrace::set_shot_org(v > 0.0f);
+        // BUILD 154: the vertical. SetShotLine never reads it, so the arc is
+        // rebuilt on the barrel angle instead. See AimTrace.h.
+        if (sscanf_s(line, " shot_pitch = %f", &v) == 1)
+            aimtrace::set_shot_pitch(v > 0.0f);
         // Build 55: rotate the engine's own aim quaternion. Degrees, 0 off.
         if (sscanf_s(line, " aim_quat_deg = %f", &v) == 1) {
             if (v < -90.0f) v = -90.0f;
@@ -1024,9 +1958,156 @@ void load_config() {
     // save is the way back from any amount of tuner wandering.
     camera::set_wgun_grip(g_cfg_wgun_grip_fwd, g_cfg_wgun_grip_lat,
                           g_cfg_wgun_grip_up, g_cfg_wgun_grip_two);
+    camera::set_wgun_grip_bone(g_cfg_wgun_grip_bone >= 0.5f ? 1 : 0);  // BUILD 219
+    // BUILD 221: the PiP scope. The present-thread values are plain statics
+    // written here on the init thread, read once a frame; a torn read costs one
+    // frame of a wrong zoom, as with the dot and marker switches above.
+    g_pip_enable = g_cfg_pip >= 0.5f;
+    // BUILD 237: the zoom is a user control now, 1.2x to 4x, on both the F1
+    // panel and the desktop GUI. The range is his: 1.2 is "barely magnified,
+    // clearest" and 4 is "as far as this source can be pushed". It is a real
+    // clamp, not a suggestion, because the disc cannot hold more angular
+    // detail than the eye frame it samples: at 4x the same pixels are spread
+    // over four times the area and it gets blurrier, not sharper. The slider
+    // gives control over that trade, not an escape from it.
+    g_pip_zoom = (isfinite(g_cfg_pip_zoom) && g_cfg_pip_zoom >= 1.2f &&
+                  g_cfg_pip_zoom <= 4.0f) ? g_cfg_pip_zoom : 2.7f;
+    g_pip_radius = (isfinite(g_cfg_pip_radius) && g_cfg_pip_radius > 0.002f && g_cfg_pip_radius < 0.20f) ? g_cfg_pip_radius : 0.016f;
+    camera::set_pip(g_pip_enable ? 1 : 0);
+    camera::set_pip_fallback(g_cfg_pip_lat, g_cfg_pip_fwd, g_cfg_pip_up);
+    camera::set_pip_block_ads(g_cfg_pip_block_ads >= 0.5f ? 1 : 0);
+    camera::set_pip_toggle(g_cfg_pip_toggle >= 0.5f ? 1 : 0);   // BUILD 237
+    camera::set_scope_native(g_cfg_scope_native >= 0.5f ? 1 : 0);          // BUILD 238
+    camera::set_scope_hold(isfinite(g_cfg_scope_hold) ? (int)g_cfg_scope_hold : 6);
     camera::set_wgun_twohand((int)g_cfg_wgun_twohand);
     camera::set_wgun_two_agree(g_cfg_wgun_two_agree);
+    camera::set_wgun_two_attach(g_cfg_wgun_two_attach);
     camera::set_wgun_two_auto((int)g_cfg_wgun_two_auto);
+    camera::set_wgun_hands((int)g_cfg_wgun_hands);
+    camera::set_wgun_hands_grab((int)g_cfg_wgun_hands_grab);
+    camera::set_wgun_hand_free((int)g_cfg_wgun_hand_free);
+    camera::set_wgun_hide_arms((int)g_cfg_wgun_hide_arms);
+    camera::set_wgun_arms((int)g_cfg_wgun_arms);
+    camera::set_wgun_wrist((int)g_cfg_wgun_wrist);
+    camera::set_wgun_wrist_abs((int)g_cfg_wgun_wrist_abs);
+    camera::set_wgun_twist((int)g_cfg_wgun_twist);
+    camera::set_wgun_twist_share(g_cfg_wgun_twist_share);
+    camera::set_wgun_twist_arm(g_cfg_wgun_twist_arm);
+    camera::set_wgun_wristfirst((int)g_cfg_wgun_wristfirst);
+    camera::set_wgun_wrist_limit(g_cfg_wgun_wrist_limit);
+    camera::set_wgun_shoulder_max(g_cfg_wgun_shoulder_max);
+    camera::set_wgun_clav_max(g_cfg_wgun_clav_max);
+    camera::set_wgun_mirror((int)g_cfg_wgun_mirror);
+    camera::set_wroll_probe((int)g_cfg_wroll_probe);
+    camera::set_wgun_roll_unflip((int)g_cfg_wgun_roll_unflip);
+    camera::set_wgun_own((int)g_cfg_wgun_own);
+    camera::set_fov_scene_ads((int)g_cfg_fov_scene_ads);   // BUILD 198
+    camera::set_sprint_probe((int)g_cfg_sprint_probe);     // BUILD 200
+    camera::set_wgun_lead(g_cfg_wgun_lead);                // BUILD 201
+    camera::set_gpair(g_cfg_gpair != 0.0f ? 1 : 0);        // BUILD 277
+    camera::set_wgun_drawcam(g_cfg_wgun_drawcam != 0.0f ? 1 : 0); // BUILD 282
+    camera::set_wgun_pull(g_cfg_wgun_pull != 0.0f ? 1 : 0, g_cfg_wgun_pull_k, g_cfg_wgun_pull_max); // BUILD 283
+    set_head_roll_fix((int)g_cfg_head_roll_fix);           // BUILD 202
+    {   // BUILD 204
+        // BUILD 300: the lean owns the head offset (soft limit, no hard clamp); head_pos alone is the old build-204 path
+        const int lean = g_cfg_lean != 0.0f ? 1 : 0;
+        {
+            auto okf = [](float x, float lo, float hi, float dflt) { return isfinite(x) && x >= lo && x <= hi ? x : dflt; };
+            g_lean_max.store(okf(g_cfg_lean_max, 0.05f, 1.5f, 0.40f), std::memory_order_relaxed);
+            g_lean_soft.store(okf(g_cfg_lean_soft, 0.0f, 0.95f, 0.75f), std::memory_order_relaxed);
+            g_lean_down.store(okf(g_cfg_lean_down, 0.0f, 1.0f, 0.25f), std::memory_order_relaxed);
+            g_lean_up.store(okf(g_cfg_lean_up, 0.0f, 1.0f, 0.10f), std::memory_order_relaxed);
+            g_lean_hold_ms.store((int)okf(g_cfg_lean_hold_ms, 0.0f, 5000.0f, 800.0f), std::memory_order_relaxed);
+            if (g_lean_mode.exchange(lean, std::memory_order_relaxed) != lean)
+                LOG_INFO("lean: the head's offset moves the view %s (cfg lean; build 300: soft limit %.2f m horizontal with the easing from "
+                         "%.0f%% of it, %.2f m down, %.2f m up; hold the left menu button %d ms to recentre, a shorter press is Start on release).",
+                         lean ? "ON" : "off", g_lean_max.load(std::memory_order_relaxed), g_lean_soft.load(std::memory_order_relaxed) * 100.0f,
+                         g_lean_down.load(std::memory_order_relaxed), g_lean_up.load(std::memory_order_relaxed),
+                         g_lean_hold_ms.load(std::memory_order_relaxed));
+            camera::set_lean(g_cfg_lean_hinge != 0.0f ? 1 : 0, g_cfg_lean_theta, g_cfg_lean_slide);
+        }
+        const int want = (g_cfg_head_pos != 0.0f || lean) ? 1 : 0;
+        float mx = g_cfg_head_pos_max;
+        if (!(mx >= 0.0f) || !isfinite(mx)) mx = 0.0f;
+        if (mx > 3.0f) mx = 3.0f;
+        g_head_pos_max.store(mx, std::memory_order_relaxed);
+        if (g_head_pos_on.exchange(want, std::memory_order_relaxed) != want)
+            LOG_INFO("hpos: head translation %s (cfg head_pos; build 204: the head's movement since the "
+                     "reference moves the viewpoint, clamped to %.2f m; the hands follow the eyes).",
+                     want ? "ON" : "off", mx);
+    }
+    {   // BUILD 205
+        const int want = g_cfg_stance != 0.0f ? 1 : 0;
+        g_stance_height.store(isfinite(g_cfg_stance_height) && g_cfg_stance_height > 1.0f && g_cfg_stance_height < 2.5f ? g_cfg_stance_height : 0.0f, std::memory_order_relaxed);
+        g_stance_crouch.store(isfinite(g_cfg_stance_crouch) && g_cfg_stance_crouch > 0.3f && g_cfg_stance_crouch < 0.95f ? g_cfg_stance_crouch : 0.75f, std::memory_order_relaxed);
+        g_stance_prone.store(isfinite(g_cfg_stance_prone) && g_cfg_stance_prone > 0.1f && g_cfg_stance_prone < 0.7f ? g_cfg_stance_prone : 0.0f, std::memory_order_relaxed);   // BUILD 208: anything else = off
+        g_crouch_drop.store(isfinite(g_cfg_crouch_drop) && g_cfg_crouch_drop >= 0.0f && g_cfg_crouch_drop <= 1.0f ? g_cfg_crouch_drop : 0.25f, std::memory_order_relaxed);   // BUILD 301
+        g_crouch_rise.store(isfinite(g_cfg_crouch_rise) && g_cfg_crouch_rise >= 0.0f && g_cfg_crouch_rise <= 0.5f ? g_cfg_crouch_rise : 0.10f, std::memory_order_relaxed);   // BUILD 301
+        if (g_stance_on.exchange(want, std::memory_order_relaxed) != want)
+            LOG_INFO("stance: loop %s (cfg stance; build 205: the physical head height picks the stance, the pad's B "
+                     "makes the character match it; build 301: crouch when the head is %.2f m below the standing height taken at the "
+                     "recentre, stand again %.2f m above that (crouch_drop 0 = the old ratio %.2f); prone %s; the eyes "
+                     "stay at the physical height through the change).", want ? "ON" : "off",
+                     g_crouch_drop.load(std::memory_order_relaxed), g_crouch_rise.load(std::memory_order_relaxed),
+                     g_stance_crouch.load(std::memory_order_relaxed),
+                     g_stance_prone.load(std::memory_order_relaxed) > 0.05f ? "from the head too" : "stays the pad's (build 208)");
+    }
+    camera::set_fov_scene((int)g_cfg_fov_scene);   // BUILD 198: before the source and the root, so it owns the field while on
+    camera::set_fov_src((int)g_cfg_fov_src);       // BUILD 197: before the root, so a reload that turns it off can turn the root on
+    camera::set_fov_root((int)g_cfg_fov_root);
+    camera::set_fov_root_mode((int)g_cfg_fov_root_mode);
+    camera::set_fov_root_aimk(g_cfg_fov_root_aimk);
+    camera::set_wgun_pitch(g_cfg_wgun_pitch_deg);
+    camera::set_ray_probe((int)g_cfg_ray_probe);
+    camera::set_wgun_two_grip((int)g_cfg_wgun_two_grip);
+    // hand_calib is a momentary: a 1 in the file arms one capture per reload,
+    // which is harmless (log only) and the reliable file-edit route survives.
+    if (g_cfg_stance_calib >= 0.5f) { stance_calib_start(); g_cfg_stance_calib = 0.0f; }   // BUILD 207: its own momentary
+    camera::set_arm_anchor(g_cfg_arm_anchor, g_cfg_arm_anchor_max);   // BUILD 213
+    camera::set_arm_pole(g_cfg_arm_pole, g_cfg_arm_pole_min);         // BUILD 214
+    camera::set_pole_smooth(g_cfg_arm_pole_smooth, g_cfg_arm_pole_tau_ms, g_cfg_arm_pole_rate);   // BUILD 285
+    camera::set_pole_down(g_cfg_arm_pole_down_l, g_cfg_arm_pole_down_r);                          // BUILD 293
+    camera::set_torso(g_cfg_torso_turn, g_cfg_torso_dead, g_cfg_torso_rate, g_cfg_torso_hand_w, g_cfg_torso_max);   // BUILD 294
+    {   // BUILD 216: fixed foveated rendering. The first apply decides whether the hooks go in at all.
+        ffr::Params fp;
+        fp.on         = g_cfg_ffr != 0.0f ? 1 : 0;
+        fp.inner      = g_cfg_ffr_inner;
+        fp.mid        = g_cfg_ffr_mid;
+        fp.outer      = g_cfg_ffr_outer;
+        fp.horizontal = g_cfg_ffr_horizontal != 0.0f ? 1 : 0;
+        fp.cull       = g_cfg_ffr_cull != 0.0f ? 1 : 0;
+        fp.margin     = g_cfg_ffr_margin;
+        ffr::set_params(fp);
+    }
+    {   // BUILD 209
+        const int want = g_cfg_follow != 0.0f ? 1 : 0;
+        g_follow_dead.store(isfinite(g_cfg_follow_dead) && g_cfg_follow_dead >= 0.05f && g_cfg_follow_dead <= 1.0f ? g_cfg_follow_dead : 0.20f, std::memory_order_relaxed);
+        g_follow_push.store(isfinite(g_cfg_follow_push) && g_cfg_follow_push >= 0.30f && g_cfg_follow_push <= 1.0f ? g_cfg_follow_push : 0.75f, std::memory_order_relaxed);
+        g_follow_stop.store(isfinite(g_cfg_follow_stop) && g_cfg_follow_stop >= 0.0f && g_cfg_follow_stop <= 0.5f ? g_cfg_follow_stop : 0.10f, std::memory_order_relaxed);
+        g_follow_vmax.store(isfinite(g_cfg_follow_vmax) && g_cfg_follow_vmax >= 0.3f && g_cfg_follow_vmax <= 8.0f ? g_cfg_follow_vmax : 2.0f, std::memory_order_relaxed);
+        g_follow_bleed.store(isfinite(g_cfg_follow_bleed) && g_cfg_follow_bleed >= 0.0f && g_cfg_follow_bleed <= 2.0f ? g_cfg_follow_bleed : 0.30f, std::memory_order_relaxed);
+        if (g_follow_on.exchange(want, std::memory_order_relaxed) != want)
+            LOG_INFO("follow: body follow %s (cfg follow; build 211: past %.2f m the character walks under the head on "
+                     "the left stick at %.2f of it, lets go one stopping distance out (%.2f s of its own speed, capped "
+                     "at %.1f m/s), and the settle takes the last centimetres out of the view at %.2f m/s; only while "
+                     "his own stick is idle and he is not rushing).", want ? "ON" : "off",
+                     g_follow_dead.load(std::memory_order_relaxed), g_follow_push.load(std::memory_order_relaxed),
+                     g_follow_stop.load(std::memory_order_relaxed), g_follow_vmax.load(std::memory_order_relaxed),
+                     g_follow_bleed.load(std::memory_order_relaxed));
+    }
+    if (g_cfg_hand_calib >= 0.5f) {
+        camera::set_hand_calib(1);
+        g_cfg_hand_calib = 0.0f;
+    }
+    camera::set_wgun_two_anchor((int)g_cfg_wgun_two_anchor);
+    camera::set_hide_child(0, (int)g_cfg_hide_child);
+    camera::set_hide_child(1, (int)g_cfg_hide_child2);
+    camera::set_head_prelatch(g_cfg_head_prelatch >= 0.5f ? 1 : 0);
+    camera::set_head_reassert(g_cfg_head_reassert >= 0.5f ? 1 : 0);
+    camera::set_head_always(g_cfg_head_always >= 0.5f ? 1 : 0);
+    camera::set_head_populate(g_cfg_head_populate >= 0.5f ? 1 : 0);
+    camera::set_fp_auto(g_cfg_fp_auto >= 0.5f ? 1 : 0);
+    camera::set_head_pulse(isfinite(g_cfg_head_pulse) ? (int)g_cfg_head_pulse : 30);
     g_main_hand.store(g_cfg_main_hand >= 0.5f ? 1 : 0, std::memory_order_relaxed);
     camera::set_ipd_sign(g_cfg_ipd_swap >= 0.5f ? -1 : 1);
     camera::set_wgun_grip_bypass(g_cfg_wgun_grip_bypass >= 0.5f ? 1 : 0);
@@ -1035,6 +2116,20 @@ void load_config() {
     camera::set_wbaxis((int)g_cfg_wbaxis);
     camera::set_wnode((int)g_cfg_wnode, g_cfg_wnode_dz);
     g_ipd_default = headpose::ipd_scale();
+    {   // BUILD 270: gtrec's header snapshot (log only), in FileHdr::cfg order
+        g_gt_cfg[0]  = headpose::ipd_scale();
+        g_gt_cfg[1]  = (float)camera::get_ipd_sign();
+        g_gt_cfg[2]  = (float)g_cfg_layer_lag.load(std::memory_order_relaxed);
+        g_gt_cfg[3]  = (float)g_cfg_veh_lag.load(std::memory_order_relaxed);
+        g_gt_cfg[4]  = (float)g_cfg_veh_depth.load(std::memory_order_relaxed);
+        g_gt_cfg[5]  = headpose::cam_pose_rot() ? 1.0f : 0.0f;
+        g_gt_cfg[6]  = g_cfg_head_roll_fix != 0.0f ? 1.0f : 0.0f;
+        g_gt_cfg[9]  = cam2::stereo_swap_eyes() ? 1.0f : 0.0f;
+        g_gt_cfg[10] = g_cfg_fs_fov_cfg;
+        g_gt_cfg[11] = cam2::stereo_target_fovy();
+        g_gt_cfg[13] = camera::veh_smooth();
+        gtrec::set_cfg_snapshot(g_gt_cfg);
+    }
     LOG_INFO("VR: grwxr.cfg read, ipd_scale = %.2f, mono_scope_fov = %.2f rad",
              headpose::ipd_scale(), headpose::mono_scope_fov());
 }
@@ -1186,14 +2281,62 @@ void aim_pump(float head_yaw, float head_pitch) {
     // was being computed correctly all along.
     const float aim_fov = headpose::read_fov(0.7853982f);
     const bool bar_want = g_bar_want.load(std::memory_order_relaxed);
-    const bool live = (g_vraim_on || bar_want) &&
+    // BUILD 261: in a vehicle the head is composed onto the body heading (CameraProbe.cpp veh_step), so the head must
+    // not ALSO be injected into the game's aim: injection stands down, the baseline re-zeroes every frame, and the
+    // falling edge (getting out) re-syncs so the on foot view resumes from where the engine has it.
+    const bool veh_now = camera::veh_on();
+    static bool s_veh_prev = false;
+    if (s_veh_prev && !veh_now) g_aim_resync.store(true, std::memory_order_relaxed);
+    s_veh_prev = veh_now;
+    const bool live = !veh_now && (g_vraim_on || bar_want) &&
                       (aim_fov >= 0.65f ||
                        (bar_want && aim_fov >= headpose::mono_scope_fov()));
+
+    if (g_rc_on.load(std::memory_order_relaxed) && camera::aim_available()) {   // BUILD 289/292: log only, plain stores, no I/O
+        float bp = 0.0f;
+        if (!camera::base_pitch_geo(&bp)) bp = 0.0f;
+        const unsigned bf = g_bar_frames.load(std::memory_order_relaxed);
+        const bool ran = bf != g_rcx_frames_seen;           // the barrel block drove the aim since the last row
+        g_rcx_frames_seen = bf;
+        RcRow& r = g_rc[g_rc_w.load(std::memory_order_relaxed) & (kRcN - 1)];
+        r.t_ms  = (uint32_t)GetTickCount64();
+        r.shots = aimtrace::shots_total();
+        r.trig  = g_in_trig[1].load(std::memory_order_relaxed);
+        r.eng   = camera::aim_lastval(1) * 57.29578f;
+        r.base  = bp * 57.29578f;
+        r.head  = head_pitch * 57.29578f;
+        r.calls = (uint32_t)camera::aim_count(1);
+        r.ep     = ran ? g_bar_diag[1].load(std::memory_order_relaxed) * 57.29578f : 0.0f;
+        r.barrel = ran ? g_rcx_barrel * 57.29578f : 0.0f;
+        r.view   = ran ? g_rcx_view * 57.29578f : 0.0f;
+        r.cum    = g_aim_cum[1] * 57.29578f;
+        r.fov    = aim_fov;
+        r.obj    = (uint32_t)camera::aim_lastobj();
+        r.flags  = (uint8_t)((ran ? 1 : 0) | (live ? 2 : 0) | (aimtrace::firing() ? 4 : 0) |
+                             ((camera::aim_pending(1) || g_aim_outf[1]) ? 8 : 0));
+        g_rc_w.fetch_add(1, std::memory_order_release);
+    }
 
     // Build 49 fix 2: complete a pending recenter resync. New injections
     // pause until it lands; the kicker unblocks a parasitic stall so this
     // cannot hang on an idle engine.
+    // BUILD 290: THE PITCH BASELINE IS ABSOLUTE. His word 2026-10-11: he loaded in and the view stared up; earlier, after the
+    // swoop he looked down, looked up, and the tilt reversed. The recoil CSV of build 289 (recoil-30132) shows why: the pump
+    // took its baseline when it went live, with his head 44.6 deg DOWN and the engine at 0.03 deg, then drove the engine by
+    // the head's change since that moment, so a level head showed as +44 deg (engine 32 deg at 1.7 s, 52 deg at the end).
+    // A headset's pitch is measured against gravity, so the engine pitch must follow the head's own pitch, not its change.
+    // At the first live frame, and after every recenter or vehicle exit, the pitch accounting is set to the engine's own
+    // measured pitch and the baseline to zero, so the pump drives the engine to the head pitch (per-injection clamp
+    // 17 deg, so a large first correction takes a few frames). Yaw keeps its relative baseline. ADS and fov gating keep the
+    // old resume-without-snap behaviour. cfg aim_pitch_abs, code default ON.
+    static bool s_abs = true;
+    // BUILD 291: and after EVERY stretch where the pump was not live (ADS, fov gating, a vehicle, the pre-fp swoop): the 290 run
+    // (recoil-23660.csv, 27 s in) had the engine's pitch stick at -7.6 deg for 4 s while the head moved to +7 and the pump kept
+    // booking pushes the engine did not take, leaving the view 15 to 25 deg too low afterwards. The character loads crouched
+    // and the stance change takes the camera for a few seconds.
+    if (!live) s_abs = true;
     if (g_aim_resync.load(std::memory_order_relaxed)) {
+        s_abs = true;
         bool busy = false;
         for (int a = 0; a < 2; ++a) {
             if (camera::aim_pending(a)) { busy = true; continue; }
@@ -1224,6 +2367,43 @@ void aim_pump(float head_yaw, float head_pitch) {
         if (!pending)             s_pend_since = 0;
         else if (!s_pend_since)   s_pend_since = now;
         else if (now - s_pend_since > 300) kick_engine_aim();
+    }
+    if (s_abs && live && g_cfg_aim_pitch_abs >= 0.5f && camera::aim_count(1) > 0 &&
+        !camera::aim_pending(1) && !g_aim_outf[1]) {
+        s_abs = false;
+        const float eg = camera::aim_lastval(1) * g_aim_sign_pitch;     // the engine's pitch now, geometric radians
+        const float before = g_aim_zero[1];
+        g_aim_zero[1] = 0.0f;
+        g_aim_cum[1]  = eg;
+        headpose::set_aim_cum(g_aim_cum[0], g_aim_cum[1]);
+        note("aim: pitch baseline ABSOLUTE (build 290): engine pitch %+.1f deg, head pitch %+.1f deg, old baseline %+.1f deg; the pump now "
+             "drives the engine to the head's own pitch.",
+             eg * 57.29578f, head[1] * 57.29578f, before * 57.29578f);
+    } else if (s_abs && g_cfg_aim_pitch_abs < 0.5f) {
+        s_abs = false;
+    }
+    // BUILD 291: THE DRIFT NET. The pump books what it armed (open loop) and that stays the law: no measurement enters the
+    // per-frame head tracking (288 broke exactly that). But if the engine's measured pitch has been more than 5 deg away from
+    // the booked pitch for half a second with nothing in flight, the booking is wrong (a stance or cover animation took the
+    // camera, or the engine clamped, or a bump was taken by another caller of the setter): re-take the absolute baseline, so the
+    // accounting is set to the measured pitch and the pump walks the engine back to the head at its normal clamped rate. A
+    // normal frame never gets near 5 deg for half a second (recoil-23660: engine within 0.3 deg of the head at rest).
+    if (live && !s_abs && g_cfg_aim_pitch_abs >= 0.5f && camera::aim_count(1) > 0 &&
+        !camera::aim_pending(1) && !g_aim_outf[1]) {
+        static ULONGLONG s_dev_since = 0;
+        const ULONGLONG nowd = GetTickCount64();
+        const float dev = camera::aim_lastval(1) * g_aim_sign_pitch - g_aim_cum[1];
+        if (fabsf(dev) > 0.0873f) {
+            if (!s_dev_since) s_dev_since = nowd;
+            else if (nowd - s_dev_since > 500) {
+                s_dev_since = 0;
+                s_abs = true;
+                note("aim: pitch drift net (build 291): the engine pitch has been %+.1f deg from the booked pitch for 0.5 s; re-taking the "
+                     "absolute baseline.", dev * 57.29578f);
+            }
+        } else {
+            s_dev_since = 0;
+        }
     }
     for (int a = 0; a < 2; ++a) {
         if (camera::aim_pending(a)) continue;   // still queued for the engine
@@ -1256,9 +2436,12 @@ void aim_pump(float head_yaw, float head_pitch) {
             if (fabsf(d) < 0.0005f) continue;
         }
         const float sign = a == 0 ? g_aim_sign_yaw : g_aim_sign_pitch;
-        if (camera::aim_arm(a, d * sign) == 1) {
+        // BUILD 194: fov_root_aimk scales what the engine is handed while the
+        // fov root is armed; the accounting below stays in geometric units.
+        if (camera::aim_arm(a, d * sign * camera::fovroot_aim_gain()) == 1) {
             g_aim_out[a]  = d;
             g_aim_outf[a] = true;
+            if (gtrec::PRow* gp = gtrec::p_stage()) gp->aim_armed[a] = d;   // BUILD 270: the gtrec P row, log only
         }
     }
 }
@@ -1362,6 +2545,263 @@ void steer_aim() {
     g_steer_dy.fetch_add(dy, std::memory_order_relaxed);
 }
 
+// BUILD 209: the body follow's tick, after Quat and quat_rotate_inv exist.
+// BUILD 210 (the read-only review of 209): the offset and the advance in
+// yaw-only frames (the XR horizontal displacement against the head's
+// horizontal forward and right; the world horizontal step against the camera
+// rows' horizontal projections, back into XR through the same head frame),
+// exact inverses at every yaw, pitch and roll under a rotation or a reflection
+// between XR and world (followtest211.py).
+//
+// BUILD 211: THE STICK THE GAME TAKES, THE STOP IT MEASURES, AND THE SETTLE.
+// His words, 2026-09-06 21:31, on the 210 run: "it doesnt recenter it perfectly
+// you can actually see the where the head is supposed to be and it doesnt move
+// back to the camera. Needs to be tightened." The log said why. In
+// grwxr-8320.log the follow pushed 0.30 to 0.45 of the left stick for six
+// seconds while the 10 Hz sprint probe measured the character's own head bone
+// at 0.01 to 0.06 m/s: the body did not move, and the camera-to-bone offset
+// held 0.29 to 0.38 m and never closed. The merge answered every poll of that
+// run (xin: calls=7820 merged=6987) and the same merge's B injection is
+// confirmed (build 205), so the poll is ours and it is the MAGNITUDE the game
+// discards: on a diagonal our components were 0.21 of full scale (6880 of
+// 32767), under XInput's own 7849 dead zone and under the 0.25 of the game's
+// own Filter_Remap_LS. A stick that small cannot move this character at all.
+// So the follow stops metering speed with the stick. It pushes one magnitude
+// the game cannot discard (follow_push 0.75: 0.53 on each axis of a diagonal,
+// 17400 of 32767) and closes the loop on the BODY'S MEASURED SPEED instead: it
+// lets go one stopping distance out (the game's v_fStopBlendTime is 0.2 s, so
+// follow_stop seconds of the body's own speed), coasts while the advance keeps
+// the view still, and then bleeds the last few centimetres out of the VIEW
+// (follow_bleed), which is the part no stick can do: the game's smallest step
+// is one dead-zone crossing, about 0.1 m of coast. A close that moves the body
+// less than 5 cm in 1.5 s is abandoned as blocked (a wall) and settles, so the
+// stick is never held down against something that will not move.
+enum { FL_IDLE = 0, FL_CLOSING = 1, FL_COAST = 2, FL_SETTLE = 3 };
+static void follow_tick(const float dxr[3], const Quat& qh, bool built, bool seated) {
+    const float dead  = g_follow_dead.load(std::memory_order_relaxed);
+    const float push  = g_follow_push.load(std::memory_order_relaxed);
+    const float tstop = g_follow_stop.load(std::memory_order_relaxed);
+    const float vmax  = g_follow_vmax.load(std::memory_order_relaxed);
+    const float bleed = g_follow_bleed.load(std::memory_order_relaxed);
+    const uint64_t now = GetTickCount64();
+
+    // the frame time, for the two speed estimates and the bleed's rate limit.
+    // GetTickCount64 is 15 ms coarse, which is one frame here, so the
+    // performance counter: read-only, no allocation, no lock (rule 8).
+    static LARGE_INTEGER s_freq = {};
+    static LARGE_INTEGER s_last = {};
+    if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
+    LARGE_INTEGER nowq;
+    QueryPerformanceCounter(&nowq);
+    float dt = 0.0f;
+    if (s_last.QuadPart && s_freq.QuadPart)
+        dt = (float)((double)(nowq.QuadPart - s_last.QuadPart) / (double)s_freq.QuadPart);
+    s_last = nowq;
+    if (!(dt > 0.0005f && dt < 0.2f)) dt = 0.013f;   // the first frame, or a hitch
+
+    // the head's horizontal frame in XR (+x right, +y up, -z forward): the
+    // forward projected onto the floor, held from the last frame within about
+    // three degrees of straight up or down, where the projection has no direction
+    static float s_fx = 0.0f, s_fz = -1.0f;
+    static bool s_fok = false;
+    {
+        const float back[3] = {0.0f, 0.0f, -1.0f};
+        const Quat qc{-qh.x, -qh.y, -qh.z, qh.w};
+        float f[3];
+        quat_rotate_inv(qc, back, f);   // the inverse of the conjugate: rotate by qh, the head's forward in XR
+        const float mh = sqrtf(f[0] * f[0] + f[2] * f[2]);
+        if (isfinite(mh) && mh > 0.05f) { s_fx = f[0] / mh; s_fz = f[2] / mh; s_fok = true; }
+    }
+    const float rx = -s_fz, rz = s_fx;                // right = forward x up
+    const float lx = dxr[0] * rx + dxr[2] * rz;       // the head's horizontal offset, right
+    const float lf = dxr[0] * s_fx + dxr[2] * s_fz;   // and forward
+    const float dist = sqrtf(lx * lx + lf * lf);      // = the XR horizontal magnitude
+    g_fl_dist.store(dist, std::memory_order_relaxed);
+
+    // the camera's horizontal rows: the advance needs them, and the follow
+    // does not push without them (a push with no advance is the slide)
+    float R[9], P[3];
+    float crx = 0.0f, cry = 0.0f, cfx = 0.0f, cfy = 0.0f;
+    bool cam = false;
+    if (camera::base_frame(R, P)) {
+        const float mr = sqrtf(R[0] * R[0] + R[1] * R[1]);
+        const float mf = sqrtf(R[3] * R[3] + R[4] * R[4]);
+        if (isfinite(mr) && isfinite(mf) && mr > 0.05f && mf > 0.05f) {
+            crx = R[0] / mr; cry = R[1] / mr;
+            cfx = R[3] / mf; cfy = R[4] / mf;
+            cam = true;
+        }
+    }
+
+    // the character's own horizontal speed, from its Head bone, and his own
+    // head's speed in XR. Both smoothed over about seven frames: the stop
+    // estimate and the settle's hold-still gate are the only consumers.
+    static float s_vbody = 0.0f, s_vhead = 0.0f;
+    static float s_prev[3] = {0.0f, 0.0f, 0.0f};
+    static bool s_have = false;
+    float hb[3];
+    const bool bone = camera::body_head_world(hb);
+    float step0 = 0.0f, step1 = 0.0f, stepm = 0.0f;
+    if (bone) {
+        if (s_have) {
+            step0 = hb[0] - s_prev[0]; step1 = hb[1] - s_prev[1];
+            stepm = sqrtf(step0 * step0 + step1 * step1);
+            const float v = stepm < 0.35f ? stepm / dt : s_vbody;   // a teleport is not a speed
+            if (isfinite(v)) s_vbody += (v - s_vbody) * 0.15f;
+        }
+    } else {
+        s_vbody = 0.0f;
+    }
+    {
+        static float s_hprev[3] = {0.0f, 0.0f, 0.0f};
+        static bool s_hhave = false;
+        if (s_hhave && g_head_pos_ok) {
+            const float h0 = g_head_pos[0] - s_hprev[0], h2 = g_head_pos[2] - s_hprev[2];
+            const float v = sqrtf(h0 * h0 + h2 * h2) / dt;
+            if (isfinite(v) && v < 20.0f) s_vhead += (v - s_vhead) * 0.15f;
+        }
+        if (g_head_pos_ok) {
+            s_hprev[0] = g_head_pos[0]; s_hprev[1] = g_head_pos[1]; s_hprev[2] = g_head_pos[2];
+            s_hhave = true;
+        }
+    }
+    g_fl_vbody.store(s_vbody, std::memory_order_relaxed);
+    g_fl_vhead.store(s_vhead, std::memory_order_relaxed);
+
+    float ulx = 0.0f, uly = 0.0f; unsigned int ubtn = 0;
+    camera::move_input(&ulx, &uly, &ubtn);
+    const bool user_moving = ulx * ulx + uly * uly > 0.01f;
+    const bool rush = (ubtn & 0x0040u) != 0;   // the LS click, Base_Rush
+    static uint64_t s_user_ms = 0;
+    if (user_moving) s_user_ms = now;
+    const bool user_recent = s_user_ms != 0 && (now - s_user_ms) < 300;
+    const bool sane = s_fok && isfinite(dist) && dist < 3.0f;
+    if (isfinite(dist) && dist >= 3.0f) g_fl_far.fetch_add(1, std::memory_order_relaxed);
+    const bool gate = g_follow_on.load(std::memory_order_relaxed) != 0 && headpose::fp_enabled() &&
+                      built && !seated && sane && !user_moving && !user_recent && !rush;
+
+    // the state machine
+    static int s_state = FL_IDLE;
+    static uint64_t s_state_ms = 0;
+    static float s_from[2] = {0.0f, 0.0f};
+    static bool s_from_ok = false;
+    if (!gate && s_state != FL_IDLE) { s_state = FL_IDLE; s_state_ms = now; }
+    switch (s_state) {
+    case FL_IDLE:
+        if (gate && dist > dead) {
+            s_state = FL_CLOSING; s_state_ms = now;
+            s_from[0] = bone ? hb[0] : 0.0f; s_from[1] = bone ? hb[1] : 0.0f; s_from_ok = bone;
+            g_fl_closes.fetch_add(1, std::memory_order_relaxed);
+        }
+        break;
+    case FL_CLOSING: {
+        const float stopd = s_vbody * tstop + 0.03f;
+        if (now - s_state_ms > 1500) {
+            const float m0 = bone && s_from_ok ? hb[0] - s_from[0] : 1.0f;
+            const float m1 = bone && s_from_ok ? hb[1] - s_from[1] : 0.0f;
+            if (sqrtf(m0 * m0 + m1 * m1) < 0.05f) {
+                // blocked: a wall, a slope, an input context that will not walk.
+                // The stick is not held down against it; the view comes back instead.
+                g_fl_blocked.fetch_add(1, std::memory_order_relaxed);
+                s_state = FL_SETTLE; s_state_ms = now;
+                g_fl_settles.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            s_state_ms = now;
+            s_from[0] = bone ? hb[0] : 0.0f; s_from[1] = bone ? hb[1] : 0.0f; s_from_ok = bone;
+        }
+        if (dist <= stopd || dist <= dead * 0.35f || s_vbody > vmax) { s_state = FL_COAST; s_state_ms = now; }
+        break; }
+    case FL_COAST:
+        if ((s_vbody < 0.12f && now - s_state_ms > 150) || now - s_state_ms > 900) {
+            if (dist > dead) {
+                s_state = FL_CLOSING; s_state_ms = now;
+                s_from[0] = bone ? hb[0] : 0.0f; s_from[1] = bone ? hb[1] : 0.0f; s_from_ok = bone;
+                g_fl_closes.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                s_state = FL_SETTLE; s_state_ms = now;
+                g_fl_settles.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        break;
+    case FL_SETTLE:
+        // his own head moving is a lean he means: the settle is only ever the
+        // follow's own leftover, never a physical offset he is holding
+        if (dist < 0.02f || now - s_state_ms > 2500 || s_vhead > 0.30f) { s_state = FL_IDLE; s_state_ms = now; }
+        break;
+    }
+    g_fl_state.store(s_state, std::memory_order_relaxed);
+
+    // the push
+    bool active = false;
+    float sx = 0.0f, sy = 0.0f;
+    if (s_state == FL_CLOSING && dist > 1e-4f) {
+        if (!cam) {
+            g_fl_nocam.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            sx = lx / dist * push;
+            sy = lf / dist * push;
+            active = true;
+            g_fl_frames.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    g_fl_stick.store(active ? sqrtf(sx * sx + sy * sy) : 0.0f, std::memory_order_relaxed);
+    headpose::set_follow_stick(sx, sy, active);
+    if (!gate) {
+        if (user_moving || user_recent) g_fl_user.fetch_add(1, std::memory_order_relaxed);
+        else if (rush) g_fl_rush.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // the reference advance: while the follow is closing and while the body
+    // coasts to its stop, the body's motion is the follow's, so the reference
+    // moves with it and the view stays where it is. World horizontal step,
+    // onto the camera's horizontal right and forward, into XR through the
+    // head's horizontal frame: the exact inverse of the offset above.
+    if (bone) {
+        if (s_have && (s_state == FL_CLOSING || s_state == FL_COAST)) {
+            if (stepm < 0.35f) {
+                if (stepm > 1e-5f && cam) {
+                    const float hx = step0 * crx + step1 * cry;
+                    const float hf = step0 * cfx + step1 * cfy;
+                    const float vx0 = hx * rx + hf * s_fx;
+                    const float vx2 = hx * rz + hf * s_fz;
+                    if (isfinite(vx0) && isfinite(vx2)) {
+                        g_head_ref_pos[0] += vx0;
+                        g_head_ref_pos[2] += vx2;
+                        g_fl_advances.fetch_add(1, std::memory_order_relaxed);
+                        g_fl_adv.store(stepm, std::memory_order_relaxed);
+                    }
+                }
+            } else {
+                g_fl_teleports.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        s_prev[0] = hb[0]; s_prev[1] = hb[1]; s_prev[2] = hb[2];
+        s_have = true;
+    } else {
+        s_have = false;
+    }
+
+    // the settle: the stick cannot place the body inside its own stopping
+    // distance, so the last few centimetres come out of the view. The
+    // reference moves toward the head along the horizontal XR direction of the
+    // offset, which reduces the offset by exactly the step and moves the view
+    // onto the character's head by exactly the step (followtest211.py).
+    if (s_state == FL_SETTLE && dist > 0.005f && s_vhead < 0.30f && dt > 0.0f) {
+        float st = dist * (1.0f - expf(-dt / 0.25f));   // a 0.25 s time constant
+        const float lim = bleed * dt;                   // and a rate limit
+        if (st > lim) st = lim;
+        if (st > dist) st = dist;
+        const float ux = dxr[0] / dist, uz = dxr[2] / dist;
+        if (isfinite(ux) && isfinite(uz) && st > 0.0f) {
+            g_head_ref_pos[0] += ux * st;
+            g_head_ref_pos[2] += uz * st;
+            g_fl_bleeds.fetch_add(1, std::memory_order_relaxed);
+            g_fl_bled.store(g_fl_bled.load(std::memory_order_relaxed) + st, std::memory_order_relaxed);
+        }
+    }
+}
+
 void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
     if (!(flags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) return;
     const Quat q{o.x, o.y, o.z, o.w};
@@ -1380,8 +2820,28 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
         const float psi = atan2f(-fx, -fz);   // yaw about XR +Y
         g_ref_inv = Quat{0.0f, -sinf(psi * 0.5f), 0.0f, cosf(psi * 0.5f)};
         g_have_ref = true;
+        headpose::note_recenter();   // BUILD 261
         note("VR: head reference captured, yaw %.1f deg. Head tracking live.",
              psi * 57.29578f);
+        // BUILD 207: the 6DOF position reference is captured HERE, with the
+        // yaw reference, so every recenter (Home, Space, F2, the runtime's
+        // own) re-zeroes the origin and restarts the standing average and
+        // the bone maximum. The 204 block's own capture never saw a recenter
+        // because this function had re-armed g_have_ref first (the internal
+        // dig, 5.3). g_head_pos is stored before this call in the same
+        // present; if the position is not valid yet, the 204 block captures
+        // it on the first present that has one.
+        if (g_head_pos_ok) {
+            g_head_ref_pos[0] = g_head_pos[0];
+            g_head_ref_pos[1] = g_head_pos[1];
+            g_head_ref_pos[2] = g_head_pos[2];
+            g_head_ref_ok = true;
+            g_hp_refs.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_head_ref_ok = false;
+        }
+        g_st_ref_ms = GetTickCount64();
+        g_st_dzmax = 0.0f; g_st_auto_sum = 0.0; g_st_auto_n = 0; g_st_auto_done = false;
     }
 
     // Head rotation relative to the reference, expressed in the REFERENCE
@@ -1427,12 +2887,33 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
         // internally coherent. Gun-anchored optics belong to the arms phase.
         const bool lt_ads =
             g_in_trig[0].load(std::memory_order_relaxed) >= 0.5f;
+        // BUILD 237: is the scope UP? On the L3 latch that is the latch state;
+        // with pip_toggle = 0 it is the held trigger, exactly as before 237.
+        // Computed once here because both the aim source below and the disc
+        // itself further down have to agree on it.
+        const bool pip_up = g_pip_enable &&
+            (camera::pip_toggle_enabled() ? (camera::pip_user_on() != 0) : lt_ads);
         // Build 23: controller-driven hip-fire. Same reference (g_ref_inv),
         // same basis change, same yaw/pitch convention as the head above, so
         // the two sources are interchangeable mid-run (cfg aim_source, hot-
         // reloadable). An untracked controller HOLDS its last filtered ray
         // (no snap); one that never tracked leaves the head in charge.
-        if (g_aim_source.load(std::memory_order_relaxed) == 1 && !lt_ads) {
+        // BUILD 221: with the PiP scope on, the pull opens the disc and the
+        // controller ray stays the aim; look-to-aim during ADS is off.
+        // BUILD 237: with the scope on a latch the left trigger reaches the
+        // game again, so a real ADS is possible for the first time since 221.
+        // Look-to-aim belongs to that real ADS (the game draws its sight
+        // picture at view centre); the controller ray keeps the aim only while
+        // the SCOPE is up, which is what 221 actually meant.
+        // BUILD 238: NATIVE VR ADS adds the third case. Build 25's revert to the
+        // head exists because our camera write made the scene follow the head
+        // while the game drew its sight picture at its own aim; inside the
+        // flat-scope path that write is skipped, so there is one camera and no
+        // split, and the rifle can pan the game's own magnified picture. The
+        // condition is the LATCHED state, so it is false everywhere the mode is
+        // off and everywhere the flat-scope path is not actually engaged.
+        if (g_aim_source.load(std::memory_order_relaxed) == 1 &&
+            (!lt_ads || pip_up || camera::scope_native_aim())) {
             const Quat c{g_in_ori[1][0].load(std::memory_order_relaxed),
                          g_in_ori[1][1].load(std::memory_order_relaxed),
                          g_in_ori[1][2].load(std::memory_order_relaxed),
@@ -1591,6 +3072,8 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
                     if (ep < -cap) { ep = -cap; g_bar_clamp.fetch_add(1, std::memory_order_relaxed); }
                     ay = wrap_pi(ay + ey);
                     ap = ap + ep;
+                    g_rcx_barrel = asinf(bz);   // BUILD 292 (log only)
+                    g_rcx_view   = asinf(vz);
                     g_bar_frames.fetch_add(1, std::memory_order_relaxed);
                     g_bar_diag[0].store(ey, std::memory_order_relaxed);
                     g_bar_diag[1].store(ep, std::memory_order_relaxed);
@@ -1599,6 +3082,7 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
             }
         }
 
+        g_aimref_head.store(ay, std::memory_order_relaxed);
         aim_pump(ay, ap);
 
         // Build 24: place the aim reticle at the controller ray's offset
@@ -1660,6 +3144,56 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
             }
         }
 
+        // BUILD 221: the PiP scope. Shown while the left trigger is pulled and
+        // the anchor has an eyepiece; placed like the weapon markers below
+        // (engine world through base_frame, per-eye IPD shift). The source
+        // centre is where the BARREL points, from the barrel publish the
+        // green ring consumes (camera axes: x right, y forward, z up), so the
+        // disc is honest about the shot under every aim_source; the
+        // controller-ray angles are never computed under aim_source 0
+        // (review 2 of build 221). Same optics gate as the rings.
+        g_pip_show = false;
+        // BUILD 237: the disc follows the L3 latch (pip_up, computed above).
+        if (pip_up &&
+            headpose::read_fov(0.7853982f) >= 0.65f) {
+            float lens[3], R[9], C[3], bl[3];
+            uint32_t bgen = 0;
+            if (camera::pip_lens(lens) && camera::base_frame(R, C) &&
+                aimtrace::barrel_local_peek(bl, &bgen) && bgen != 0 &&
+                bl[1] > 0.05f) {
+                // BUILD 222: C is the CENTRE viewpoint (the latch leaves the eye
+                // offset out on purpose); each eye's frame was rendered from
+                // C + eye_shift(e) along the camera's right axis, so the disc
+                // for eye e is projected from exactly there. The 221 run had it
+                // one disc-width left of the glass with the marker convention.
+                const float rw[3] = {lens[0] - C[0], lens[1] - C[1], lens[2] - C[2]};
+                const float lx = rw[0] * R[0] + rw[1] * R[1] + rw[2] * R[2];
+                const float lf = rw[0] * R[3] + rw[1] * R[4] + rw[2] * R[5];
+                const float lu = rw[0] * R[6] + rw[1] * R[7] + rw[2] * R[8];
+                // The barrel's tangent in the frame: right over forward, up over
+                // forward, the same convention as lx/lf/lu just above.
+                const float atx = bl[0] / bl[1], aty = bl[2] / bl[1];
+                if (lf > 0.05f && fabsf(atx) < 2.5f && fabsf(aty) < 2.5f) {
+                    bool any = false;
+                    for (int e = 0; e < 2; ++e) {
+                        const float ex = lx - camera::eye_shift(e);
+                        const float tx = ex / lf, ty = lu / lf;
+                        if (tx < -3.0f || tx > 3.0f || ty < -3.0f || ty > 3.0f) continue;
+                        float tr = g_pip_radius / lf;
+                        if (tr > 0.60f)  tr = 0.60f;
+                        if (tr < 0.010f) tr = 0.010f;
+                        g_pip_tx[e] = tx; g_pip_ty[e] = ty; g_pip_tr[e] = tr;
+                        any = true;
+                    }
+                    if (any) {
+                        g_pip_atx = atx;
+                        g_pip_aty = aty;
+                        g_pip_show = true;
+                    }
+                }
+            }
+        }
+
         // BUILD 45: weapon-candidate markers. Unlike the hand markers these
         // are placed from ENGINE world positions, so the conversion uses the
         // GAME CAMERA's own basis (base_frame: row 0 right, row 1 forward,
@@ -1680,7 +3214,7 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
                     // Build 64: while wskel is armed the WHITE slot carries
                     // the weapon-skeleton pick; the wp handles keep the
                     // other five slots (and all six when it is off).
-                    if (i == kWpm - 1 && g_wskel_enable) {
+                    if (i == kWpm - 1 && g_wskel_enable && g_wskel_marker) {
                         if (!camera::wskel_marker(wpos)) continue;
                     } else if (!g_wpm_enable || !wp::marker(i, wpos)) {
                         continue;
@@ -1706,6 +3240,91 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
                         any = true;
                     }
                     g_wpm_on[i] = any;
+                }
+            }
+        }
+
+        // BUILD 153: the evidence reticle. Same conversion as the wp markers
+        // above (game camera basis, per-eye tangents), so it inherits their
+        // headset-proven placement rather than inventing a second one.
+        //
+        // barrel_dir_PEEK, never barrel_dir. The plain accessor keeps its
+        // freshness memory in one function-static and is SINGLE CONSUMER: a
+        // second caller is answered "stale" whenever the frame-rate consumer
+        // arrives first, which is a build that quietly does nothing for a
+        // reason no log line explains. That trap is already recorded in
+        // FIREARM section 3 and peek exists precisely for this.
+        g_ret_on[0] = g_ret_on[1] = false;
+        if (g_ret_mode > 0 && headpose::read_fov(0.7853982f) >= 0.65f) {
+            float R[9], C[3];
+            if (camera::base_frame(R, C)) {
+                const float half_ipd = 0.5f * headpose::read_ipd(0.063f);
+                float wpos[kRet][3];
+                bool  have[kRet] = {false, false};
+
+                // BOTH rings originate at the CAMERA, and that is a fix, not
+                // a shortcut. 2026-09-02, owner: "the gun following one gets
+                // turned around if the character moves, it will end up behind
+                // the player." He was right and the cause is freshness:
+                // aimtrace::player_muzzle reads g_sd_muz, which is published
+                // from the MUZZLE GETTER HOOK, and the engine only calls that
+                // when it wants a muzzle point, which in practice means while
+                // shooting. Between shots the value is a STALE WORLD POSITION,
+                // so a ring drawn from it stays pinned to a dead point and the
+                // player walks away from it. The direction was live the whole
+                // time; the origin was not.
+                //
+                // Drawing both from base_frame's camera position makes them
+                // live by construction, and it is also the better instrument:
+                // same origin and same distance means the on-screen gap is
+                // EXACTLY the angle between the barrel and the view, which is
+                // the rayprobe's raw-vs-cam number and the thing being
+                // measured. The muzzle is about 0.6 m off the camera, so at a
+                // sane range this costs a couple of degrees of parallax on a
+                // mark that was never an impact predictor anyway.
+                // 153b: consume the CAMERA-AXES publish, so the barrel ring
+                // needs no conversion here at all and cannot pick up a basis
+                // from a different instant than the one it was built with.
+                // x right, y forward, z up. Placed as a world point below
+                // purely so both rings share one code path.
+                float bl[3];
+                uint32_t bgen = 0;
+                if (aimtrace::barrel_local_peek(bl, &bgen) && bgen != 0 &&
+                    bl[1] > 0.05f) {          // in front of the camera
+                    for (int k = 0; k < 3; ++k)
+                        wpos[0][k] = C[k] + (bl[0] * R[k]
+                                           + bl[1] * R[3 + k]
+                                           + bl[2] * R[6 + k]) * g_ret_dist;
+                    have[0] = true;
+                }
+                if (g_ret_mode >= 2) {
+                    // Camera forward is base_frame row 1 (row 0 right,
+                    // row 1 forward, row 2 up), the same convention the
+                    // markers above swizzle through.
+                    for (int k = 0; k < 3; ++k)
+                        wpos[1][k] = C[k] + R[3 + k] * g_ret_dist;
+                    have[1] = true;
+                }
+
+                for (int i = 0; i < kRet; ++i) {
+                    if (!have[i]) continue;
+                    const float rw[3] = {wpos[i][0] - C[0], wpos[i][1] - C[1],
+                                         wpos[i][2] - C[2]};
+                    const float lx = rw[0] * R[0] + rw[1] * R[1] + rw[2] * R[2];
+                    const float lf = rw[0] * R[3] + rw[1] * R[4] + rw[2] * R[5];
+                    const float lu = rw[0] * R[6] + rw[1] * R[7] + rw[2] * R[8];
+                    if (lf < 0.15f) continue;   // at or behind the camera
+                    bool any = false;
+                    for (int e = 0; e < 2; ++e) {
+                        const float ex = lx - (e == 0 ? -half_ipd : half_ipd);
+                        const float tx = ex / lf, ty = lu / lf;
+                        if (tx < -3.0f || tx > 3.0f || ty < -3.0f || ty > 3.0f)
+                            continue;
+                        g_ret_tx[i][e] = tx;
+                        g_ret_ty[i][e] = ty;
+                        any = true;
+                    }
+                    g_ret_on[i] = any;
                 }
             }
         }
@@ -1802,6 +3421,7 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
                 if (g_head_pos_ok &&
                     g_in_track[1].load(std::memory_order_relaxed) &&
                     camera::base_frame(Rp, Cp)) {
+                    camera::apply_ctrl_lead(Cp);   // BUILD 201: the frame that draws this hand
                     const float crel[3] = {
                         g_in_pos[1][0].load(std::memory_order_relaxed) -
                             g_head_pos[0],
@@ -1816,6 +3436,7 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
                     pw[1] = Cp[1] + lx * Rp[1] + lf * Rp[4] + lu * Rp[7];
                     pw[2] = Cp[2] + lx * Rp[2] + lf * Rp[5] + lu * Rp[8];
                     pok = isfinite(pw[0]) && isfinite(pw[1]) && isfinite(pw[2]);
+                    if (pok) { const float off[3] = {lx, lf, lu}; camera::gpair_note(1, pw, off, Cp); camera::note_pub_cam(0, Cp, pw); }   // BUILD 277 log only; BUILD 278/282 the camera this hand was placed from
                 }
                 aimtrace::set_ctrl_pos(pw, pok);
             }
@@ -1833,6 +3454,7 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
                 if (g_head_pos_ok &&
                     g_in_track[0].load(std::memory_order_relaxed) &&
                     camera::base_frame(Rl, Cl)) {
+                    camera::apply_ctrl_lead(Cl);   // BUILD 201: same lead, same instant
                     const float lrel[3] = {
                         g_in_pos[0][0].load(std::memory_order_relaxed) -
                             g_head_pos[0],
@@ -1847,8 +3469,101 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
                     pl[1] = Cl[1] + lx * Rl[1] + lf * Rl[4] + lu * Rl[7];
                     pl[2] = Cl[2] + lx * Rl[2] + lf * Rl[5] + lu * Rl[8];
                     plok = isfinite(pl[0]) && isfinite(pl[1]) && isfinite(pl[2]);
+                    if (plok) camera::note_pub_cam(1, Cl, pl);   // BUILD 278: the camera the left hand was placed from
                 }
                 aimtrace::set_ctrl_pos_l(pl, plok);
+            }
+
+            // BUILD 158, CX-017: the LEFT controller's forward and up, so the
+            // free hand's wrist can follow the real wrist instead of freezing
+            // in the animation's brace pose. Identical route to the right
+            // controller's up vector below: local reference vector through the
+            // controller quaternion, into head space, signed permutation, then
+            // the engine base. Vectors only, never a quaternion, for the same
+            // reason that block states.
+            {
+                float fw[3] = {}, uw2[3] = {};
+                bool  vok = false;
+                float Rv2[9], Cv2[3];
+                if (g_head_pos_ok &&
+                    g_in_track[0].load(std::memory_order_relaxed) &&
+                    camera::base_frame(Rv2, Cv2)) {
+                    const Quat c{g_in_ori[0][0].load(std::memory_order_relaxed),
+                                 g_in_ori[0][1].load(std::memory_order_relaxed),
+                                 g_in_ori[0][2].load(std::memory_order_relaxed),
+                                 g_in_ori[0][3].load(std::memory_order_relaxed)};
+                    if (c.x != 0.0f || c.y != 0.0f || c.z != 0.0f ||
+                        c.w != 0.0f) {
+                        const Quat cconj{-c.x, -c.y, -c.z, c.w};
+                        const float refs[2][3] = {{0.0f, 0.0f, -1.0f},
+                                                  {0.0f, 1.0f,  0.0f}};
+                        float* outs[2] = {fw, uw2};
+                        int good = 0;
+                        for (int vi = 0; vi < 2; ++vi) {
+                            float vr[3], lv[3];
+                            quat_rotate_inv(cconj, refs[vi], vr);
+                            quat_rotate_inv(q, vr, lv);
+                            const float lx = lv[0], lf = -lv[2], lu = lv[1];
+                            float* o = outs[vi];
+                            o[0] = lx * Rv2[0] + lf * Rv2[3] + lu * Rv2[6];
+                            o[1] = lx * Rv2[1] + lf * Rv2[4] + lu * Rv2[7];
+                            o[2] = lx * Rv2[2] + lf * Rv2[5] + lu * Rv2[8];
+                            const float m = sqrtf(o[0]*o[0] + o[1]*o[1] +
+                                                  o[2]*o[2]);
+                            if (m > 0.5f) {
+                                o[0] /= m; o[1] /= m; o[2] /= m;
+                                ++good;
+                            }
+                        }
+                        vok = (good == 2);
+                    }
+                }
+                aimtrace::set_ctrl_vecs_l(fw, uw2, vok);
+            }
+
+            // BUILD 162: the LEFT controller's GRIP-pose +Y and +Z, the
+            // anatomical frame, through exactly the route the aim vectors
+            // above take: controller quaternion, head space, the signed
+            // permutation, the engine base. Two vectors, never the
+            // quaternion, for the reason the ctrl_up block states.
+            {
+                float gy[3] = {}, gz[3] = {};
+                bool  gok = false;
+                float Rv3[9], Cv3[3];
+                if (g_head_pos_ok &&
+                    g_in_gtrack[0].load(std::memory_order_relaxed) &&
+                    camera::base_frame(Rv3, Cv3)) {
+                    const Quat c{g_in_gori[0][0].load(std::memory_order_relaxed),
+                                 g_in_gori[0][1].load(std::memory_order_relaxed),
+                                 g_in_gori[0][2].load(std::memory_order_relaxed),
+                                 g_in_gori[0][3].load(std::memory_order_relaxed)};
+                    if (c.x != 0.0f || c.y != 0.0f || c.z != 0.0f ||
+                        c.w != 0.0f) {
+                        const Quat cconj{-c.x, -c.y, -c.z, c.w};
+                        const float refs[2][3] = {{0.0f, 1.0f, 0.0f},
+                                                  {0.0f, 0.0f, 1.0f}};
+                        float* outs[2] = {gy, gz};
+                        int good = 0;
+                        for (int vi = 0; vi < 2; ++vi) {
+                            float vr[3], lv[3];
+                            quat_rotate_inv(cconj, refs[vi], vr);
+                            quat_rotate_inv(q, vr, lv);
+                            const float lx = lv[0], lf = -lv[2], lu = lv[1];
+                            float* o = outs[vi];
+                            o[0] = lx * Rv3[0] + lf * Rv3[3] + lu * Rv3[6];
+                            o[1] = lx * Rv3[1] + lf * Rv3[4] + lu * Rv3[7];
+                            o[2] = lx * Rv3[2] + lf * Rv3[5] + lu * Rv3[8];
+                            const float m = sqrtf(o[0]*o[0] + o[1]*o[1] +
+                                                  o[2]*o[2]);
+                            if (m > 0.5f) {
+                                o[0] /= m; o[1] /= m; o[2] /= m;
+                                ++good;
+                            }
+                        }
+                        gok = (good == 2);
+                    }
+                }
+                aimtrace::set_ctrl_gripf_l(gy, gz, gok);
             }
 
             // 2026-08-13: the RIGHT controller's UP vector, so the weapon can
@@ -1922,11 +3637,20 @@ void update_head(XrSpaceLocationFlags flags, const XrQuaternionf& o) {
 bool copy_into(int eye, ID3D11DeviceContext* ctx, ID3D11Texture2D* src) {
     uint32_t idx = 0;
     XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    if (XR_FAILED(xrAcquireSwapchainImage(g_swapchains[eye], &ai, &idx))) return false;
+    ph(kPhAcquireCopy, eye);
+    if (XR_FAILED(xrAcquireSwapchainImage(g_swapchains[eye], &ai, &idx))) {
+        ph(kPhDone);
+        return false;
+    }
     XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wi.timeout = XR_INFINITE_DURATION;
+    wi.timeout = img_wait_timeout();
     bool copied = false;
-    if (XR_SUCCEEDED(xrWaitSwapchainImage(g_swapchains[eye], &wi))) {
+    ph(kPhWaitCopy, eye);
+    const XrResult wr = xrWaitSwapchainImage(g_swapchains[eye], &wi);
+    ph(kPhDone);
+    if (wr == XR_TIMEOUT_EXPIRED)
+        g_img_to_copy.fetch_add(1, std::memory_order_relaxed);
+    if (XR_SUCCEEDED(wr) && wr != XR_TIMEOUT_EXPIRED) {
         if (idx < g_rtv[eye].size() && g_rtv[eye][idx]) {
             const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
             ctx->ClearRenderTargetView(g_rtv[eye][idx], black);
@@ -1966,6 +3690,7 @@ struct CtxState {
     ID3D11DomainShader*       ds; ID3D11ClassInstance* dsi[16]; UINT dsn;
     ID3D11ShaderResourceView* srv0;
     ID3D11SamplerState*       smp0;
+    ID3D11Buffer*             cb0;    // BUILD 221: the PiP disc binds PS b0
     ID3D11RasterizerState*    rs;
     UINT                      nvp;
     D3D11_VIEWPORT            vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
@@ -1991,6 +3716,7 @@ void ctx_save(ID3D11DeviceContext* c, CtxState& s) {
     c->HSGetShader(&s.hs, s.hsi, &s.hsn);
     c->DSGetShader(&s.ds, s.dsi, &s.dsn);
     c->PSGetShaderResources(0, 1, &s.srv0);
+    c->PSGetConstantBuffers(0, 1, &s.cb0);   // BUILD 221
     c->PSGetSamplers(0, 1, &s.smp0);
     c->RSGetState(&s.rs);
     s.nvp = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
@@ -2022,6 +3748,8 @@ void ctx_restore(ID3D11DeviceContext* c, CtxState& s) {
     for (UINT i = 0; i < s.dsn; ++i) if (s.dsi[i]) s.dsi[i]->Release();
     c->PSSetShaderResources(0, 1, &s.srv0);
     if (s.srv0) s.srv0->Release();
+    c->PSSetConstantBuffers(0, 1, &s.cb0);   // BUILD 221: the PiP disc's b0 undone
+    if (s.cb0) s.cb0->Release();
     c->PSSetSamplers(0, 1, &s.smp0);
     if (s.smp0) s.smp0->Release();
     c->RSSetState(s.rs);
@@ -2084,6 +3812,9 @@ bool create_blit_resources(const d3d11::State& st) {
     static const char kSrc[] =
         "Texture2D    tex0 : register(t0);\n"
         "SamplerState smp0 : register(s0);\n"
+        // BUILD 221: the PiP disc's source window: xy = the uv of the barrel's
+        // aim point in the frame, zw = the half extent in uv at this zoom.
+        "cbuffer PipCB : register(b0) { float4 pip_uv; };\n"
         "void vs_main(uint id : SV_VertexID, out float4 pos : SV_Position,\n"
         "             out float2 uv : TEXCOORD0) {\n"
         "    float2 t = float2((id << 1) & 2, id & 2);\n"
@@ -2143,7 +3874,40 @@ bool create_blit_resources(const d3d11::State& st) {
         "float4 ps_wp4(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target\n"
         "    { return wp_body(uv, float3(0.10, 0.95, 1.00)); }\n"   // CYAN
         "float4 ps_wp5(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target\n"
-        "    { return wp_body(uv, float3(1.00, 1.00, 1.00)); }\n";  // WHITE
+        "    { return wp_body(uv, float3(1.00, 1.00, 1.00)); }\n"   // WHITE
+        // BUILD 153: the evidence reticle. It was a centre dot plus a thin
+        // ring with a hollow gap, so that it read as an aiming mark on a
+        // recording and left the target visible through the middle.
+        // BUILD 192, owner 2026-09-05: "make it a single green dot not a
+        // circle dot". The ring is gone; the dot is half the quad across,
+        // which at barrel_reticle_size 0.010 is about half a degree, a rifle
+        // red dot. The same body serves the orange camera-forward mark when
+        // barrel_reticle = 2 (off in his cfg).
+        // BUILD 221: the PiP scope. The viewport is the eyepiece's bounding
+        // square; inside the circle the frame is sampled about the aim point
+        // at 1/zoom of the disc's own angular size, which is the magnification;
+        // a dark rim reads as the tube, a small mark sits on the aim point.
+        "float4 ps_pip(float4 pos : SV_Position,\n"
+        "              float2 uv : TEXCOORD0) : SV_Target {\n"
+        "    float2 d = uv - 0.5;\n"
+        "    float  r = length(d) * 2.0;\n"
+        "    if (r > 1.0) discard;\n"
+        "    float2 suv = pip_uv.xy + d * 2.0 * pip_uv.zw;\n"
+        "    float3 col = tex0.Sample(smp0, suv).rgb;\n"
+        "    if (r > 0.94) col *= 0.15;\n"
+        "    if (r < 0.030) col = float3(1.0, 0.25, 0.10);\n"
+        "    return float4(col, 1.0);\n"
+        "}\n"
+        "float4 ret_body(float2 uv, float3 col) {\n"
+        "    float r = length(uv - 0.5) * 2.0;\n"
+        "    if (r < 0.50) return float4(col, 1.0);\n"
+        "    discard;\n"
+        "    return float4(0, 0, 0, 0);\n"
+        "}\n"
+        "float4 ps_ret0(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target\n"
+        "    { return ret_body(uv, float3(0.10, 1.00, 0.25)); }\n"  // BARREL, green
+        "float4 ps_ret1(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target\n"
+        "    { return ret_body(uv, float3(1.00, 0.30, 0.10)); }\n"; // GAZE, orange
 
     ID3DBlob* vsb = nullptr;
     ID3DBlob* psb = nullptr;
@@ -2196,6 +3960,34 @@ bool create_blit_resources(const d3d11::State& st) {
         D3D11_DEPTH_STENCIL_DESC dd{};   // depth and stencil both disabled
         ok = SUCCEEDED(st.device->CreateDepthStencilState(&dd, &g_blit_dss));
     }
+    // BUILD 221: the PiP scope shader and its constant buffer, OPTIONAL like
+    // the dot: a failure costs the disc, never the blit.
+    if (ok) {
+        ID3DBlob* pb = nullptr;
+        ID3DBlob* pe = nullptr;
+        if (SUCCEEDED(compile(kSrc, sizeof(kSrc) - 1, "grwxr_blit", nullptr,
+                              nullptr, "ps_pip", "ps_4_0", 0, 0, &pb, &pe))) {
+            if (FAILED(st.device->CreatePixelShader(pb->GetBufferPointer(),
+                                                    pb->GetBufferSize(),
+                                                    nullptr, &g_pip_ps)))
+                LOG_WARN("VR: 221 pip shader creation failed, no PiP scope");
+            pb->Release();
+        } else {
+            LOG_WARN("VR: 221 pip shader compile failed, no PiP scope: %s",
+                     pe ? (const char*)pe->GetBufferPointer() : "?");
+        }
+        if (pe) pe->Release();
+        if (g_pip_ps) {
+            D3D11_BUFFER_DESC bd{};
+            bd.ByteWidth      = 16;
+            bd.Usage          = D3D11_USAGE_DEFAULT;
+            bd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+            if (FAILED(st.device->CreateBuffer(&bd, nullptr, &g_pip_cb))) {
+                LOG_WARN("VR: 221 pip constant buffer failed, no PiP scope");
+                g_pip_ps->Release(); g_pip_ps = nullptr;
+            }
+        }
+    }
     if (ok) {
         // 2026-08-12: straight alpha blending, for the settings panel only.
         // Menu::render() clears its target to alpha 0.92, so the panel is
@@ -2223,6 +4015,8 @@ bool create_blit_resources(const d3d11::State& st) {
         if (g_blit_rs)   { g_blit_rs->Release();   g_blit_rs   = nullptr; }
         if (g_blit_samp) { g_blit_samp->Release(); g_blit_samp = nullptr; }
         if (g_blit_ps)   { g_blit_ps->Release();   g_blit_ps   = nullptr; }
+        if (g_pip_ps)    { g_pip_ps->Release();    g_pip_ps    = nullptr; }   // BUILD 221
+        if (g_pip_cb)    { g_pip_cb->Release();    g_pip_cb    = nullptr; }
         if (g_blit_vs)   { g_blit_vs->Release();   g_blit_vs   = nullptr; }
     }
     // Build 24: the dot shader is OPTIONAL: a failure only costs the
@@ -2306,6 +4100,41 @@ bool create_blit_resources(const d3d11::State& st) {
                      "it. wp_markers=0 in grwxr.cfg hides them.",
                      made, kWpm);
         }
+
+        // BUILD 153: the evidence reticle shaders. Same independence rule
+        // again: if one fails to compile that mark is simply absent, and the
+        // build is still worth running with the other one.
+        {
+            const char* rnames[kRet] = {"ps_ret0", "ps_ret1"};
+            int made = 0;
+            for (int i = 0; i < kRet; ++i) {
+                ID3DBlob* rb = nullptr;
+                ID3DBlob* re = nullptr;
+                if (SUCCEEDED(compile(kSrc, sizeof(kSrc) - 1, "grwxr_blit",
+                                      nullptr, nullptr, rnames[i], "ps_4_0",
+                                      0, 0, &rb, &re))) {
+                    if (SUCCEEDED(st.device->CreatePixelShader(
+                            rb->GetBufferPointer(), rb->GetBufferSize(),
+                            nullptr, &g_ret_ps[i])))
+                        ++made;
+                    else
+                        LOG_WARN("VR: 153 reticle shader %d creation failed", i);
+                    rb->Release();
+                } else {
+                    LOG_WARN("VR: 153 reticle shader %s compile failed: %s",
+                             rnames[i],
+                             re ? (const char*)re->GetBufferPointer() : "?");
+                }
+                if (re) re->Release();
+            }
+            LOG_INFO("VR: 153 evidence reticle shaders armed (%d/%d). "
+                     "GREEN ring = the published barrel direction from your "
+                     "muzzle, ORANGE ring = camera forward. Both at "
+                     "barrel_reticle_dist metres, so their separation is the "
+                     "head-versus-barrel divergence. barrel_reticle=0 off, "
+                     "1 barrel only, 2 both.",
+                     made, kRet);
+        }
     }
     return ok;
 }
@@ -2314,7 +4143,14 @@ bool create_blit_resources(const d3d11::State& st) {
 // BUILD 11a: acquire one image of the eye's canvas, clear it black, DRAW the
 // eye's captured frame (g_last mips) at the angular size of `fovy`, release.
 // Assumes blit_bind() state is current. Render thread, no logging (rule 8).
-bool blit_into(int eye, ID3D11DeviceContext* ctx, float fovy) {
+// BUILD 247: `src` and `aspect` are the true-stereo hooks. Left at their defaults (null, 0) the eye's own
+// last-frame texture and the backbuffer's aspect are used and the function is the build 246 function. With
+// them set, `src` is the SRV of the eye's half of the backbuffer and `aspect` is that half's width over its
+// height, which is the content's angular extent: tan_h = tan_v * aspect.
+bool blit_into(int eye, ID3D11DeviceContext* ctx, float fovy,
+               ID3D11ShaderResourceView* src = nullptr, float aspect = 0.0f,
+               float* out_tan_h = nullptr, float* out_tan_v = nullptr) {   // BUILD 248: the extents actually used
+    ID3D11ShaderResourceView* src_srv = src ? src : g_last_srv[eye];
     if (fovy < 0.05f) fovy = 0.05f;      // keep the viewport inside D3D11's
     if (fovy > 2.60f) fovy = 2.60f;      // +-32k coordinate bounds
     // BUILD 11e: scoped frames display across the fixed window, not their
@@ -2325,11 +4161,20 @@ bool blit_into(int eye, ID3D11DeviceContext* ctx, float fovy) {
         fovy = g_scope_disp_fov;
     uint32_t idx = 0;
     XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    if (XR_FAILED(xrAcquireSwapchainImage(g_swapchains[eye], &ai, &idx))) return false;
+    ph(kPhAcquireBlit, eye);
+    if (XR_FAILED(xrAcquireSwapchainImage(g_swapchains[eye], &ai, &idx))) {
+        ph(kPhDone);
+        return false;
+    }
     XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wi.timeout = XR_INFINITE_DURATION;
+    wi.timeout = img_wait_timeout();
     bool drawn = false;
-    if (XR_SUCCEEDED(xrWaitSwapchainImage(g_swapchains[eye], &wi)) &&
+    ph(kPhWaitBlit, eye);
+    const XrResult wr = xrWaitSwapchainImage(g_swapchains[eye], &wi);
+    ph(kPhDone);
+    if (wr == XR_TIMEOUT_EXPIRED)
+        g_img_to_blit.fetch_add(1, std::memory_order_relaxed);
+    if (XR_SUCCEEDED(wr) && wr != XR_TIMEOUT_EXPIRED &&
         idx < g_rtv[eye].size() && g_rtv[eye][idx]) {
         const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
         ctx->ClearRenderTargetView(g_rtv[eye][idx], black);
@@ -2337,7 +4182,9 @@ bool blit_into(int eye, ID3D11DeviceContext* ctx, float fovy) {
         // center; the viewport is that span in canvas pixels. Fractional
         // placement is intended (viewports are float); the sampler resolves it.
         const float tan_v = tanf(0.5f * fovy);
-        const float tan_h = tan_v * ((float)g_content_w / (float)g_content_h);
+        const float tan_h = tan_v * (aspect > 0.0f ? aspect : ((float)g_content_w / (float)g_content_h));
+        if (out_tan_h) *out_tan_h = tan_h;
+        if (out_tan_v) *out_tan_v = tan_v;
         D3D11_VIEWPORT vp;
         vp.TopLeftX = g_cx[eye] - tan_h * g_sx[eye];
         vp.TopLeftY = g_cy[eye] - tan_v * g_sy[eye];
@@ -2346,10 +4193,42 @@ bool blit_into(int eye, ID3D11DeviceContext* ctx, float fovy) {
         vp.MinDepth = 0.0f;
         vp.MaxDepth = 1.0f;
         ctx->RSSetViewports(1, &vp);
-        ctx->PSSetShaderResources(0, 1, &g_last_srv[eye]);
+        ctx->PSSetShaderResources(0, 1, &src_srv);
         ctx->OMSetRenderTargets(1, &g_rtv[eye][idx], nullptr);
         ctx->Draw(3, 0);
         drawn = true;
+
+        // BUILD 221: the PiP scope, drawn over the content with the content
+        // itself as the source (still bound at t0). The disc's viewport is the
+        // eyepiece's bounding square in this eye; the constant buffer carries
+        // the aim point's uv in the frame and the half extent at this zoom.
+        if (g_pip_show && g_pip_ps && g_pip_cb) {
+            const float tr = g_pip_tr[eye];
+            const float rx = tr * g_sx[eye], ry = tr * g_sy[eye];
+            float zoom = g_pip_zoom;
+            if (!(zoom >= 1.2f)) zoom = 1.2f;   // BUILD 237: the user range
+            if (zoom > 4.0f) zoom = 4.0f;
+            // BUILD 237: this eye's own latched aim tangent, not the shared
+            // pair. See the note at g_pip_atx_eye.
+            const float cb[4] = {
+                0.5f + g_pip_atx_eye[eye] / (2.0f * tan_h),
+                0.5f - g_pip_aty_eye[eye] / (2.0f * tan_v),
+                (tr / zoom) / (2.0f * tan_h),
+                (tr / zoom) / (2.0f * tan_v)};
+            ctx->UpdateSubresource(g_pip_cb, 0, nullptr, cb, 0, 0);
+            ctx->PSSetConstantBuffers(0, 1, &g_pip_cb);
+            D3D11_VIEWPORT pv;
+            pv.TopLeftX = g_cx[eye] + g_pip_tx[eye] * g_sx[eye] - rx;
+            pv.TopLeftY = g_cy[eye] - g_pip_ty[eye] * g_sy[eye] - ry;
+            pv.Width    = 2.0f * rx;
+            pv.Height   = 2.0f * ry;
+            pv.MinDepth = 0.0f;
+            pv.MaxDepth = 1.0f;
+            ctx->RSSetViewports(1, &pv);
+            ctx->PSSetShader(g_pip_ps, nullptr, 0);
+            ctx->Draw(3, 0);
+            ctx->PSSetShader(g_blit_ps, nullptr, 0);
+        }
 
         // Build 24: the aim reticle rides the same acquire. Zero-disparity
         // placement (same angular offset in both eyes = optical infinity),
@@ -2407,6 +4286,26 @@ bool blit_into(int eye, ID3D11DeviceContext* ctx, float fovy) {
             ctx->PSSetShader(g_blit_ps, nullptr, 0);
         }
 
+        // Build 153: the evidence reticle, same mechanism, drawn after the
+        // markers so it is never hidden behind one. Fixed angular size, so
+        // unlike the markers the radius does not come from the distance.
+        for (int i = 0; i < kRet; ++i) {
+            if (!g_ret_on[i] || !g_ret_ps[i]) continue;
+            const float rx = g_ret_size * g_sx[eye];
+            const float ry = g_ret_size * g_sy[eye];
+            D3D11_VIEWPORT rv;
+            rv.TopLeftX = g_cx[eye] + g_ret_tx[i][eye] * g_sx[eye] - rx;
+            rv.TopLeftY = g_cy[eye] - g_ret_ty[i][eye] * g_sy[eye] - ry;
+            rv.Width    = 2.0f * rx;
+            rv.Height   = 2.0f * ry;
+            rv.MinDepth = 0.0f;
+            rv.MaxDepth = 1.0f;
+            ctx->RSSetViewports(1, &rv);
+            ctx->PSSetShader(g_ret_ps[i], nullptr, 0);
+            ctx->Draw(3, 0);
+            ctx->PSSetShader(g_blit_ps, nullptr, 0);
+        }
+
         // 2026-08-12: the settings panel, drawn last so it sits over
         // everything else. Same viewport-as-bounding-box trick as the markers,
         // which is all it needs: the blit vertex shader already spreads uv 0..1
@@ -2442,7 +4341,7 @@ bool blit_into(int eye, ID3D11DeviceContext* ctx, float fovy) {
             ctx->Draw(3, 0);
             if (g_menu_blend) ctx->OMSetBlendState(nullptr, bf, 0xFFFFFFFFu);
             // Put the eye texture back for anything drawn after this.
-            ctx->PSSetShaderResources(0, 1, &g_last_srv[eye]);
+            ctx->PSSetShaderResources(0, 1, &src_srv);
         }
 
         // 11a.2 one-shot probe: read one pixel of the blit source and one of
@@ -2503,6 +4402,23 @@ bool create_canvases(const d3d11::State& st, const XrView views[2]) {
     g_sc_w = ((uint32_t)(tw * ppt + 0.5f) + 1u) & ~1u;
     g_sc_h = ((uint32_t)(th * ppt + 0.5f) + 1u) & ~1u;
 
+    // BUILD 229: cap at what the runtime asked for, with the game's own
+    // content size as a hard floor. The floor matters: copy_into copies a
+    // content-sized box into this canvas and the dst-offset arithmetic below
+    // computes g_sc_w - g_content_w unsigned, so a canvas narrower than the
+    // content would underflow it. Each axis is capped independently, which is
+    // fine because g_sx and g_sy are derived per axis further down.
+    const uint32_t was_w = g_sc_w, was_h = g_sc_h;
+    if (g_cfg_canvas_clamp.load(std::memory_order_relaxed) && g_rec_w && g_rec_h) {
+        const uint32_t cap_w = g_rec_w > g_content_w ? g_rec_w : g_content_w;
+        const uint32_t cap_h = g_rec_h > g_content_h ? g_rec_h : g_content_h;
+        if (g_sc_w > cap_w) g_sc_w = (cap_w + 1u) & ~1u;
+        if (g_sc_h > cap_h) g_sc_h = (cap_h + 1u) & ~1u;
+    }
+    if (g_max_w && g_sc_w > g_max_w) g_sc_w = g_max_w & ~1u;
+    if (g_max_h && g_sc_h > g_max_h) g_sc_h = g_max_h & ~1u;
+    g_clamp_from_w = was_w; g_clamp_from_h = was_h;
+
     for (int eye = 0; eye < 2; ++eye) {
         XrSwapchainCreateInfo scci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
         scci.usageFlags  = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
@@ -2513,11 +4429,16 @@ bool create_canvases(const d3d11::State& st, const XrView views[2]) {
         scci.faceCount   = 1;
         scci.arraySize   = 1;
         scci.mipCount    = 1;
-        if (XR_FAILED(xrCreateSwapchain(g_session, &scci, &g_swapchains[eye])))
+        ph(kPhCreateSwapchain, eye);
+        if (XR_FAILED(xrCreateSwapchain(g_session, &scci, &g_swapchains[eye]))) {
+            ph(kPhDone);
             return false;
+        }
 
         uint32_t ic = 0;
+        ph(kPhEnumImages, eye);
         xrEnumerateSwapchainImages(g_swapchains[eye], 0, &ic, nullptr);
+        ph(kPhDone);
         g_images[eye].assign(ic, XrSwapchainImageD3D11KHR{XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
         if (XR_FAILED(xrEnumerateSwapchainImages(g_swapchains[eye], ic, &ic,
                                                  (XrSwapchainImageBaseHeader*)g_images[eye].data())))
@@ -2582,7 +4503,7 @@ bool create_canvases(const d3d11::State& st, const XrView views[2]) {
 
 // BUILD 118: DEPTH CANDIDATE PROBE. Log only, latched once, then never again.
 //
-// The stale-eye reprojection the project spec calls "the single most important delta
+// The stale-eye reprojection CLAUDE.md calls "the single most important delta
 // from the reference" needs a depth buffer per eye. The mod has never captured
 // one. It does, however, ALREADY hold the game's depth-stencil view: ctx_save
 // calls OMGetRenderTargets and stores s.dsv, purely so ctx_restore can put it
@@ -2669,6 +4590,212 @@ void probe_depth_once(const CtxState& s) {
     res->Release();
 }
 
+// ---------------------------------------------------------------------------
+// BUILD 233: UNIVERSAL OPENXR API LAYER SUPPRESSION. See the cfg block above
+// for the evidence. Everything here runs once, on the init thread, before
+// xrCreateInstance, and it logs whatever it finds whether it acts or not.
+// ---------------------------------------------------------------------------
+
+// The manifest scanner itself lives in src\XrLayers.h so tools\layertest can
+// run it against real manifests without the game. See that header for why it
+// is a scan and not a JSON parse.
+
+bool read_file_text(const char* path, std::string& out) {
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > (1 << 20)) {
+        CloseHandle(h);
+        return false;
+    }
+    out.resize((size_t)sz.QuadPart);
+    DWORD got = 0;
+    BOOL ok = ReadFile(h, &out[0], (DWORD)sz.QuadPart, &got, nullptr);
+    CloseHandle(h);
+    if (!ok) return false;
+    out.resize(got);
+    return true;
+}
+
+// Case-insensitive membership in the comma-separated xr_layer_allow list.
+bool layer_is_allowed(const char* name) {
+    if (!g_cfg_layer_allow[0]) return false;
+    std::string list = g_cfg_layer_allow, item;
+    for (size_t i = 0; i <= list.size(); ++i) {
+        if (i == list.size() || list[i] == ',') {
+            size_t s = item.find_first_not_of(" \t");
+            size_t e = item.find_last_not_of(" \t");
+            if (s != std::string::npos && _stricmp(item.substr(s, e - s + 1).c_str(),
+                                                   name) == 0)
+                return true;
+            item.clear();
+        } else {
+            item += list[i];
+        }
+    }
+    return false;
+}
+
+// Walk one hive's Implicit key. Returns how many enabled layers it suppressed.
+int suppress_hive(HKEY root, const char* hive_name) {
+    HKEY key = nullptr;
+    LONG r = RegOpenKeyExA(root, "SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit",
+                           0, KEY_READ, &key);
+    if (r != ERROR_SUCCESS) {
+        // ERROR_FILE_NOT_FOUND is the ordinary case: most machines have no
+        // HKCU key at all. Anything else is worth a line.
+        if (r != ERROR_FILE_NOT_FOUND)
+            LOG_INFO("VR: layers: %s implicit key unreadable (error %ld)", hive_name, r);
+        return 0;
+    }
+
+    int suppressed = 0;
+    for (DWORD i = 0;; ++i) {
+        char  path[1024];
+        DWORD path_len = (DWORD)sizeof(path);
+        DWORD type = 0, data = 0, data_len = (DWORD)sizeof(data);
+        LONG e = RegEnumValueA(key, i, path, &path_len, nullptr, &type,
+                               (LPBYTE)&data, &data_len);
+        if (e == ERROR_NO_MORE_ITEMS) break;
+        if (e != ERROR_SUCCESS) {
+            LOG_INFO("VR: layers: %s enum stopped at index %lu (error %ld)",
+                     hive_name, i, e);
+            break;
+        }
+        if (type != REG_DWORD) data = 0;   // treat a non-DWORD as enabled
+
+        std::string text, name, disable_env;
+        bool parsed = read_file_text(path, text);
+        if (parsed) {
+            xrlayers::layer_name(text, name);
+            xrlayers::disable_env(text, disable_env);
+        }
+        const char* shown = name.empty() ? "(name unreadable)" : name.c_str();
+
+        if (data != 0) {
+            LOG_INFO("VR: layers: %s %s ALREADY OFF at the registry (%s)",
+                     hive_name, shown, path);
+            continue;
+        }
+        if (!parsed) {
+            LOG_WARN("VR: layers: %s manifest could NOT BE READ, so this layer "
+                     "cannot be switched off and stays in the path: %s "
+                     "(error %lu)", hive_name, path, GetLastError());
+            continue;
+        }
+        if (layer_is_allowed(shown)) {
+            LOG_INFO("VR: layers: %s %s KEPT by xr_layer_allow", hive_name, shown);
+            continue;
+        }
+        if (disable_env.empty()) {
+            LOG_WARN("VR: layers: %s %s is ENABLED and its manifest carries NO "
+                     "disable_environment, so it CANNOT be switched off and "
+                     "stays in the path: %s", hive_name, shown, path);
+            continue;
+        }
+        SetEnvironmentVariableA(disable_env.c_str(), "1");
+        ++suppressed;
+        // BUILD 236: the manifest path belongs on this line too. Every other
+        // outcome above prints it, and without it the SUPPRESSED line is the
+        // one case where a tester's log cannot be traced back to a file on
+        // their disk.
+        LOG_INFO("VR: layers: %s %s SUPPRESSED for this process (%s = 1) [%s]",
+                 hive_name, shown, disable_env.c_str(), path);
+    }
+    RegCloseKey(key);
+    return suppressed;
+}
+
+// BUILD 236: the layers that survived, remembered by name so the first-frame
+// watchdog can print them again at the moment of the stall. A tester's log is
+// thousands of lines long and the suppression block is at the very top of it;
+// repeating the list beside the failure means the two facts that matter -
+// "this hung" and "this was in the chain while it hung" - sit together.
+//
+// Written once on the init thread before any VR frame exists, read afterwards
+// on the render thread. There is no window where both happen at once.
+std::vector<std::string> g_layer_survivor_names;
+
+// Reprint the survivor list. Silent by design when nothing survived: on a
+// machine with a clean chain this must not add a line that reads like a fault.
+void log_layer_survivors(const char* when) {
+    if (g_layer_survivor_names.empty()) {
+        LOG_ERROR("xrlayers: no foreign OpenXR layer was in the chain %s, so a "
+                  "layer is NOT the explanation for this machine.", when);
+        return;
+    }
+    LOG_ERROR("xrlayers: %zu foreign OpenXR layer(s) were in the chain %s:",
+              g_layer_survivor_names.size(), when);
+    for (const std::string& n : g_layer_survivor_names)
+        LOG_ERROR("xrlayers:   %s", n.c_str());
+}
+
+// Returns how many foreign layers are STILL in our chain after everything
+// above has been tried. Zero is the healthy answer and the answer on every
+// machine that has ever completed a VR frame.
+uint32_t suppress_api_layers() {
+    // The two hardcoded names stay as a floor. If the registry walk is
+    // refused outright these are still the two layers we know by name, and
+    // when the walk works it finds the same two and sets them again.
+    SetEnvironmentVariableA("DISABLE_XR_APILAYER_NOVENDOR_OBSMirror", "1");
+    SetEnvironmentVariableA("DISABLE_XR_APILAYER_VIRTUALDESKTOP_OCULUS_COMPATIBILITY", "1");
+
+    if (!g_cfg_layer_suppress.load(std::memory_order_relaxed)) {
+        LOG_INFO("VR: layers: xr_layer_suppress = 0, only the two hardcoded "
+                 "names are set. This is the pre-233 behaviour.");
+    } else {
+        if (g_cfg_layer_allow[0])
+            LOG_INFO("VR: layers: xr_layer_allow = %s", g_cfg_layer_allow);
+        int n = suppress_hive(HKEY_LOCAL_MACHINE, "HKLM")
+              + suppress_hive(HKEY_CURRENT_USER,  "HKCU");
+        LOG_INFO("VR: layers: %d implicit layer(s) switched off for this "
+                 "process by the registry walk.", n);
+    }
+
+    // The verdict line. The loader honours the variables above at this call,
+    // so whatever it still reports is genuinely in our chain.
+    uint32_t unwanted = 0;   // survivors the user did NOT ask to keep
+    g_layer_survivor_names.clear();   // BUILD 236
+    uint32_t lc = 0;
+    xrEnumerateApiLayerProperties(0, &lc, nullptr);
+    std::vector<XrApiLayerProperties> lps(lc, {XR_TYPE_API_LAYER_PROPERTIES});
+    if (lc) xrEnumerateApiLayerProperties(lc, &lc, lps.data());
+    if (lc == 0) {
+        LOG_INFO("VR: 0 API layer(s) visible after suppression. Nothing "
+                 "foreign is in the OpenXR chain.");
+    } else {
+        // Loud, because every wedged machine we can currently reach has
+        // exactly one of these and every machine that runs has none.
+        LOG_WARN("VR: %u API layer(s) STILL VISIBLE after suppression. A "
+                 "foreign layer sits inside every OpenXR call this mod makes:",
+                 lc);
+        for (uint32_t i = 0; i < lc; ++i) {
+            bool chosen = layer_is_allowed(lps[i].layerName);
+            LOG_WARN("VR:   %s (v%u) %s%s", lps[i].layerName,
+                     lps[i].layerVersion, lps[i].description,
+                     chosen ? "  [KEPT ON PURPOSE by xr_layer_allow]" : "");
+            // BUILD 236: kept for the watchdog. Allow-listed ones go in too:
+            // the question the watchdog answers is "what was in the chain",
+            // and a layer the user asked to keep is still in the chain.
+            {
+                std::string n = lps[i].layerName;
+                if (chosen) n += "  [kept on purpose by xr_layer_allow]";
+                g_layer_survivor_names.push_back(n);
+            }
+            // A layer the user named in xr_layer_allow is their decision and
+            // does not count toward the stand-down: they asked for it, they
+            // were told what it risks, and overriding that would be the mod
+            // deciding for them.
+            if (!chosen) ++unwanted;
+        }
+        LOG_WARN("VR: if the first frame never completes, this is the first "
+                 "thing to switch off. Set its registry DWORD to 1 under "
+                 "SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit and relaunch.");
+    }
+    return unwanted;
+}
+
 }  // namespace
 
 bool begin_and_arm();   // build 38, defined below
@@ -2683,22 +4810,51 @@ bool init(const d3d11::State& st) {
     LOG_INFO("VR: initialising OpenXR on the game's D3D11 device");
     load_config();
 
-    // BUILD 10d: two foreign implicit API layers sit inside every call we
-    // make (flagged by the session 1 probe, confirmed enabled in the
-    // registry): OBS Mirror and Virtual Desktop's Oculus compatibility shim.
-    // The mod needs neither, and both are suspects for the offset-independent
-    // monocular doubling. Each honors a disable_environment variable that the
-    // loader reads at instance creation, so setting them here suppresses the
-    // layers for this process only.
-    SetEnvironmentVariableA("DISABLE_XR_APILAYER_NOVENDOR_OBSMirror", "1");
-    SetEnvironmentVariableA("DISABLE_XR_APILAYER_VIRTUALDESKTOP_OCULUS_COMPATIBILITY", "1");
-    uint32_t lc = 0;
-    xrEnumerateApiLayerProperties(0, &lc, nullptr);
-    std::vector<XrApiLayerProperties> lps(lc, {XR_TYPE_API_LAYER_PROPERTIES});
-    if (lc) xrEnumerateApiLayerProperties(lc, &lc, lps.data());
-    LOG_INFO("VR: %u API layer(s) visible after suppression%s", lc,
-             lc ? ":" : ". OBS Mirror and VD compatibility are out of the path.");
-    for (uint32_t i = 0; i < lc; ++i) LOG_INFO("VR:   %s", lps[i].layerName);
+    // BUILD 10d, REPLACED BY BUILD 233: foreign implicit API layers sit inside
+    // every OpenXR call this mod makes. 10d killed the two this machine had by
+    // hardcoded name; 233 reads the machine's own registry and manifests and
+    // switches off whatever is actually there. load_config() ran directly
+    // above, so xr_layer_suppress and xr_layer_allow are current.
+    uint32_t survivors = suppress_api_layers();
+
+    // BUILD 234: THE GAME NEVER DIES FOR THIS AGAIN.
+    //
+    // If a foreign layer is STILL in the chain here, we have tried everything
+    // we can and failed: its manifest carries no disable_environment, or the
+    // manifest could not be read, or the user allow-listed it. That is the
+    // exact configuration that kills the game today. The mod cannot rescue it
+    // later either: the wedge parks the game's own render thread inside the
+    // first Present, and no watchdog thread can unblock another thread that
+    // is already stuck in a runtime call.
+    //
+    // So decide it HERE, before a session exists, where bailing out is free.
+    // The game then runs flat, on its own monitor, exactly as if the mod were
+    // not installed, and the log says which layer and what to do about it.
+    // "No VR, and here is the one line telling you why" beats "black screen,
+    // back to your launcher, no idea".
+    //
+    // This cannot cost anyone their VR: every machine that has ever completed
+    // a frame reports zero layers here, and every machine that reports one is
+    // already failing to start. xr_layer_bail = 0 for the user who wants to
+    // try anyway.
+    if (survivors && g_cfg_layer_bail.load(std::memory_order_relaxed)) {
+        LOG_ERROR("VR: STANDING DOWN BEFORE STARTING. %u foreign OpenXR layer(s) "
+                  "are in the chain and could not be switched off, and that is "
+                  "the configuration that hangs this game on the first frame.",
+                  survivors);
+        LOG_ERROR("VR: THE GAME WILL NOW RUN NORMALLY ON YOUR MONITOR, WITHOUT "
+                  "VR. Nothing is broken and nothing needs reinstalling.");
+        LOG_ERROR("VR: TO GET VR BACK: switch the layer(s) named above off. In "
+                  "regedit, under HKEY_LOCAL_MACHINE\\SOFTWARE\\Khronos\\OpenXR"
+                  "\\1\\ApiLayers\\Implicit, set that layer's value to 1, then "
+                  "relaunch. Most are a checkbox in the program that installed "
+                  "them (ReShade's setup, OBS, OpenXR Toolkit).");
+        LOG_ERROR("VR: to skip this check and start VR anyway, set "
+                  "xr_layer_bail = 0 in grwxr.cfg. The game may then hang on "
+                  "the first frame, which is what this check exists to prevent.");
+        g_failed.store(true);
+        return false;
+    }
 
     // --- extensions ---
     uint32_t n = 0;
@@ -2783,6 +4939,40 @@ bool init(const d3d11::State& st) {
                  sp.graphicsProperties.maxLayerCount);
     } else {
         LOG_WARN("VR: headset name unavailable (xrGetSystemProperties failed)");
+    }
+
+    {   // BUILD 229: what size does the runtime actually want? Never asked
+        // before this build. Log it whatever the clamp is set to, so the
+        // numbers are on record even when the clamp is off.
+        uint32_t vc = 0;
+        XrResult vr_r = xrEnumerateViewConfigurationViews(
+            g_instance, g_system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+            0, &vc, nullptr);
+        if (XR_SUCCEEDED(vr_r) && vc >= 1) {
+            std::vector<XrViewConfigurationView> vcv(
+                vc, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+            vr_r = xrEnumerateViewConfigurationViews(
+                g_instance, g_system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                vc, &vc, vcv.data());
+            if (XR_SUCCEEDED(vr_r) && vc >= 1) {
+                g_rec_w = vcv[0].recommendedImageRectWidth;
+                g_rec_h = vcv[0].recommendedImageRectHeight;
+                g_max_w = vcv[0].maxImageRectWidth;
+                g_max_h = vcv[0].maxImageRectHeight;
+                LOG_INFO("VR: 229 the runtime recommends %ux%u per eye "
+                         "(max %ux%u, %u view(s), %u sample(s)). canvas_clamp "
+                         "= %d: the canvas is capped at this, and never below "
+                         "the game's own content size.",
+                         g_rec_w, g_rec_h, g_max_w, g_max_h, vc,
+                         vcv[0].recommendedSwapchainSampleCount,
+                         g_cfg_canvas_clamp.load(std::memory_order_relaxed));
+            }
+        }
+        if (!g_rec_w)
+            LOG_WARN("VR: 229 xrEnumerateViewConfigurationViews gave nothing "
+                     "(result %d). The canvas clamp is INERT this run and the "
+                     "canvas is sized exactly as it was before build 229.",
+                     (int)vr_r);
     }
 
     // The runtime dictates which adapter. If the game's device is on a different
@@ -2885,6 +5075,22 @@ bool init(const d3d11::State& st) {
     vsci.poseInReferenceSpace.orientation.w = 1.0f;
     r = xrCreateReferenceSpace(g_session, &vsci, &g_view_space);
     if (XR_FAILED(r)) return fail("xrCreateReferenceSpace(VIEW)", r);
+    // BUILD 205: a STAGE space alongside, for the head's height above the
+    // physical floor (immune to recenter). Optional: a runtime without a
+    // floor leaves it null and the stance loop falls back to the LOCAL
+    // height plus an assumed standing eye height.
+    {
+        XrReferenceSpaceCreateInfo ssci{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+        ssci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+        ssci.poseInReferenceSpace.orientation.w = 1.0f;
+        const XrResult sr = xrCreateReferenceSpace(g_session, &ssci, &g_stage_space);
+        if (XR_FAILED(sr)) {
+            g_stage_space = XR_NULL_HANDLE;
+            LOG_INFO("stance: no STAGE space on this runtime (%d); the head's height comes from LOCAL plus 1.65 m.", (int)sr);
+        } else {
+            LOG_INFO("stance: STAGE space created; the head's height above the floor is read every frame.");
+        }
+    }
 
     // BUILD 13b: controller input plumbing. Every step is checked; a failure
     // logs which call died and disables input for the run WITHOUT failing the
@@ -2910,6 +5116,20 @@ bool init(const d3d11::State& st) {
         aci.subactionPaths = g_hand;
         ir = xrCreateAction(g_actionset, &aci, &g_act_aim);
         if (XR_FAILED(ir)) { LOG_INFO("VR: 13b create aim_pose FAILED %d, input disabled", (int)ir); return false; }
+
+        // BUILD 162: the GRIP pose, the anatomical frame OpenXR defines for
+        // the hand itself (+X palm normal, -Z little finger to thumb, +Y by
+        // the right-hand rule). Non-fatal, unlike the rest of this block:
+        // the aim pose stays the aim, and the whole input surface must not
+        // be lost to a runtime that cannot supply this one.
+        aci = {XR_TYPE_ACTION_CREATE_INFO};
+        aci.actionType = XR_ACTION_TYPE_POSE_INPUT;
+        strcpy_s(aci.actionName, "grip_pose");
+        strcpy_s(aci.localizedActionName, "Grip pose");
+        aci.countSubactionPaths = 2;
+        aci.subactionPaths = g_hand;
+        ir = xrCreateAction(g_actionset, &aci, &g_act_gpose);
+        if (XR_FAILED(ir)) { LOG_INFO("VR: 162 create grip_pose FAILED %d, absolute wrist unavailable", (int)ir); g_act_gpose = XR_NULL_HANDLE; }
 
         aci = {XR_TYPE_ACTION_CREATE_INFO};
         aci.actionType = XR_ACTION_TYPE_FLOAT_INPUT;
@@ -2958,6 +5178,7 @@ bool init(const d3d11::State& st) {
         // the controller, exactly what gun direction wants), trigger value,
         // and grip (squeeze) value.
         XrPath prof, p_aim[2], p_trig[2], p_grip[2];
+        XrPath p_gpose[2] = {XR_NULL_PATH, XR_NULL_PATH};   // BUILD 162
         XrPath p_stick[2], p_stickclk[2], p_a, p_b, p_x, p_y, p_menu;
         if (XR_FAILED(xrStringToPath(g_instance, "/interaction_profiles/oculus/touch_controller", &prof)) ||
             XR_FAILED(xrStringToPath(g_instance, "/user/hand/left/input/aim/pose",       &p_aim[0]))  ||
@@ -2978,7 +5199,13 @@ bool init(const d3d11::State& st) {
             LOG_INFO("VR: 13b binding paths FAILED, input disabled");
             return false;
         }
-        XrActionSuggestedBinding sb[15] = {
+        // BUILD 162: the grip pose paths, non-fatal. The two grip-pose rows
+        // sit LAST in the table so a count of 15 leaves them out.
+        const bool gpose_ok = g_act_gpose != XR_NULL_HANDLE &&
+            XR_SUCCEEDED(xrStringToPath(g_instance, "/user/hand/left/input/grip/pose",  &p_gpose[0])) &&
+            XR_SUCCEEDED(xrStringToPath(g_instance, "/user/hand/right/input/grip/pose", &p_gpose[1]));
+        if (!gpose_ok) LOG_INFO("VR: 162 grip pose paths unavailable, absolute wrist unavailable");
+        XrActionSuggestedBinding sb[17] = {
             {g_act_aim,      p_aim[0]},      {g_act_aim,      p_aim[1]},
             {g_act_trig,     p_trig[0]},     {g_act_trig,     p_trig[1]},
             {g_act_grip,     p_grip[0]},     {g_act_grip,     p_grip[1]},
@@ -2987,10 +5214,11 @@ bool init(const d3d11::State& st) {
             {g_act_btn_a,    p_a},           {g_act_btn_b,    p_b},
             {g_act_btn_x,    p_x},           {g_act_btn_y,    p_y},
             {g_act_menu,     p_menu},
+            {g_act_gpose,    p_gpose[0]},    {g_act_gpose,    p_gpose[1]},
         };
         XrInteractionProfileSuggestedBinding ipsb{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
         ipsb.interactionProfile = prof;
-        ipsb.countSuggestedBindings = 15;
+        ipsb.countSuggestedBindings = gpose_ok ? 17 : 15;
         ipsb.suggestedBindings = sb;
         ir = xrSuggestInteractionProfileBindings(g_instance, &ipsb);
         if (XR_FAILED(ir)) { LOG_INFO("VR: 13b suggest bindings FAILED %d, input disabled", (int)ir); return false; }
@@ -3009,7 +5237,21 @@ bool init(const d3d11::State& st) {
             ir = xrCreateActionSpace(g_session, &aspci, &g_aim_space[h]);
             if (XR_FAILED(ir)) { LOG_INFO("VR: 13b action space %d FAILED %d, input disabled", h, (int)ir); return false; }
         }
-        LOG_INFO("VR: 13b input plumbing up (aim pose + trigger + grip, both hands, Touch profile)");
+        // BUILD 162: a space per hand for the grip pose, non-fatal.
+        if (gpose_ok) {
+            for (int h = 0; h < 2; ++h) {
+                XrActionSpaceCreateInfo gsci{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+                gsci.action = g_act_gpose;
+                gsci.subactionPath = g_hand[h];
+                gsci.poseInActionSpace.orientation.w = 1.0f;
+                if (XR_FAILED(xrCreateActionSpace(g_session, &gsci, &g_grip_space[h]))) {
+                    LOG_INFO("VR: 162 grip pose space %d FAILED, absolute wrist unavailable", h);
+                    g_grip_space[h] = XR_NULL_HANDLE;
+                }
+            }
+        }
+        LOG_INFO("VR: 13b input plumbing up (aim pose + trigger + grip, both hands, Touch profile; grip pose %s)",
+                 (gpose_ok && g_grip_space[0] && g_grip_space[1]) ? "bound" : "UNBOUND");
         return true;
     }();
 
@@ -3164,10 +5406,14 @@ bool begin_and_arm() {
     // advertising the old map, so the log told the tester to press Numpad 8
     // for first person when Numpad 8 had become an empty preset slot. A stale
     // key banner is worse than no banner: it is the mod lying about itself.
-    LOG_INFO("VR: keys: F1 panel, F2 first person, Home recenter (Space too, "
-             "but Space also vaults), Numpad 1..9 then 0 LOAD A WHOLE PRESET "
-             "from GRWVR\\presets (each one says its name), Numpad Decimal "
-             "head aim, Numpad Minus palette capture.");
+    LOG_INFO("VR: keys: F1 panel, F2 first person, F3 ARM CALIBRATION (press "
+             "it, let go, then stand with both controllers straight out to "
+             "your sides at shoulder height and hold; it speaks when it "
+             "fires, applies the arm scale and puts you in first person), "
+             "Home recenter (Space too, but Space also vaults), Numpad 1..9 "
+             "then 0 LOAD A WHOLE PRESET from GRWVR\\presets (each one says "
+             "its name), Numpad Decimal head aim, Numpad Minus palette "
+             "capture.");
     LOG_INFO("VR: what moved in build 129: barrel aim, ADS, eye swap and the "
              "camera pose write are Settings rows in the F1 panel; the "
              "weapon-draw recorder and first person are Captures rows. The "
@@ -3344,7 +5590,508 @@ bool acquire_frame_state(XrFrameState& fs) {
     return g_wait_ok.load(std::memory_order_acquire);
 }
 
+// BUILD 203: the level pose. Build 202 used a swing-twist decomposition about
+// the view's own Z axis, which is NOT the roll against gravity: a level head
+// looking left and down has a large "twist" in that decomposition (45 degrees
+// at yaw 90 and pitch 45, rolltest203.py), so the image was rotated by it and
+// the corners went black: "why is it on a screen again? its like the fov has
+// be tightened and the head stracking is worse" (2026-09-06 19:13, build 202
+// REFUTED, rolled back by cfg). The pose the content deserves is the head's
+// yaw and pitch with no roll: the frame whose forward is the head's forward
+// and whose right axis is horizontal in the reference space (LOCAL space, +Y
+// up). right = f x up, up' = right x f, R = [right | up' | -f], then the
+// quaternion. Exact for every yaw and pitch (residual 0.0000 degrees over
+// 20000 random heads in the test); the roll it removes is reported on the 1 Hz
+// line. Looking within about three degrees of straight up or down the roll is
+// undefined and the pose passes through untouched.
+static XrQuaternionf strip_roll_xr(XrQuaternionf q) {
+    const float x = q.x, y = q.y, z = q.z, w = q.w;
+    // the head's forward in the reference space: q rotates the local (0,0,-1)
+    const float v[3] = {0.0f, 0.0f, -1.0f};
+    const float cx = y * v[2] - z * v[1], cy = z * v[0] - x * v[2], cz = x * v[1] - y * v[0];
+    const float f[3] = {v[0] + 2.0f * (w * cx + y * cz - z * cy),
+                        v[1] + 2.0f * (w * cy + z * cx - x * cz),
+                        v[2] + 2.0f * (w * cz + x * cy - y * cx)};
+    // right = f x up with up = +Y: (-f.z, 0, f.x)
+    float r[3] = {-f[2], 0.0f, f[0]};
+    const float rm = sqrtf(r[0] * r[0] + r[2] * r[2]);
+    if (!(rm > 0.05f) || !isfinite(rm)) return q;    // straight up or down: no defined roll
+    r[0] /= rm; r[2] /= rm;
+    // up' = right x f
+    const float u[3] = {r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0]};
+    // R columns: local X -> r, local Y -> u, local Z -> -f; M[row][col]
+    const float M00 = r[0], M01 = u[0], M02 = -f[0];
+    const float M10 = r[1], M11 = u[1], M12 = -f[1];
+    const float M20 = r[2], M21 = u[2], M22 = -f[2];
+    XrQuaternionf s;
+    const float tr = M00 + M11 + M22;
+    if (tr > 0.0f) {
+        const float sq = sqrtf(tr + 1.0f) * 2.0f;
+        s.w = 0.25f * sq; s.x = (M21 - M12) / sq; s.y = (M02 - M20) / sq; s.z = (M10 - M01) / sq;
+    } else if (M00 > M11 && M00 > M22) {
+        const float sq = sqrtf(1.0f + M00 - M11 - M22) * 2.0f;
+        s.w = (M21 - M12) / sq; s.x = 0.25f * sq; s.y = (M01 + M10) / sq; s.z = (M02 + M20) / sq;
+    } else if (M11 > M22) {
+        const float sq = sqrtf(1.0f + M11 - M00 - M22) * 2.0f;
+        s.w = (M02 - M20) / sq; s.x = (M01 + M10) / sq; s.y = 0.25f * sq; s.z = (M12 + M21) / sq;
+    } else {
+        const float sq = sqrtf(1.0f + M22 - M00 - M11) * 2.0f;
+        s.w = (M10 - M01) / sq; s.x = (M02 + M20) / sq; s.y = (M12 + M21) / sq; s.z = 0.25f * sq;
+    }
+    const float m = sqrtf(s.x * s.x + s.y * s.y + s.z * s.z + s.w * s.w);
+    if (!(m > 1e-6f) || !isfinite(m)) return q;
+    s.x /= m; s.y /= m; s.z /= m; s.w /= m;
+    // the roll removed: q = s * d with d about the local forward (0,0,-1);
+    // d = conj(s) * q, its signed angle about that axis is 2 * atan2(-d.z, d.w)
+    const float dw = s.w * w + s.x * x + s.y * y + s.z * z;
+    const float dz = s.w * z - s.x * y + s.y * x - s.z * w;
+    g_roll_last_deg.store(2.0f * atan2f(-dz, dw) * 57.29578f, std::memory_order_relaxed);
+    g_roll_strips.fetch_add(1, std::memory_order_relaxed);
+    return s;
+}
+
+static void roll_log() {
+    LOG_INFO("roll: fix=%d strips=%llu last=%+.1f deg (the roll removed from the submitted "
+             "pose at the last submit; with the fix off nothing is removed and strips stays)",
+             g_head_roll_fix.load(std::memory_order_relaxed),
+             (unsigned long long)g_roll_strips.load(std::memory_order_relaxed),
+             g_roll_last_deg.load(std::memory_order_relaxed));
+}
+
+static void on_present_body(const d3d11::State& st);
+
+// ===========================================================================================
+// BUILD 247: TRUE STEREO SUBMISSION (cfg cam2_stereo; Cam2.h has the contract).
+//
+// One game frame holds BOTH eyes: camera 0 rendered the left half of the backbuffer, camera 2 the right
+// half. Each half is copied into its own half-size texture (mip chain, like g_last) and drawn into its eye's
+// canvas by the same scaling blit the alternate-eye path uses, at the content's own angular size: the
+// vertical fov is the one the projection hook published (fs_fov in the world band, the engine's own in a
+// zoom), the horizontal extent follows the half's aspect, so the world scale is what it was. Both layer views
+// are fresh, carry the pose each image was RENDERED with (the tag's head orientation, the per-eye position of
+// the one xrLocateViews of this frame), and share the frame's predicted display time because there is one
+// xrEndFrame. Nothing here logs, locks or allocates per frame except the one-time half-texture creation
+// (init-shaped, like create_canvases, attempted at most three times).
+//
+// WHY THE CONTENT-FOV ROUTE AND NOT THE ENGINE'S PER-CAMERA FRUSTUM WINDOW (camera+0x324). The window would
+// give each eye the asymmetric OpenXR frustum straight from the engine, but the world's fov is carried by the
+// hooked projection argument and the sky, the cascades and the culling frustum read other derivations of the
+// camera: an off-centre window on them is untested and would have to be right in every consumer. The
+// symmetric wide content already covers a headset eye's frustum (tan 1.27 each way at fs_fov 1.92 and a
+// 3840x2160 backbuffer, against about 1.2 of the widest eye of a Quest 3), the placement machinery is the
+// one that has been in the headset since build 11a, and the world scale cannot change because the vertical fov
+// is the same number the alternate-eye path publishes and places by.
+// ===========================================================================================
+static ID3D11Texture2D*          g_half[2]     = {nullptr, nullptr};
+static ID3D11ShaderResourceView* g_half_srv[2] = {nullptr, nullptr};
+static uint32_t                  g_half_w = 0, g_half_h = 0;
+static int                       g_half_tries = 0;
+static bool                      g_stereo_prev_halves = false;
+
+// Creates (or re-creates after a size change) the two half-size sources. Render thread, init-shaped work.
+static bool ensure_half(const d3d11::State& st, uint32_t full_w, uint32_t full_h) {
+    const uint32_t hw = full_w / 2;
+    if (g_half[0] && g_half[1] && g_half_srv[0] && g_half_srv[1] && g_half_w == hw && g_half_h == full_h) return true;
+    if (g_half_tries >= 3) return false;
+    ++g_half_tries;
+    for (int i = 0; i < 2; ++i) {
+        if (g_half_srv[i]) { g_half_srv[i]->Release(); g_half_srv[i] = nullptr; }
+        if (g_half[i])     { g_half[i]->Release();     g_half[i]     = nullptr; }
+    }
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width  = hw;
+    td.Height = full_h;
+    td.MipLevels = 0;                                   // full chain, GenerateMips at capture (as g_last)
+    td.ArraySize = 1;
+    td.Format = st.format;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+    bool ok = true;
+    for (int i = 0; i < 2 && ok; ++i) {
+        if (FAILED(st.device->CreateTexture2D(&td, nullptr, &g_half[i])) ||
+            FAILED(st.device->CreateShaderResourceView(g_half[i], nullptr, &g_half_srv[i])))
+            ok = false;
+    }
+    if (!ok) {
+        for (int i = 0; i < 2; ++i) {
+            if (g_half_srv[i]) { g_half_srv[i]->Release(); g_half_srv[i] = nullptr; }
+            if (g_half[i])     { g_half[i]->Release();     g_half[i]     = nullptr; }
+        }
+        g_half_w = g_half_h = 0;
+        note("stereo2: creating the two %ux%u half-size eye textures FAILED (attempt %d of 3)", hw, full_h, g_half_tries);
+        return false;
+    }
+    g_half_w = hw;
+    g_half_h = full_h;
+    note("stereo2: eye textures created, %ux%u each (half of the %ux%u backbuffer), mip chain, format %u", hw, full_h, full_w, full_h, (unsigned)st.format);
+    return true;
+}
+
+// BUILD 250: the runtime's predicted display time for this present and the previous one (ns), for the recorder's rows.
+static int64_t g_dbg_pdt = 0, g_dbg_pdt_prev = 0;
+
+// BUILD 251: THE LAYER POSE LAG. Measured on build 250's recording (6709 frames, both eyes): the picture a present shows was drawn
+// with the head orientation located at the present THREE earlier, at every head speed and in every window (corr 0.99-1.00 when
+// turning, the left and right eyes agree with each other at 0.99). The tag carries the orientation published to the engine when the
+// frame was built, which is the present ONE earlier (19 per cent of frames: two earlier), so the layer was labelled 1-2 presents
+// newer than its picture and by an amount that varied: the compositor's reprojection of that error is the jitter on head turns.
+// With cfg layer_pose_lag = N the stereo layer carries the orientation located at the present N earlier instead. 0 = the tag's, as
+// before. A ring of the last 16 located head orientations, stamped with the present counter they were located at.
+static XrQuaternionf     g_qh_ring[16];
+static uint64_t          g_qh_ring_frame[16] = {};
+static std::atomic<uint32_t> g_lag_used{0}, g_lag_miss{0};
+
+static void stereo_pack_views(const XrView views[2], float pos[2][3], float ori[2][4], float fov[2][4]) {
+    for (int e = 0; e < 2; ++e) {
+        pos[e][0] = views[e].pose.position.x;    pos[e][1] = views[e].pose.position.y;    pos[e][2] = views[e].pose.position.z;
+        ori[e][0] = views[e].pose.orientation.x; ori[e][1] = views[e].pose.orientation.y;
+        ori[e][2] = views[e].pose.orientation.z; ori[e][3] = views[e].pose.orientation.w;
+        fov[e][0] = views[e].fov.angleLeft; fov[e][1] = views[e].fov.angleRight;
+        fov[e][2] = views[e].fov.angleUp;   fov[e][3] = views[e].fov.angleDown;
+    }
+}
+
+// 0 = not a usable halves frame (the caller runs the alternate-eye path), 1 = both eyes drawn and the layer
+// filled, 2 = attempted and failed after drawing began (the caller submits nothing).
+//   true_stereo: the right half is camera 2's (a trusted stereo frame). False: the left half goes to both eyes.
+static int submit_halves(const d3d11::State& st, ID3D11Texture2D* back, const XrView views[2], bool true_stereo,
+                         bool head_ori_ok, const XrQuaternionf& head_ori, bool built_q_ok, const float built_q[4],
+                         float cfov, int tag,
+                         XrCompositionLayerProjectionView pviews[2], XrCompositionLayerProjection& layer) {
+    D3D11_TEXTURE2D_DESC bd{};
+    back->GetDesc(&bd);
+    if (bd.Width != g_content_w || bd.Height != g_content_h || bd.SampleDesc.Count != 1 || (bd.Width & 1u) != 0u || bd.Width < 64u) {
+        cam2::stereo_note_reason("the backbuffer is not the size the mod initialised on, or is odd-width or multisampled: no half-split is possible");
+        return 0;
+    }
+    if (!g_canvas_ready || !g_blit_ok || !st.context) {
+        cam2::stereo_note_reason("the canvases or the scaling blit are not ready");
+        return 0;
+    }
+    if (!ensure_half(st, bd.Width, bd.Height)) {
+        cam2::stereo_note_reason("the half-size eye textures could not be created");
+        return 0;
+    }
+    const uint32_t hw = g_half_w, hh = g_half_h;
+    float aspect = cam2::stereo_aspect_override();
+    if (!(aspect > 0.0f)) aspect = (float)hw / (float)hh;
+
+    // The two halves. Source rects: the left half (0,0,W/2,H) and the right half (W/2,0,W/2,H) of the backbuffer.
+    const int nsrc = true_stereo ? 2 : 1;
+    for (int i = 0; i < nsrc; ++i) {
+        const D3D11_BOX box{(UINT)(i * hw), 0u, 0u, (UINT)((i + 1) * hw), (UINT)hh, 1u};
+        st.context->CopySubresourceRegion(g_half[i], 0, 0, 0, 0, back, 0, &box);
+        st.context->GenerateMips(g_half_srv[i]);
+    }
+
+    // The poses each image was rendered with: the tag's head orientation (else the located one), and each
+    // eye's located position. The roll strip is the alternate path's, for both views.
+    XrPosef pose[2] = {views[0].pose, views[1].pose};
+    gtrec::PRow* const gp = gtrec::p_stage();   // BUILD 270: the gtrec P row (log only), nullptr unless recording
+    for (int e = 0; e < 2; ++e) {
+        // BUILD 270: which override below set this eye's label, and the Present count it was taken at (gtrec only)
+        uint32_t lsrc  = gtrec::kLsLocatedView;
+        uint32_t lfrom = gp ? (uint32_t)d3d11::frame_count() : 0u;
+        if (head_ori_ok) { pose[e].orientation = head_ori; lsrc = gtrec::kLsHead; }
+        if (built_q_ok)  { pose[e].orientation = {built_q[0], built_q[1], built_q[2], built_q[3]}; lsrc = gtrec::kLsTag; lfrom = 0xFFFFFFFFu; }
+        // BUILD 251: true stereo only: the orientation the picture was actually drawn with (see g_cfg_layer_lag).
+        // BUILD 266: in a vehicle the picture is drawn with the located head from exactly TWO presents earlier: measured on the build 265
+        // recording (eyerec-6472, 22 windows of 45 frames of head motion, best lag 2 in 21 and 1 in the other; on foot the same method gives 3,
+        // which is build 251's number). The 265 label, the tag, matched the picture worse (it is the located head from 1 or 2 presents earlier,
+        // varying): yaw correlation 0.880 and residual p95 1.76 degrees, against 0.937 and 1.48 for lag 2 and 0.829 and 2.17 for lag 3.
+        // So while the vehicle compose is on, the layer carries the ring's orientation from cfg veh_layer_lag presents earlier (default 2).
+        // BUILD 267: while the recompute hook drives the vehicle frame the label is the exact head quaternion of the build that
+        // was composed at Present count (now - veh_build_depth); a miss falls back to the 266 lag estimate, never shifts a queue.
+        bool have_vq = false;
+        if (true_stereo && camera::veh_hook_drives()) {
+            float vq[4];
+            const uint64_t fc = d3d11::frame_count();
+            const uint64_t dep = (uint64_t)g_cfg_veh_depth.load(std::memory_order_relaxed);
+            if (fc >= dep && camera::veh_build_label(fc - dep, vq)) {
+                pose[e].orientation = {vq[0], vq[1], vq[2], vq[3]};
+                have_vq = true;
+                if (e == 0) g_lag_used.fetch_add(1, std::memory_order_relaxed);
+                lsrc  = gtrec::kLsBuildLabel;   // BUILD 270
+                lfrom = (uint32_t)(fc - dep);
+            }
+        }
+        const int lag = camera::veh_on() ? g_cfg_veh_lag.load(std::memory_order_relaxed) : g_cfg_layer_lag.load(std::memory_order_relaxed);
+        if (!have_vq && true_stereo && lag > 0 && lag < 15) {
+            const uint64_t want = d3d11::frame_count() - (uint64_t)lag;
+            if (g_qh_ring_frame[want & 15u] == want) {
+                pose[e].orientation = g_qh_ring[want & 15u];
+                if (e == 0) g_lag_used.fetch_add(1, std::memory_order_relaxed);
+                lsrc  = gtrec::kLsLagRing;   // BUILD 270
+                lfrom = (uint32_t)want;
+            } else if (e == 0) {
+                g_lag_miss.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (g_head_roll_fix.load(std::memory_order_relaxed)) {
+            pose[e].orientation = strip_roll_xr(pose[e].orientation);
+            lsrc |= gtrec::kLsStripped;   // BUILD 270
+            if (gp && e == 0) gp->roll_removed = g_roll_last_deg.load(std::memory_order_relaxed);
+        }
+        if (gp) {   // BUILD 270
+            gp->label_src[e]  = lsrc;
+            gp->label_from[e] = lfrom;
+        }
+    }
+
+    const bool swap = cam2::stereo_swap_eyes();
+    bool all_ok = true;
+    float used_th[2] = {0.0f, 0.0f}, used_tv[2] = {0.0f, 0.0f};
+    bool  own_cam[2] = {false, false};
+    ID3D11ShaderResourceView* rec_src[2] = {nullptr, nullptr};
+    const bool aspect_forced = cam2::stereo_aspect_override() > 0.0f;
+    for (int e = 0; e < 2; ++e) {
+        const int srci = true_stereo ? (swap ? (e ^ 1) : e) : 0;
+        g_pip_atx_eye[e] = g_pip_atx;     // BUILD 237: the disc's source centre travels with its picture
+        g_pip_aty_eye[e] = g_pip_aty;
+        // BUILD 248: each eye is placed at the angular size ITS OWN camera rendered with (the camera's projection,
+        // Camera+0x420), not the one shared last-writer fov the two cameras used to fight over. A frame whose camera
+        // cannot be read falls back to the shared fov and aspect, as before.
+        float eye_fovy = cfov, eye_aspect = aspect;
+        if (true_stereo && !aspect_forced) {
+            float th = 0.0f, tv = 0.0f;
+            const uint64_t cam = (srci == 0) ? cam2::first_camera() : cam2::second_camera();
+            if (cam2::camera_proj_tans(cam, &th, &tv)) {
+                eye_fovy = 2.0f * atanf(tv);
+                eye_aspect = th / tv;
+                own_cam[e] = true;
+            }
+        }
+        if (gp) {   // BUILD 270
+            gp->eye_fovy[e] = eye_fovy;
+            if (own_cam[e]) gp->fl |= (e == 0) ? (1u << 12) : (1u << 13);
+        }
+        rec_src[e] = g_half_srv[srci];
+        if (blit_into(e, st.context, eye_fovy, g_half_srv[srci], eye_aspect, &used_th[e], &used_tv[e])) {
+            g_eye[e] = {pose[e], views[e].fov, true, eye_fovy};
+        } else {
+            g_eye[e].valid = false;
+            all_ok = false;
+        }
+    }
+    cam2::stereo_note_place(used_th, used_tv, own_cam);
+    if (gp) {   // BUILD 270: the placement each eye used
+        for (int e = 0; e < 2; ++e) {
+            gp->th[e] = used_th[e];
+            gp->tv[e] = used_tv[e];
+        }
+        if (eyerec::enabled()) gp->fl |= 1u << 11;
+    }
+    cam2::stereo_note_lag(g_cfg_layer_lag.load(std::memory_order_relaxed), g_lag_used.load(std::memory_order_relaxed), g_lag_miss.load(std::memory_order_relaxed));
+    float pp[2][3], oo[2][4], ff[2][4];
+    stereo_pack_views(views, pp, oo, ff);
+    cam2::stereo_note_frame(all_ok ? (true_stereo ? cam2::kStereoBoth : cam2::kStereoMonoLeft) : cam2::kStereoFailed, tag,
+                            d3d11::frame_count(), pp, oo, ff, cfov, hw, hh, aspect, true);
+    if (!all_ok) return 2;
+    // BUILD 248: the eye recorder, trusted stereo frames only (never a menu or a loading frame: those are not
+    // true_stereo). One relaxed load when off. The blit state is current, the eye placement is final.
+    if (true_stereo && eyerec::enabled()) {
+        char meta[480];
+        // BUILD 250: qb = the orientation this frame was BUILT with (the one the layer carries), qh = the head orientation located
+        // at this present, dtms = the step of the predicted display time since the previous present. The recorder analysis compares
+        // the picture's own motion between rows with the rotation between their qb values.
+        const int n0 = snprintf(meta, sizeof(meta), "ql=%.5f;%.5f;%.5f;%.5f lag=%d qb=%.5f;%.5f;%.5f;%.5f qh=%.5f;%.5f;%.5f;%.5f dtms=%.2f bq=%d ho=%d ",
+                 (double)pose[0].orientation.x, (double)pose[0].orientation.y, (double)pose[0].orientation.z, (double)pose[0].orientation.w,
+                 g_cfg_layer_lag.load(std::memory_order_relaxed),
+                 built_q_ok ? (double)built_q[0] : 0.0, built_q_ok ? (double)built_q[1] : 0.0, built_q_ok ? (double)built_q[2] : 0.0, built_q_ok ? (double)built_q[3] : 1.0,
+                 (double)head_ori.x, (double)head_ori.y, (double)head_ori.z, (double)head_ori.w,
+                 (double)(g_dbg_pdt - g_dbg_pdt_prev) / 1.0e6, built_q_ok ? 1 : 0, head_ori_ok ? 1 : 0);
+        snprintf(meta + (n0 > 0 ? n0 : 0), sizeof(meta) - (size_t)(n0 > 0 ? n0 : 0), "tag=%d th0=%.3f tv0=%.3f th1=%.3f tv1=%.3f own=%d%d gap=%.4f cfov=%.3f",
+                 tag, (double)used_th[0], (double)used_tv[0], (double)used_th[1], (double)used_tv[1],
+                 own_cam[0] ? 1 : 0, own_cam[1] ? 1 : 0,
+                 (double)std::sqrt((views[1].pose.position.x - views[0].pose.position.x) * (views[1].pose.position.x - views[0].pose.position.x) +
+                                   (views[1].pose.position.y - views[0].pose.position.y) * (views[1].pose.position.y - views[0].pose.position.y) +
+                                   (views[1].pose.position.z - views[0].pose.position.z) * (views[1].pose.position.z - views[0].pose.position.z)),
+                 (double)cfov);
+        eyerec::record(st.context, rec_src, used_th, used_tv, g_cx, g_cy, g_sx, g_sy, g_sc_w, g_sc_h, d3d11::frame_count(), meta);
+        st.context->PSSetShader(g_blit_ps, nullptr, 0);
+    }
+    for (int i = 0; i < 2; ++i) {
+        pviews[i].pose = g_eye[i].pose;
+        pviews[i].fov  = g_eye[i].fov;
+        pviews[i].subImage.swapchain = g_swapchains[i];
+        pviews[i].subImage.imageRect.offset = {0, 0};
+        pviews[i].subImage.imageRect.extent = {(int32_t)g_sc_w, (int32_t)g_sc_h};
+        pviews[i].subImage.imageArrayIndex  = 0;
+    }
+    layer.layerFlags = 0;
+    layer.space      = g_space;
+    layer.viewCount  = 2;
+    layer.views      = pviews;
+    return 1;
+}
+
+// BUILD 215: the present cadence and the whole hook are timed (CX-029). The
+// body below is unchanged; the wrapper reads the performance counter at entry
+// (the interval since the last Present is the frame time, and the presents per
+// second are the exact frame rate) and around the body.
+// ---------------------------------------------------------------------------
+// BUILD 235: THE FIRST FRAME CANNOT KILL THE GAME ANY MORE.
+//
+// Every failing machine on record dies the same way: the game's render thread
+// enters Present once and never comes back. D3D11Hook.cpp:106 counts ENTRIES,
+// so frames=1 is not one frame drawn, it is one frame entered. And because our
+// callback never returns, the hook never reaches g_orig_present, so the game
+// itself never presents again. The window stops answering, and eight to nine
+// seconds later something outside the process kills it. The user sees a black
+// screen and their launcher, with nothing to report.
+//
+// A watchdog thread cannot rescue that: the stuck thread is the game's own and
+// there is no safe way to unstick a thread parked inside a runtime call. So
+// bound it instead. The FIRST frame, and only the first, runs on a worker
+// thread while the render thread waits with a deadline. Nothing is concurrent:
+// the render thread does nothing but wait, so exactly one thread touches the
+// device, which is the same guarantee the inline path gives.
+//
+//   worker finishes in time  -> disarm, and every later frame runs inline with
+//                               no thread, no wait and no cost. One frame's
+//                               hand-off, once per launch.
+//   worker does not          -> take the thread snapshot (StallWatch.h) so the
+//                               log NAMES what is holding it, stand VR down,
+//                               and return so the game presents flat and keeps
+//                               running.
+//
+// The honest cost of the second branch: the worker is abandoned where it sits.
+// It is stuck inside a runtime call, and if that call is touching the device
+// when the game resumes, the two could collide. That is a risk. Today's
+// behaviour is not a risk, it is a certainty: the process dies every time. A
+// logged, switchable fallback that usually saves the session beats that, and
+// xr_firstframe_ms = 0 restores the old unbounded behaviour exactly.
+//
+// The deadline defaults to 5000 ms deliberately. The measured gap between
+// "session begun" and the process being killed is 8.1 to 9.1 s across every
+// failing run, and the best numeric fit for that is Windows TDR (TdrDelay 2 s
+// plus TdrDdiDelay 5 s). Giving up at 5 s means we act BEFORE the thing that
+// kills the process, not after it. The slowest healthy first frame we have
+// ever recorded is about 2 s, on the RTX 5090 run that works.
+// ---------------------------------------------------------------------------
+static std::atomic<bool> g_ff_settled{false};   // first frame decided, guard off
+static d3d11::State      g_ff_state;            // the worker's copy of the state
+static HANDLE            g_ff_done = nullptr;
+
+static DWORD WINAPI ff_worker(LPVOID) {
+    // The guard is constructed HERE, on the thread that actually draws, so the
+    // foveation hook still recognises our own render-target binds as ours.
+    ffr::PresentGuard pg;
+    on_present_body(g_ff_state);
+    SetEvent(g_ff_done);
+    return 0;
+}
+
+static void first_frame_guarded(const d3d11::State& st) {
+    const int ms = g_cfg_firstframe_ms.load(std::memory_order_relaxed);
+
+    // Nothing to guard until there is a session to wedge on, and no reason to
+    // pay for a thread hand-off on the frames before VR arms.
+    if (ms <= 0 || g_session == XR_NULL_HANDLE || g_dead) {
+        ffr::PresentGuard pg;
+        on_present_body(st);
+        if (g_session != XR_NULL_HANDLE) g_ff_settled.store(true, std::memory_order_relaxed);
+        return;
+    }
+
+    g_ff_state = st;
+    if (!g_ff_done) g_ff_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE th = g_ff_done ? CreateThread(nullptr, 0, ff_worker, nullptr, 0, nullptr)
+                          : nullptr;
+    if (!th) {
+        // Could not get a thread. Run it inline rather than skip the frame:
+        // that is exactly today's behaviour and no worse than it.
+        LOG_WARN("xrff: could not start the first-frame worker (error %lu); "
+                 "running it inline, unguarded, as every build before 235 did.",
+                 GetLastError());
+        if (th) CloseHandle(th);
+        ffr::PresentGuard pg;
+        on_present_body(st);
+        g_ff_settled.store(true, std::memory_order_relaxed);
+        return;
+    }
+
+    const DWORD w = WaitForSingleObject(g_ff_done, (DWORD)ms);
+    if (w == WAIT_OBJECT_0) {
+        WaitForSingleObject(th, 1000);   // it has signalled; this just reaps it
+        CloseHandle(th);
+        CloseHandle(g_ff_done);
+        g_ff_done = nullptr;
+        g_ff_settled.store(true, std::memory_order_relaxed);
+        LOG_INFO("xrff: the first VR frame completed and the guard is off. "
+                 "Every frame from here runs inline, as before.");
+        return;
+    }
+
+    // It did not come back. Take the reading FIRST, while it is still parked
+    // exactly where it stuck, then stand down.
+    LOG_ERROR("xrff: THE FIRST VR FRAME HAS NOT RETURNED IN %d ms. This is the "
+              "failure that kills the game on startup. Reading every thread "
+              "before standing down.", ms);
+
+    // BUILD 236: the three facts a reported log must carry side by side. The
+    // phase is read FIRST and from the atomic alone, because it is the one
+    // that is still moving: it names the last OpenXR step the frame worker
+    // entered, which is as close to "the call it is parked in" as this process
+    // can get without the stack walk below.
+    LOG_ERROR("xrff: the frame worker was last inside: %s", frame_phase());
+    log_layer_survivors("when the first frame stalled");
+
+    stallwatch::report("the first VR frame did not return");
+
+    g_failed.store(true);
+    g_dead = true;
+    g_ff_settled.store(true, std::memory_order_relaxed);
+    CloseHandle(th);   // the worker is abandoned where it sits; see the block above
+
+    LOG_ERROR("xrff: VR IS OFF FOR THIS RUN. THE GAME WILL NOW CARRY ON "
+              "NORMALLY ON YOUR MONITOR. Nothing is broken and nothing needs "
+              "reinstalling.");
+    LOG_ERROR("xrff: the thread snapshot above names what was holding it. If a "
+              "foreign DLL appears there (ReShade64.dll, XR_APILAYER_*.dll), "
+              "switch that layer off and VR will start: its registry value is "
+              "under HKEY_LOCAL_MACHINE\\SOFTWARE\\Khronos\\OpenXR\\1\\"
+              "ApiLayers\\Implicit, set to 1.");
+    LOG_ERROR("xrff: xr_firstframe_ms = 0 in grwxr.cfg restores the old "
+              "behaviour, where this hung the game instead.");
+}
+
+// BUILD 239: the header. Called from the heartbeat thread by the stall
+// watchdog, which is the one thread still ticking through every wedge on
+// record. It cannot unstick the render thread and does not try: it makes sure
+// that IF that thread returns, it finds VR already off and presents flat,
+// instead of walking into a session nobody is driving.
+void stand_down(const char* why) {
+    if (g_dead) return;
+    g_failed.store(true);
+    g_dead = true;
+    g_ff_settled.store(true, std::memory_order_relaxed);   // the guard has nothing left to guard
+    LOG_ERROR("VR: STOOD DOWN (%s). If the game comes back it will run flat on "
+              "your monitor from here. Nothing is broken and nothing needs "
+              "reinstalling.", why ? why : "no reason given");
+}
+
+int init_frames() { return g_cfg_init_frames.load(std::memory_order_relaxed); }
+
 void on_present(const d3d11::State& st) {
+    perf::mark_present();
+    perf::Scope sc(perf::kPresent);
+    ph(kPhBody);
+
+    // BUILD 235: the first frame is bounded; after that this is the old path
+    // exactly, with one relaxed atomic load in front of it.
+    if (!g_ff_settled.load(std::memory_order_relaxed)) {
+        first_frame_guarded(st);
+        return;
+    }
+
+    ffr::PresentGuard pg;   // BUILD 216: render-target binds inside our own Present are ours
+    on_present_body(st);
+}
+
+static void on_present_body(const d3d11::State& st) {
     // Build 8.1: the session survives a doff. Taking the headset off sends
     // STOPPING; build 8 stopped polling events there, never called
     // xrEndSession, and so left the runtime showing a frozen frame with no way
@@ -3355,8 +6102,30 @@ void on_present(const d3d11::State& st) {
     if (g_session == XR_NULL_HANDLE || g_dead) return;
     if (!st.device || !st.context || !st.swapchain) return;
 
+    {   // BUILD 216: publish what the foveation mask is built from (the content
+        // size, the wide field, both eyes' frustum tangents) and clear the rate
+        // on the immediate context before anything of ours draws. Eight tanf
+        // per frame; the mask itself is built on the init thread.
+        float et[2][4];
+        for (int e = 0; e < 2; ++e) {
+            et[e][0] = tanf(g_eyefov[e].angleLeft);
+            et[e][1] = tanf(g_eyefov[e].angleRight);
+            et[e][2] = tanf(g_eyefov[e].angleUp);
+            et[e][3] = tanf(g_eyefov[e].angleDown);
+        }
+        ph(kPhFfrTick);
+        ffr::present_tick(st.context, g_content_w, g_content_h, et, g_canvas_ready, headpose::fs_fov());
+    }
+
+    ph(kPhSamples);
+    camera::survive_sample();   // BUILD 172: log only, 1 Hz, reads only
+    camera::gun_survive_sample();   // BUILD 184: the gun root's records, same rules
+    camera::sprint_sample();        // BUILD 200: the sprint probe, 10 Hz, reads only
+
     // Drain session events cheaply, active or parked.
+    ph(kPhEnter);
     XrEventDataBuffer ev{XR_TYPE_EVENT_DATA_BUFFER};
+    ph(kPhPollEvent);
     while (xrPollEvent(g_instance, &ev) == XR_SUCCESS) {
         if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
             g_state_xr = ((XrEventDataSessionStateChanged*)&ev)->state;
@@ -3364,14 +6133,17 @@ void on_present(const d3d11::State& st) {
             if (g_state_xr == XR_SESSION_STATE_STOPPING) {
                 headpose::disable();
                 g_active.store(false);
+                ph(kPhEndSession);
                 xrEndSession(g_session);
             } else if (g_state_xr == XR_SESSION_STATE_READY &&
                        !g_active.load(std::memory_order_relaxed)) {
                 XrSessionBeginInfo sbi{XR_TYPE_SESSION_BEGIN_INFO};
                 sbi.primaryViewConfigurationType =
                     XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+                ph(kPhBeginSession);
                 if (XR_SUCCEEDED(xrBeginSession(g_session, &sbi))) {
                     g_have_ref = false;
+                    g_rc_begin.fetch_add(1, std::memory_order_relaxed);   // BUILD 212
                     g_aim_resync.store(true, std::memory_order_relaxed);
                     // Build 10a: the pre-doff eye images and poses are stale
                     // in every sense; bootstrap both eyes afresh.
@@ -3397,14 +6169,73 @@ void on_present(const d3d11::State& st) {
                 g_dead = true;
             }
         } else if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
-            // Build 10a.1: the runtime recentred (user long-press recenter).
-            // Both the yaw reference and the stored per-eye poses are in the
-            // old space; recapture everything.
-            g_have_ref = false;
-            g_aim_resync.store(true, std::memory_order_relaxed);
-            g_eye[0].valid = false;
-            g_eye[1].valid = false;
-            note("VR: runtime recenter. Head reference will re-capture.");
+            // Build 10a.1 took any reference space change as a user recenter and
+            // recaptured everything. BUILD 212: which space changed decides, and
+            // a LOCAL change is ABSORBED rather than thrown away.
+            //
+            // The 211 run (grwxr-18104.log) took six references in 110 seconds
+            // off ONE F2 press: four re-zeroes nobody asked for, each of them
+            // re-taking the yaw reference, which turns the world to wherever the
+            // head points, and each of them also resetting the standing height
+            // (the block in update_head), which moves the view vertically off the
+            // character's head and stretches the arm past its reach. We hold three
+            // spaces (LOCAL to compose in, VIEW, and STAGE for the stance loop
+            // since build 205), and the old code answered a change of ANY of them
+            // by re-zeroing the compose reference.
+            //
+            // The event carries poseInPreviousSpace: the new space's origin
+            // expressed in the old one. Transforming our two references by its
+            // inverse leaves the head-relative offset and the head-to-reference
+            // rotation bit-identical, so the view does not move at all
+            // (followtest212.py: 2e-15 m and 6e-16 over 20000 poses; the yaw is
+            // all that is taken from it, which is exact while the runtime keeps
+            // gravity, and a 4 degree tilt would leave a few degrees).
+            const XrEventDataReferenceSpaceChangePending* rc =
+                (const XrEventDataReferenceSpaceChangePending*)&ev;
+            if (rc->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
+                if (rc->poseValid && g_have_ref) {
+                    const XrPosef& pp = rc->poseInPreviousSpace;
+                    const Quat pq{pp.orientation.x, pp.orientation.y, pp.orientation.z, pp.orientation.w};
+                    // the yaw of the change, the same formula the reference uses
+                    const float pfx = -2.0f * (pq.x * pq.z + pq.w * pq.y);
+                    const float pfz = -(1.0f - 2.0f * (pq.x * pq.x + pq.y * pq.y));
+                    const float psi_p = atan2f(-pfx, -pfz);
+                    // g_ref_inv is the conjugate of a yaw-only quaternion
+                    const float psi_r = -2.0f * atan2f(g_ref_inv.y, g_ref_inv.w);
+                    const float psi_n = psi_r - psi_p;
+                    g_ref_inv = Quat{0.0f, -sinf(psi_n * 0.5f), 0.0f, cosf(psi_n * 0.5f)};
+                    if (g_head_ref_ok) {
+                        const float v[3] = {g_head_ref_pos[0] - pp.position.x,
+                                            g_head_ref_pos[1] - pp.position.y,
+                                            g_head_ref_pos[2] - pp.position.z};
+                        float outp[3];
+                        quat_rotate_inv(pq, v, outp);   // conj(pq) applied to v
+                        if (isfinite(outp[0]) && isfinite(outp[1]) && isfinite(outp[2])) {
+                            g_head_ref_pos[0] = outp[0];
+                            g_head_ref_pos[1] = outp[1];
+                            g_head_ref_pos[2] = outp[2];
+                        }
+                    }
+                    g_eye[0].valid = false;
+                    g_eye[1].valid = false;
+                    g_rc_absorbed.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    g_have_ref = false;
+                    g_aim_resync.store(true, std::memory_order_relaxed);
+                    g_eye[0].valid = false;
+                    g_eye[1].valid = false;
+                    g_rc_local.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else if (rc->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_STAGE) {
+                // the floor moved under the stance loop. The height model re-takes
+                // its standing reference; the yaw and the 6DOF origin are not the
+                // runtime's business and are left exactly as they are.
+                g_st_dzmax = 0.0f; g_st_auto_sum = 0.0; g_st_auto_n = 0; g_st_auto_done = false;
+                g_st_ref_ms = GetTickCount64();
+                g_rc_stage.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_rc_other.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         ev = {XR_TYPE_EVENT_DATA_BUFFER};
     }
@@ -3433,6 +6264,7 @@ void on_present(const d3d11::State& st) {
                           menu::fire_pending(menu::kProbeRecenter);
         if (edge) {
             g_have_ref = false;
+            g_rc_key.fetch_add(1, std::memory_order_relaxed);   // BUILD 212
             g_aim_resync.store(true, std::memory_order_relaxed);
             note("VR: recenter requested (Home, Space or the panel). Head "
                  "reference will re-capture.");
@@ -3480,9 +6312,43 @@ void on_present(const d3d11::State& st) {
         const bool f2 = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
         const bool f2_edge = f2 && !s_f2;
         s_f2 = f2;
-        if (menu::fire_pending(menu::kProbeFirstPerson) || f2_edge) {
-            const bool on = !headpose::fp_enabled();
+        // 2026-09-01: F3 ARMS THE WINGSPAN CAPTURE, the owner's design. F1 is
+        // the panel, F2 is first person, F3 is the third key along and can be
+        // found by feel with the headset on. It exists because the capture
+        // wants both arms straight out to the sides while the old trigger was
+        // a row in a menu, which cannot both be true, so every sample was
+        // taken mid-reach. The 3.5 s timer is what buys the time to let go and
+        // strike the pose, and a good capture then applies the scale and asks
+        // for first person on its own.
+        static bool s_f3 = false;
+        const bool f3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
+        if (f3 && !s_f3) camera::set_hand_calib(1);
+        {   // BUILD 207: F4 calibrates the standing height on its own (stand normally; four seconds from one second after the press)
+            static bool s_f4 = false;
+            const bool f4 = (GetAsyncKeyState(VK_F4) & 0x8000) != 0;
+            if (f4 && !s_f4) stance_calib_start();
+            s_f4 = f4;
+        }
+        {   // BUILD 216: F7 toggles foveated rendering at run time, for an A/B in the headset (the ffr: line counts it)
+            static bool s_f7 = false;
+            const bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+            if (f7 && !s_f7) ffr::toggle();
+            s_f7 = f7;
+        }
+        s_f3 = f3;
+
+        // A successful capture asks for first person. Folded into the SAME
+        // branch F2 uses rather than duplicated, so the recenter that has been
+        // part of entering first person since build 44 comes with it, and
+        // there is only ever one first-person path to reason about. Forces ON
+        // rather than toggling: the capture means "put me there", not "flip".
+        const bool fp_req = camera::take_fp_request() && !headpose::fp_enabled();
+        if (menu::fire_pending(menu::kProbeFirstPerson) || f2_edge || fp_req) {
+            const bool on = fp_req ? true : !headpose::fp_enabled();
             headpose::set_fp_enabled(on);
+            // BUILD 225: a deliberate off holds fp_auto until the pin changes.
+            if (!fp_req) camera::set_fp_user_off(on ? 0 : 1);
+            g_rc_fp.fetch_add(1, std::memory_order_relaxed);   // BUILD 212
             // BUILD 44 (user request): the first-person toggle ALSO recenters.
             // A stale head reference is invisible until it has already ruined
             // a test (2026-08-05: the reference was ~110 deg off, which read
@@ -3500,6 +6366,9 @@ void on_present(const d3d11::State& st) {
         // Re-published every poll (not only on the edge) so the detour is
         // correct even if FP was toggled before the hook finished installing.
         camera::set_head_hide(headpose::fp_enabled());
+        // BUILD 224: hold the hidden state against the engine's show-all
+        // path (the helmet after a roll, a climb, cover, a vehicle exit).
+        camera::head_hide_frame();
     }
     // BUILD 125: Numpad 9 flips the EYE SIGN, live.
     //
@@ -3571,19 +6440,46 @@ void on_present(const d3d11::State& st) {
     // locate (render-pose submit, see HeadPose.h).
     float built_q[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     bool  built_q_ok = false;
-    const int built_eye = headpose::pop_eye_tag(built_q, &built_q_ok);
+    // BUILD 247: the tag's flags come back too (bit 0x08 = the second camera was not trusted yet when this
+    // frame was built). The eye field is 0/1 for an alternate-eye frame, 2 for a true-stereo frame, -1 for none.
+    unsigned char built_flags = 0;
+    const int built_eye = headpose::pop_eye_tag(built_q, &built_q_ok, nullptr, &built_flags);
+    // BUILD 270: the gtrec P row (log only). p_begin opens the static staging row only while recording (one atomic
+    // load otherwise); the fields below are filled in place where they become known, and the guard commits the row on
+    // every return from here on. gp is nullptr unless recording.
+    gtrec::p_begin(d3d11::frame_count(), built_eye, built_q, built_q_ok, built_flags);
+    gtrec::PScope gtrec_commit;
+    gtrec::PRow* const gp = gtrec::p_stage();
+    // BUILD 247: foveation is suspended while the two cameras share one target (Foveate.h, set_suspended).
+    ffr::set_suspended(cam2::stereo_live());
 
     // 2026-08-12: was a bare xrWaitFrame on this, the game's render thread.
     // See the watchdog block above on_present(). Everything below is reached
     // only with a frame state in hand, exactly as before.
     XrFrameState fs{XR_TYPE_FRAME_STATE};
-    if (!acquire_frame_state(fs)) return;
+    bool have_fs = false;
+    {   // BUILD 215: the runtime's wait, timed apart from our own work
+        perf::Scope sc(perf::kWait);
+        ph(kPhWaitFrame);
+        have_fs = acquire_frame_state(fs);
+        if (have_fs) { g_dbg_pdt_prev = g_dbg_pdt; g_dbg_pdt = (int64_t)fs.predictedDisplayTime; }   // BUILD 250
+    }
+    if (gp) {   // BUILD 270
+        gp->qpc_wait = gtrec::qpc_now();
+        if (have_fs) {
+            gp->pdt = (int64_t)fs.predictedDisplayTime;
+            gp->pdp = (int64_t)fs.predictedDisplayPeriod;
+            if (fs.shouldRender) gp->fl |= 1u << 3;
+        }
+    }
+    if (!have_fs) return;
 
     // Build 8: head pose for this frame's predicted display time, published to
     // the camera hook. No logging here (rule 8); note() defers.
     XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
     bool head_ori_ok = false;
     XrQuaternionf head_ori{0.0f, 0.0f, 0.0f, 1.0f};
+    ph(kPhLocateView);
     if (XR_SUCCEEDED(xrLocateSpace(g_view_space, g_space,
                                    fs.predictedDisplayTime, &loc))) {
         // Build 42: the head POSITION, needed to place the hand markers
@@ -3599,12 +6495,305 @@ void on_present(const d3d11::State& st) {
             g_head_pos_ok = false;
         }
         update_head(loc.locationFlags, loc.pose.orientation);
+        // BUILD 204: TRUE 6DOF. The head's displacement since the reference,
+        // head-local (the conversion the hands ride: rotate by the inverse of
+        // the current head orientation; +x right, +y up, -z forward), clamped
+        // to head_pos_max, published for the camera hook. The reference
+        // position is captured the frame the yaw reference is, so Home (a
+        // recenter) re-zeroes both. Published false whenever the key is off,
+        // nothing is tracked, or no reference exists: the hook then adds 0.
+        {
+            // BUILD 207: the capture lives in update_head with the yaw reference;
+            // this is the late capture for a present whose position arrived
+            // after the orientation, and the reset while no reference exists.
+            if (!g_have_ref) g_head_ref_ok = false;
+            if (g_have_ref && !g_head_ref_ok && g_head_pos_ok) {
+                g_head_ref_pos[0] = g_head_pos[0];
+                g_head_ref_pos[1] = g_head_pos[1];
+                g_head_ref_pos[2] = g_head_pos[2];
+                g_head_ref_ok = true;
+                g_hp_refs.fetch_add(1, std::memory_order_relaxed);
+                g_st_ref_ms = GetTickCount64();
+            }
+            float lx = 0.0f, lf = 0.0f, lu = 0.0f, uh = 0.0f;
+            float dxr[3] = {0.0f, 0.0f, 0.0f};   // BUILD 210: the XR displacement, for the follow's own horizontal frames
+            bool hok = false, use_h = false;
+            if (g_head_pos_on.load(std::memory_order_relaxed) && g_head_ref_ok && g_head_pos_ok &&
+                (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+                const Quat qh{loc.pose.orientation.x, loc.pose.orientation.y,
+                              loc.pose.orientation.z, loc.pose.orientation.w};
+                float d[3] = {g_head_pos[0] - g_head_ref_pos[0],
+                              g_head_pos[1] - g_head_ref_pos[1],
+                              g_head_pos[2] - g_head_ref_pos[2]};
+                const bool lean_mode = g_lean_mode.load(std::memory_order_relaxed) != 0;
+                if (lean_mode) {
+                    // BUILD 300: the soft limit, in the tracking frame (y up) before the head-local conversion, so a pitched head cannot
+                    // change what counts as horizontal. Slope 1 up to where the easing begins, then tanh to the limit: no wall.
+                    auto soft = [](float m, float lim, float frac) {
+                        const float s0 = lim * frac, wd = lim - s0;
+                        if (m <= s0) return m;
+                        if (!(wd > 1e-4f)) return lim;
+                        return s0 + wd * tanhf((m - s0) / wd);
+                    };
+                    const float mxh = g_lean_max.load(std::memory_order_relaxed);
+                    const float fr  = g_lean_soft.load(std::memory_order_relaxed);
+                    const float mh  = sqrtf(d[0] * d[0] + d[2] * d[2]);
+                    if (mh > mxh * fr) g_lean_soft_n.fetch_add(1, std::memory_order_relaxed);
+                    if (mh > 1e-6f) {
+                        const float kh = soft(mh, mxh, fr) / mh;
+                        d[0] *= kh; d[2] *= kh;
+                    }
+                    const float lim = d[1] < 0.0f ? g_lean_down.load(std::memory_order_relaxed) : g_lean_up.load(std::memory_order_relaxed);
+                    d[1] = d[1] < 0.0f ? -soft(-d[1], lim, fr) : soft(d[1], lim, fr);
+                }
+                float lv[3];
+                quat_rotate_inv(qh, d, lv);   // head-local: +x right, +y up, -z forward
+                lx = lv[0]; lf = -lv[2]; lu = lv[1];
+                dxr[0] = d[0]; dxr[1] = d[1]; dxr[2] = d[2];   // BUILD 210
+                // BUILD 205 and 207: with the stance loop on, the eyes sit at the
+                // PHYSICAL height: (height minus standing) minus (bone minus
+                // standing bone), so a crouch does not drop the view twice. It
+                // is a world-vertical quantity and travels to the hook as its
+                // own term (uh, use_h) that rides world up; lu keeps riding the
+                // camera basis with x and f. Not in a seat (no bone to trust).
+                {
+                    float dz = 0.0f;
+                    if (g_stance_on.load(std::memory_order_relaxed) && headpose::head_dz(&dz) && !g_st_seated &&
+                        g_st_hstand > 1.0f && g_st_dzmax > 0.5f && isfinite(g_st_height)) {
+                        uh = (g_st_height - g_st_hstand) - (dz - g_st_dzmax);
+                        use_h = true;
+                    }
+                }
+                // BUILD 205: the clamp is horizontal; the height has its own.
+                const float mag = sqrtf(lx * lx + lf * lf);
+                const float mx = g_head_pos_max.load(std::memory_order_relaxed);
+                if (!lean_mode && mag > mx && mag > 1e-6f) {   // BUILD 300: the lean has its own soft limit above
+                    const float k = mx / mag;
+                    lx *= k; lf *= k;
+                    g_hp_clamps.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (lu > 1.5f) lu = 1.5f;
+                if (lu < -1.5f) lu = -1.5f;
+                if (uh > 1.5f) uh = 1.5f;
+                if (uh < -1.5f) uh = -1.5f;
+                hok = isfinite(lx) && isfinite(lf) && isfinite(lu);
+                if (hok) {
+                    g_hp_frames.fetch_add(1, std::memory_order_relaxed);
+                    g_hp_last[0].store(lx, std::memory_order_relaxed);
+                    g_hp_last[1].store(lf, std::memory_order_relaxed);
+                    g_hp_last[2].store(lu, std::memory_order_relaxed);
+                }
+            }
+            headpose::set_head_offset(lx, lf, lu, uh, use_h, hok);
+            // BUILD 209: the body follow, from the same offset and the same head
+            if (hok) {
+                const Quat qf{loc.pose.orientation.x, loc.pose.orientation.y, loc.pose.orientation.z, loc.pose.orientation.w};
+                follow_tick(dxr, qf, built_q_ok, g_st_seated);
+            } else {
+                headpose::set_follow_stick(0.0f, 0.0f, false);
+            }
+        }
+        // BUILD 205: THE STANCE LOOP. The physical head height above the floor
+        // (STAGE, or LOCAL plus 1.65 m), the standing height as the running
+        // maximum since the recenter (or cfg stance_height), the desired stance
+        // from the ratio with hysteresis; the actual stance from the character's
+        // head bone (1.6 standing, 1.1 crouched, 0.3 prone); while they disagree
+        // and the loop is on, in first person, anchored, the pad's B: a tap for
+        // one step (down to crouch, or up), a hold for prone. A settle after
+        // every act; four acts without a change back the loop off for three
+        // seconds. The head's own height must come first: the loop reads what
+        // this frame published, the merge sees the button on its next poll.
+        {
+            // the physical height
+            float height = 0.0f;
+            bool hok2 = false;
+            if (g_stage_space != XR_NULL_HANDLE) {
+                XrSpaceLocation sl{XR_TYPE_SPACE_LOCATION};
+                ph(kPhLocateStage);
+                if (XR_SUCCEEDED(xrLocateSpace(g_view_space, g_stage_space, fs.predictedDisplayTime, &sl)) &&
+                    (sl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
+                    height = sl.pose.position.y;
+                    hok2 = isfinite(height) && height > 0.05f && height < 2.6f;
+                    g_st_stage_ok = hok2;
+                }
+            }
+            if (!hok2 && g_head_pos_ok) {
+                height = g_head_pos[1] + 1.65f;
+                hok2 = isfinite(height) && height > 0.05f && height < 2.6f;
+                g_st_stage_ok = false;
+            }
+            if (hok2) {
+                g_st_height = height;
+                const uint64_t tnow = GetTickCount64();
+                // BUILD 206: the F3 window, four seconds from one second after the press
+                if (g_st_cal_until) {
+                    if (tnow >= g_st_cal_from && tnow < g_st_cal_until) {
+                        g_st_cal_sum += height; ++g_st_cal_n;
+                    } else if (tnow >= g_st_cal_until) {
+                        if (g_st_cal_n >= 60 && g_st_cal_sum / g_st_cal_n > 0.5 && g_st_cal_sum / g_st_cal_n < 2.4) {   // BUILD 207: the plausibility band
+                            g_st_hf3 = (float)(g_st_cal_sum / g_st_cal_n);
+                            g_st_hf3_ok = true;
+                            note("stance: standing height calibrated at %.2f m over %u samples (F4). "
+                                 "Crouch below %.2f m, prone below %.2f m.", g_st_hf3, g_st_cal_n,
+                                 g_st_hf3 * g_stance_crouch.load(std::memory_order_relaxed),
+                                 g_st_hf3 * g_stance_prone.load(std::memory_order_relaxed));
+                        } else {
+                            note("stance: F4 height capture got only %u samples; not used.", g_st_cal_n);
+                        }
+                        g_st_cal_until = 0; g_st_cal_sum = 0.0; g_st_cal_n = 0;
+                    }
+                }
+                const float over = g_stance_height.load(std::memory_order_relaxed);
+                if (over > 1.0f) {
+                    g_st_hstand = over; g_st_src = 2;
+                } else if (g_st_hf3_ok) {
+                    g_st_hstand = g_st_hf3; g_st_src = 1;
+                } else {
+                    // automatic: the average over the three seconds starting one
+                    // second after the recenter; until then, the current height
+                    g_st_src = 0;
+                    const uint64_t age = g_st_ref_ms ? tnow - g_st_ref_ms : 0;
+                    // BUILD 302 (his choice 2026-10-12: "the recentre takes it only if I am standing"): the average is
+                    // accepted only within 0.10 m of the tallest average accepted this session (the 301 run took 0.70 to
+                    // 1.44 m from recentres held while crouched); a rejected one leaves the standing height as it was.
+                    // Until the first average lands, the current height stands in.
+                    if (!g_st_auto_done && age >= 1000 && age < 4000) {
+                        g_st_auto_sum += height; ++g_st_auto_n;
+                        if (g_st_tallest <= 0.0f) g_st_hstand = (float)(g_st_auto_sum / g_st_auto_n);
+                    } else if (!g_st_auto_done && age >= 4000 && g_st_auto_n > 0) {
+                        g_st_auto_done = true;
+                        const float avg = (float)(g_st_auto_sum / g_st_auto_n);
+                        if (g_st_tallest <= 0.0f || avg >= g_st_tallest - 0.10f) {
+                            g_st_hstand = avg;
+                            if (avg > g_st_tallest && avg < 2.3f) g_st_tallest = avg;
+                            note("stance: standing height taken as %.2f m, the average of the three seconds after "
+                                 "the recenter (Home re-takes it; F4 calibrates it properly).", g_st_hstand);
+                        } else {
+                            note("stance: recentre average %.2f m REJECTED, you were not standing (tallest this session %.2f m); "
+                                 "standing height stays %.2f m.", avg, g_st_tallest, g_st_hstand);
+                        }
+                    } else if (g_st_auto_n == 0 && g_st_tallest <= 0.0f) {
+                        g_st_hstand = height;
+                    }
+                }
+            }
+            // the actual stance, and the bone's standing height
+            float dz = 0.0f;
+            const bool anch = headpose::head_dz(&dz);
+            int actual = -1;
+            if (anch && isfinite(dz)) {
+                if (dz > g_st_dzmax && dz < 1.75f) g_st_dzmax = dz;   // BUILD 207: capped
+                // BUILD 207: the seat band. A vehicle seat reads 0.69 to 0.75
+                // (grwxr-26920), between prone and crouch: no stance, no B,
+                // no compensation until the vehicle gate (4.3) exists.
+                g_st_seated = dz > 0.55f && dz < 0.85f;
+                // BUILD 209: the lines at the clip midpoints from the game data (stand 1.58 to 1.65,
+                // sprint 1.39 to 1.42, crouch 0.98, prone 0.27 to 0.36): stand above 1.31, prone below 0.66
+                actual = g_st_seated ? -1 : (dz > 1.31f ? 0 : (dz > 0.66f ? 1 : 2));
+            } else {
+                g_st_seated = false;
+            }
+            if (actual != g_st_actual) {
+                if (g_st_actual >= 0 && actual >= 0) g_st_changes.fetch_add(1, std::memory_order_relaxed);
+                g_st_actual = actual;
+            }
+            // the desired stance, with hysteresis
+            static int s_desired = 0;
+            if (hok2 && g_st_hstand > 1.0f) {
+                const float ratio = height / g_st_hstand;
+                const float cr = g_stance_crouch.load(std::memory_order_relaxed);
+                const float pr = g_stance_prone.load(std::memory_order_relaxed);
+                // BUILD 208: prone from the head only with stance_prone set; by
+                // default the head picks stand or crouch and prone is his own.
+                const bool prone_on = pr > 0.05f;
+                // BUILD 301: the crouch threshold in metres of real drop (his to tune), hysteresis crouch_rise on the way up.
+                // crouch_drop 0 keeps the 205 ratio test. Prone is untouched (his, unless stance_prone is set).
+                const float cdrop = g_crouch_drop.load(std::memory_order_relaxed);
+                const float crise = g_crouch_rise.load(std::memory_order_relaxed);
+                const float drop  = g_st_hstand - height;
+                g_st_drop = drop;
+                const bool  metres = cdrop > 0.01f;
+                const bool  want_crouch = metres ? (drop > cdrop) : (ratio < cr);
+                const bool  want_stand  = metres ? (drop < cdrop - crise) : (ratio > cr + 0.07f);
+                if (s_desired == 0) {
+                    if (prone_on && ratio < pr) s_desired = 2; else if (want_crouch) s_desired = 1;
+                } else if (s_desired == 1) {
+                    if (prone_on && ratio < pr) s_desired = 2; else if (want_stand) s_desired = 0;
+                } else {
+                    if (!prone_on || ratio > pr + 0.08f) s_desired = want_stand ? 0 : 1;
+                }
+            }
+            g_st_desired = s_desired;
+            // the act
+            static uint64_t s_b_until = 0, s_settle_until = 0, s_window_until = 0;
+            static int s_attempts = 0, s_last_actual = -1, s_prev_desired = -1;
+            static bool s_user_b_prev = false;
+            const uint64_t now = GetTickCount64();
+            if (actual != s_last_actual) { s_attempts = 0; s_last_actual = actual; }
+            bool b = now < s_b_until;
+            const bool on = g_stance_on.load(std::memory_order_relaxed) != 0 && headpose::fp_enabled();
+            uint32_t pad_btn = 0;
+            float pad_ax[6] = {};
+            const bool pad_live = headpose::touch_pad(&pad_btn, pad_ax);
+            const bool user_b = pad_live && (pad_btn & headpose::PAD_B);
+            const bool aiming = pad_live && pad_ax[4] > 0.12f;   // BUILD 207: never pulse while aiming (the survey's gate)
+            // BUILD 207: the loop acts only on a CHANGE of the desired stance,
+            // inside a three-second window (four acts at most); his own B
+            // closes the window, so a manual crouch or stand is respected
+            // until his body moves again (the internal dig, 1.4).
+            if (s_desired != s_prev_desired) {
+                if (s_prev_desired >= 0) { s_window_until = now + 3000; s_attempts = 0; }
+                s_prev_desired = s_desired;
+            }
+            if (user_b && !s_user_b_prev && !b) {
+                if (now < s_window_until) g_st_manual.fetch_add(1, std::memory_order_relaxed);
+                s_window_until = 0;
+            }
+            s_user_b_prev = user_b;
+            // BUILD 207: only with a stereo frame built this present (a menu or a
+            // loading screen has none, and B there is Back), and never while aiming.
+            // BUILD 208: a prone character is his own doing while prone is not the head's: leave it.
+            const bool prone_his = g_stance_prone.load(std::memory_order_relaxed) <= 0.05f && actual == 2;
+            if (on && !b && built_q_ok && !aiming && !prone_his && now < s_window_until && now >= s_settle_until && actual >= 0 && s_desired != actual && !user_b) {
+                if (s_attempts >= 4) {
+                    s_window_until = 0;
+                    g_st_fights.fetch_add(1, std::memory_order_relaxed);
+                } else if (s_desired == 2 && actual < 2) {
+                    s_b_until = now + 700;            // the hold: prone
+                    s_settle_until = s_b_until + 1100;
+                    g_st_holds.fetch_add(1, std::memory_order_relaxed);
+                    ++s_attempts; b = true;
+                } else {
+                    s_b_until = now + 120;            // the tap: one step down, or up
+                    s_settle_until = s_b_until + 900;
+                    g_st_taps.fetch_add(1, std::memory_order_relaxed);
+                    ++s_attempts; b = true;
+                }
+            }
+            if (!on) b = false;
+            headpose::set_stance_b(b);
+        }
         // BUILD 10j: this is the orientation the frame's content is composed
         // with (both eyes share it); the submit path attaches it to both views.
         if (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) {
             head_ori = loc.pose.orientation;
             head_ori_ok = true;
+            {   // BUILD 251: the layer-pose-lag ring (same present counter the recorder rows use)
+                const uint64_t fc = d3d11::frame_count();
+                g_qh_ring[fc & 15u] = head_ori;
+                g_qh_ring_frame[fc & 15u] = fc;
+            }
+            if (gp) {   // BUILD 270: the located head, which is the quaternion published to the camera side this Present
+                gp->head_q[0] = head_ori.x; gp->head_q[1] = head_ori.y; gp->head_q[2] = head_ori.z; gp->head_q[3] = head_ori.w;
+                gp->fl |= 1u << 1;
+            }
         }
+    }
+    if (gp) {   // BUILD 270: the reference and the aim accounting as this Present left them (update_head ran above)
+        gp->ref_inv[0] = g_ref_inv.x; gp->ref_inv[1] = g_ref_inv.y; gp->ref_inv[2] = g_ref_inv.z; gp->ref_inv[3] = g_ref_inv.w;
+        gp->ref_epoch  = headpose::ref_epoch();
+        gp->aim_cum[0] = g_aim_cum[0];
+        gp->aim_cum[1] = g_aim_cum[1];
     }
 
     // BUILD 13b: sync the action set and locate both aim poses. Read-only,
@@ -3615,6 +6804,7 @@ void on_present(const d3d11::State& st) {
         XrActionsSyncInfo syn{XR_TYPE_ACTIONS_SYNC_INFO};
         syn.countActiveActionSets = 1;
         syn.activeActionSets = &aas;
+        ph(kPhSyncActions);
         if (XR_SUCCEEDED(xrSyncActions(g_session, &syn))) {
             uint32_t seen = 0;
             // BUILD 124: physical hand h is stored in LOGICAL slot s, where
@@ -3624,6 +6814,7 @@ void on_present(const d3d11::State& st) {
             for (int h = 0; h < 2; ++h) {
                 const int s = (mh == 1) ? h : (1 - h);
                 XrSpaceLocation hl{XR_TYPE_SPACE_LOCATION};
+                ph(kPhLocateAim, (int)h);
                 if (XR_SUCCEEDED(xrLocateSpace(g_aim_space[h], g_space,
                                                fs.predictedDisplayTime, &hl)) &&
                     (hl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
@@ -3640,10 +6831,29 @@ void on_present(const d3d11::State& st) {
                 } else {
                     g_in_track[s].store(false, std::memory_order_relaxed);
                 }
+                // BUILD 162: the grip pose, orientation only, same pass and
+                // same predicted time, so the two frames describe one
+                // instant of the same controller.
+                bool gtr = false;
+                if (g_grip_space[h]) {
+                    XrSpaceLocation gl{XR_TYPE_SPACE_LOCATION};
+                    ph(kPhLocateGrip, (int)h);
+                    if (XR_SUCCEEDED(xrLocateSpace(g_grip_space[h], g_space,
+                                                   fs.predictedDisplayTime, &gl)) &&
+                        (gl.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+                        g_in_gori[s][0].store(gl.pose.orientation.x, std::memory_order_relaxed);
+                        g_in_gori[s][1].store(gl.pose.orientation.y, std::memory_order_relaxed);
+                        g_in_gori[s][2].store(gl.pose.orientation.z, std::memory_order_relaxed);
+                        g_in_gori[s][3].store(gl.pose.orientation.w, std::memory_order_relaxed);
+                        gtr = true;
+                    }
+                }
+                g_in_gtrack[s].store(gtr, std::memory_order_relaxed);
                 XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
                 gi.action = g_act_trig;
                 gi.subactionPath = g_hand[h];
                 XrActionStateFloat tf{XR_TYPE_ACTION_STATE_FLOAT};
+                ph(kPhActionState, (int)s);
                 if (XR_SUCCEEDED(xrGetActionStateFloat(g_session, &gi, &tf)) && tf.isActive)
                     g_in_trig[s].store(tf.currentState, std::memory_order_relaxed);
                 gi.action = g_act_grip;
@@ -3681,21 +6891,56 @@ void on_present(const d3d11::State& st) {
                     if (XR_SUCCEEDED(xrGetActionStateBoolean(g_session, &gi2, &ab)) &&
                         ab.isActive && ab.currentState)
                         btn |= h == 0 ? headpose::PAD_LTHUMB : headpose::PAD_RTHUMB;
-                    if (g_in_grip[h].load(std::memory_order_relaxed) >= 0.6f)
+                    // Build 145: with the grip-gated hold on, the OFF hand's
+                    // squeeze belongs to the weapon, not the pad, so it no
+                    // longer presses a bumper in game. The gun-hand grip
+                    // keeps its bumper.
+                    const bool offhand =
+                        (h == 0) == (g_main_hand.load(
+                                         std::memory_order_relaxed) != 0);
+                    if (g_in_grip[h].load(std::memory_order_relaxed) >= 0.6f &&
+                        !(offhand && g_cfg_wgun_two_grip >= 0.5f))
                         btn |= h == 0 ? headpose::PAD_LB : headpose::PAD_RB;
                 }
+                // Build 145: publish the off-hand squeeze for the grip gate.
+                camera::set_grip_off(
+                    g_in_grip[g_main_hand.load(std::memory_order_relaxed)
+                                  ? 0 : 1]
+                        .load(std::memory_order_relaxed));
                 const struct { XrAction a; uint32_t bit; } bmap[] = {
                     {g_act_btn_a, headpose::PAD_A}, {g_act_btn_b, headpose::PAD_B},
                     {g_act_btn_x, headpose::PAD_X}, {g_act_btn_y, headpose::PAD_Y},
                     {g_act_menu,  headpose::PAD_START},
                 };
                 gi2.subactionPath = XR_NULL_PATH;
+                // BUILD 300: with a hold time set, the left menu button is not Start while it is down: a hold of lean_hold_ms recentres
+                // (the Home recenter), and a shorter press is sent as a 120 ms Start when it is released.
+                const int hold_ms = g_lean_hold_ms.load(std::memory_order_relaxed);
+                bool menu_down = false;
                 for (const auto& m : bmap) {
                     gi2.action = m.a;
                     ab = {XR_TYPE_ACTION_STATE_BOOLEAN};
-                    if (XR_SUCCEEDED(xrGetActionStateBoolean(g_session, &gi2, &ab)) &&
-                        ab.isActive && ab.currentState)
-                        btn |= m.bit;
+                    const bool on = XR_SUCCEEDED(xrGetActionStateBoolean(g_session, &gi2, &ab)) && ab.isActive && ab.currentState;
+                    if (m.bit == headpose::PAD_START && hold_ms > 0) { menu_down = on; continue; }
+                    if (on) btn |= m.bit;
+                }
+                if (hold_ms > 0) {
+                    static bool s_md = false, s_mfired = false;
+                    static uint64_t s_mt0 = 0, s_mpulse = 0;
+                    const uint64_t tn = GetTickCount64();
+                    if (menu_down && !s_md) { s_md = true; s_mfired = false; s_mt0 = tn; }
+                    if (menu_down && s_md && !s_mfired && tn - s_mt0 >= (uint64_t)hold_ms) {
+                        s_mfired = true;
+                        g_have_ref = false;
+                        g_aim_resync.store(true, std::memory_order_relaxed);
+                        g_lean_rc_menu.fetch_add(1, std::memory_order_relaxed);
+                        note("VR: recenter requested (left menu button held). Head reference and lean origin will re-capture.");
+                    }
+                    if (!menu_down && s_md) {
+                        s_md = false;
+                        if (!s_mfired) { s_mpulse = tn + 120; g_lean_start_taps.fetch_add(1, std::memory_order_relaxed); }
+                    }
+                    if (tn < s_mpulse) btn |= headpose::PAD_START;
                 }
                 ax[4] = g_in_trig[0].load(std::memory_order_relaxed);
                 ax[5] = g_in_trig[1].load(std::memory_order_relaxed);
@@ -3734,7 +6979,14 @@ void on_present(const d3d11::State& st) {
     }
 
     XrFrameBeginInfo fbi{XR_TYPE_FRAME_BEGIN_INFO};
-    if (XR_FAILED(xrBeginFrame(g_session, &fbi))) return;
+    XrResult begin_r = XR_ERROR_RUNTIME_FAILURE;
+    {   // BUILD 215
+        perf::Scope sc(perf::kBegin);
+        ph(kPhBeginFrame);
+        begin_r = xrBeginFrame(g_session, &fbi);
+        ph(kPhDone);
+    }
+    if (XR_FAILED(begin_r)) return;
 
     // BUILD 10a (docs/HANDOFF.md "BUILD 10" step A): AER submission machinery.
     // Each presented frame the backbuffer is copied into ONE eye's swapchain,
@@ -3766,6 +7018,15 @@ void on_present(const d3d11::State& st) {
             vc == 2 &&
             (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) &&
             (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT);
+        if (gp && views_ok) {   // BUILD 270: the located views
+            for (int e = 0; e < 2; ++e) {
+                gp->view_q[e][0] = views[e].pose.orientation.x; gp->view_q[e][1] = views[e].pose.orientation.y;
+                gp->view_q[e][2] = views[e].pose.orientation.z; gp->view_q[e][3] = views[e].pose.orientation.w;
+                gp->view_p[e][0] = views[e].pose.position.x; gp->view_p[e][1] = views[e].pose.position.y;
+                gp->view_p[e][2] = views[e].pose.position.z;
+            }
+            gp->fl |= 1u << 2;
+        }
 
         // BUILD 10b: the measured IPD feeds the camera-side eye offset.
         if (views_ok) {
@@ -3801,7 +7062,7 @@ void on_present(const d3d11::State& st) {
             // invalidates both eyes so the bootstrap below feeds the same
             // image to both with their current located poses.
             int fresh = built_eye;
-            if (fresh < 0) {
+            if (fresh < 0 || fresh > 1) {   // BUILD 247: 2 is a true-stereo tag, not an eye index; the existing path treats it like none
                 g_eye[0].valid = false;
                 g_eye[1].valid = false;
                 fresh = 0;
@@ -3841,12 +7102,89 @@ void on_present(const d3d11::State& st) {
                 // It must run BEFORE blit_bind: the ImGui DX11 backend sets up
                 // its own pipeline state, and doing that after we bind ours
                 // would leave the eye blit drawing with ImGui's state.
-                g_menu_srv = menu::ready() ? menu::render() : nullptr;
+                {   // BUILD 215
+                    perf::Scope sc(perf::kMenu);
+                    g_menu_srv = menu::ready() ? menu::render() : nullptr;
+                }
 
                 blit_bind(st.context);
             } else {
                 g_menu_srv = nullptr;
             }
+
+            // BUILD 247: TRUE STEREO. A frame built with both cameras holds the LEFT eye in the left half of the
+            // backbuffer and the RIGHT eye in the right half; submit_halves() draws each half into its eye's
+            // canvas and fills the layer with two fresh views. rc 0 = not a halves frame, or not possible: the
+            // alternate-eye code below runs exactly as before. rc 1 = done. rc 2 = tried and failed: submit nothing.
+            //   halves frame = a stereo tag (eye 2), or no tag at all while the stereo route is live (a menu or a
+            //   loading frame in the half-viewport main view: the left half is shown, mono, rather than two images).
+            int halves_rc = 0;
+            const bool st_req = cam2::stereo_requested();
+            if (st_req) {
+                // BUILD 248: the one vertical fov (in the half viewport) both cameras are forced to render with: enough to
+                // cover each eye's whole view, horizontally and vertically, with a 3 per cent margin. The persp2 hook reads it.
+                float need_h = 0.0f, need_v = 0.0f;
+                for (int e = 0; e < 2; ++e) {
+                    need_h = std::max(need_h, std::max(-tanf(views[e].fov.angleLeft), tanf(views[e].fov.angleRight)));
+                    need_v = std::max(need_v, std::max(tanf(views[e].fov.angleUp), -tanf(views[e].fov.angleDown)));
+                }
+                float half_aspect = cam2::stereo_aspect_override();
+                if (!(half_aspect > 0.0f)) half_aspect = ((float)(g_content_w / 2u)) / (float)g_content_h;
+                if (need_h > 0.1f && need_v > 0.1f && half_aspect > 0.1f)
+                    cam2::set_stereo_target_fovy(2.0f * atanf(1.03f * std::max(need_v, need_h / half_aspect)));
+                // BUILD 249: the sky and the clouds are told the world fov by the scene override (fov_scene, which writes
+                // fs_fov), so while stereo is live fs_fov carries the FULL-WIDTH-equivalent of the stereo target: the engine
+                // then derives the target itself in a half viewport, and the world, the sky and the clouds share one frustum.
+                // (Build 248 forced the world to the target while the scene still said 1.92 and the clouds followed the head.)
+                if (cam2::stereo_live() && half_aspect > 0.1f) {
+                    float fe = 2.0f * atanf(tanf(0.5f * cam2::stereo_target_fovy()) * half_aspect / (16.0f / 9.0f));
+                    fe = std::min(2.0f, std::max(0.7f, fe));
+                    headpose::set_fs_fov(fe);
+                    g_fs_stereo_applied = true;
+                }
+            }
+            if (g_fs_stereo_applied && !cam2::stereo_live()) {   // stereo left: the cfg value is the fullscreen fov again
+                headpose::set_fs_fov(g_cfg_fs_fov_cfg);
+                g_fs_stereo_applied = false;
+            }
+            if (st_req) {
+                const bool stereo_tag = (built_eye == 2);
+                const bool halves = stereo_tag || (built_eye < 0 && cam2::stereo_live());
+                if (halves) {
+                    if (!blitting) {
+                        cam2::stereo_note_reason("the scaling blit is not available (create_blit_resources failed or the canvases are not ready): stereo needs it");
+                    } else {
+                        halves_rc = submit_halves(st, back, views, stereo_tag && !(built_flags & 0x08u),
+                                                  head_ori_ok, head_ori, built_q_ok, built_q, cfov, built_eye,
+                                                  pviews, layer);
+                        if (halves_rc == 1) submitted = true;
+                    }
+                }
+                if (gp) {   // BUILD 270: what this Present did with the frame
+                    gp->halves_rc = halves_rc;
+                    gp->cfov = cfov;
+                    if (halves) gp->fl |= 1u << 5;
+                    if (stereo_tag && !(built_flags & 0x08u)) gp->fl |= 1u << 4;
+                    if (g_head_roll_fix.load(std::memory_order_relaxed)) gp->fl |= 1u << 7;
+                    if (cam2::stereo_swap_eyes()) gp->fl |= 1u << 8;
+                    if (camera::veh_on()) gp->fl |= 1u << 9;
+                    if (camera::veh_hook_drives()) gp->fl |= 1u << 10;
+                }
+                const bool in_halves = halves_rc != 0;
+                if (!in_halves && g_stereo_prev_halves) {
+                    g_eye[0].valid = false;   // leaving stereo: the stored eyes are stereo-mode images, re-bootstrap both
+                    g_eye[1].valid = false;
+                }
+                g_stereo_prev_halves = in_halves;
+                if (!in_halves) {
+                    float pp[2][3], oo[2][4], ff[2][4];
+                    stereo_pack_views(views, pp, oo, ff);
+                    cam2::stereo_note_frame(stereo_tag && halves ? cam2::kStereoNotReady : cam2::kStereoAlt, built_eye,
+                                            d3d11::frame_count(), pp, oo, ff, cfov, g_half_w, g_half_h, 0.0f, true);
+                }
+            }
+
+            if (halves_rc == 0) {   // BUILD 247: the whole existing alternate-eye section, down to the desktop redraw
 
             // Capture the fresh frame into its eye's private texture first:
             // it is the blit source now, and the 10i stale re-copy source
@@ -3856,6 +7194,13 @@ void on_present(const d3d11::State& st) {
                                                   back, 0, nullptr);
                 if (blitting) st.context->GenerateMips(g_last_srv[fresh]);
             }
+            // BUILD 237: latch the disc's source centre WITH the picture it
+            // belongs to. This eye's content is the frame just captured, so
+            // this frame's aim tangent is the right one for it; the other eye
+            // keeps the pair it was captured with and stops being cropped
+            // around a direction its picture never saw.
+            g_pip_atx_eye[fresh] = g_pip_atx;
+            g_pip_aty_eye[fresh] = g_pip_aty;
 
             const bool fresh_ok =
                 g_canvas_ready &&
@@ -3898,6 +7243,14 @@ void on_present(const d3d11::State& st) {
                     fresh_pose.orientation = {built_q[0], built_q[1],
                                               built_q[2], built_q[3]};
                     stale_boot.orientation = fresh_pose.orientation;
+                }
+                // BUILD 202: the head roll (CX-022). The content has no roll;
+                // submit a pose with none, and the compositor levels the
+                // horizon by the head's roll. Both orientations, so the
+                // bootstrap fill and the stored re-submits agree.
+                if (g_head_roll_fix.load(std::memory_order_relaxed)) {
+                    fresh_pose.orientation = strip_roll_xr(fresh_pose.orientation);
+                    stale_boot.orientation = strip_roll_xr(stale_boot.orientation);
                 }
                 // BUILD 10L: the recommended per-eye fov is now the TRUTH,
                 // because the canvas is shaped to it and the content sits
@@ -3990,6 +7343,8 @@ void on_present(const d3d11::State& st) {
                 }
             }
 
+            }   // BUILD 247: end of the alternate-eye section (halves_rc == 0)
+
             // BUILD 11a: hand the context back to the game exactly as found.
             if (blitting) ctx_restore(st.context, saved);
         }
@@ -4002,10 +7357,54 @@ void on_present(const d3d11::State& st) {
     fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     fei.layerCount           = submitted ? 1 : 0;
     fei.layers               = submitted ? layers : nullptr;
-    xrEndFrame(g_session, &fei);
+    {   // BUILD 215: the submit, timed apart from our own work
+        perf::Scope sc(perf::kEnd);
+        ph(kPhEndFrame);
+        xrEndFrame(g_session, &fei);
+        ph(kPhDone);
+    }
+    if (gp) {   // BUILD 270: what was submitted (the guard commits the row when this function returns)
+        gp->qpc_end = gtrec::qpc_now();
+        if (submitted) {
+            gp->fl |= 1u << 6;
+            for (int e = 0; e < 2; ++e) {
+                const XrPosef& lp = pviews[e].pose;
+                gp->label_q[e][0] = lp.orientation.x; gp->label_q[e][1] = lp.orientation.y;
+                gp->label_q[e][2] = lp.orientation.z; gp->label_q[e][3] = lp.orientation.w;
+                gp->label_p[e][0] = lp.position.x; gp->label_p[e][1] = lp.position.y; gp->label_p[e][2] = lp.position.z;
+                gp->label_fov[e][0] = pviews[e].fov.angleLeft; gp->label_fov[e][1] = pviews[e].fov.angleRight;
+                gp->label_fov[e][2] = pviews[e].fov.angleUp;   gp->label_fov[e][3] = pviews[e].fov.angleDown;
+            }
+        }
+    }
+    if (submitted) anatomy::on_stereo_submit();   // BUILD 241: starts the anatomy clock, first time only
+    if (submitted) census::on_stereo_submit();    // BUILD 242: starts the census clock, first time only
 }
 
 bool active() { return g_active.load(); }
+
+// BUILD 228: the phase the render thread last entered, for the heartbeat.
+const char* frame_phase() {
+    static char buf[64];
+    static const char* const kName[] = {
+        "idle", "xrWaitFrame", "xrBeginFrame", "xrCreateSwapchain",
+        "xrEnumerateSwapchainImages", "xrAcquireSwapchainImage(copy)",
+        "xrWaitSwapchainImage(copy)", "xrAcquireSwapchainImage(blit)",
+        "xrWaitSwapchainImage(blit)", "xrEndFrame", "returned",
+        "Present entry (before any OpenXR call)", "xrPollEvent",
+        "xrBeginSession", "xrEndSession", "xrLocateSpace(view)",
+        "xrLocateSpace(stage)", "xrSyncActions", "xrLocateSpace(aim)",
+        "xrLocateSpace(grip)", "xrGetActionStateFloat",
+        "on_present_body (the D3D side of the present)",
+        "ffr::present_tick", "the camera 1 Hz samples"
+    };
+    int p = g_phase.load(std::memory_order_relaxed);
+    if (p < 0 || p >= kPhCount) p = kPhIdle;
+    const int e = g_phase_eye.load(std::memory_order_relaxed);
+    if (e < 0) return kName[p];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%s eye %d", kName[p], e);
+    return buf;
+}
 
 void drain_log() {
     // BUILD 119d: drain the one-shot slot FIRST and independently, so a
@@ -4020,7 +7419,266 @@ void drain_log() {
 // BUILD 13b: 1 Hz controller state line, heartbeat thread. Position in LOCAL
 // meters, orientation quaternion, trigger 0..1. Silent until a hand tracks,
 // so headset-only runs stay uncluttered.
+// BUILD 215: THE MOD'S OWN TIME, once a second (CX-029, item 4.16).
+//
+// The frame rate decays after about ninety good seconds on the same binary
+// and cfg, with every 6DOF feature and the clouds fix ruled out by controlled
+// runs; that shape is an accumulation, and nothing the mod does per frame had
+// ever been timed. This line answers "is it ours": if ours, rig or cam grow
+// over the run while fps falls, the accumulation is in the mod and the phase
+// names it; if they stay flat and nothing of the process climbs, it is the
+// game's or the runtime's, and the answer is headroom (foveated rendering,
+// then upscaling). Init thread only: the process queries and the COM below are
+// banned in Present (rule 8). The line is assembled from short pieces, each
+// with its arguments beside its format, so no field can lose its argument.
+namespace {
+struct PerfLine {
+    char s[1400] = {};
+    int  p = 0;
+    void add(const char* fmt, ...) {
+        if (p >= (int)sizeof(s) - 1) return;
+        va_list ap;
+        va_start(ap, fmt);
+        const int w = vsnprintf(s + p, sizeof(s) - (size_t)p, fmt, ap);
+        va_end(ap);
+        if (w < 0) return;
+        p += w;
+        if (p > (int)sizeof(s) - 1) p = (int)sizeof(s) - 1;
+    }
+};
+}  // namespace
+
+static void perf_log() {
+    static int64_t       s_last        = 0;
+    static uint64_t      s_last_faults = 0;
+    static IDXGIAdapter3* s_adapter3   = nullptr;
+    static bool          s_adapter_tried = false;
+
+    const int64_t t  = perf::now();
+    const double  dt = s_last ? (double)(t - s_last) / (double)perf::freq() : 0.0;
+    s_last = t;
+
+    const perf::Take pr = perf::take(perf::kPresent);
+    const perf::Take wt = perf::take(perf::kWait);
+    const perf::Take bg = perf::take(perf::kBegin);
+    const perf::Take en = perf::take(perf::kEnd);
+    const perf::Take mn = perf::take(perf::kMenu);
+    const perf::Take rg = perf::take(perf::kRig);
+    const perf::Take ff = perf::take(perf::kFfr);   // BUILD 216
+    perf::Take cam[perf::kNumCam];
+    uint64_t cam_n = 0;
+    double   cam_sum = 0.0, cam_max = 0.0;
+    for (int i = 0; i < perf::kNumCam; ++i) {
+        cam[i] = perf::take(perf::kCam0 + i);
+        cam_n   += cam[i].n;
+        cam_sum += cam[i].sum_ms;
+        if (cam[i].max_ms > cam_max) cam_max = cam[i].max_ms;
+    }
+    const double   k      = 1000.0 / (double)perf::freq();
+    const double   ft_max = (double)perf::g_ft_max.exchange(0, std::memory_order_relaxed) * k;
+    const uint64_t over20 = perf::g_ft_over20.exchange(0, std::memory_order_relaxed);
+    const uint64_t over28 = perf::g_ft_over28.exchange(0, std::memory_order_relaxed);
+    const uint64_t lines  = perf::g_log_lines.exchange(0, std::memory_order_relaxed);
+    const uint64_t bytes  = perf::g_log_bytes.exchange(0, std::memory_order_relaxed);
+
+    // the first tick has no interval: the accumulators are reset and nothing is rated
+    if (dt <= 0.0) return;
+    // nothing presented (the game loading, VR not armed): keep the log quiet
+    if (pr.n == 0 && rg.n == 0 && cam_n == 0) return;
+
+    const double ours = pr.sum_ms - wt.sum_ms - bg.sum_ms - en.sum_ms;
+    const double fps  = (double)pr.n / dt;
+
+    // the process, cheap, this thread only
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    double   ws_mb = 0.0, priv_mb = 0.0;
+    uint64_t faults = 0;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+        ws_mb   = (double)pmc.WorkingSetSize / (1024.0 * 1024.0);
+        priv_mb = (double)pmc.PrivateUsage   / (1024.0 * 1024.0);
+        faults  = pmc.PageFaultCount;
+    }
+    const uint64_t dfaults = (s_last_faults && faults >= s_last_faults) ? faults - s_last_faults : 0;
+    s_last_faults = faults;
+    DWORD handles = 0;
+    GetProcessHandleCount(GetCurrentProcess(), &handles);
+    const DWORD gdi = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+    const DWORD usr = GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
+
+    // the process's video memory, from the adapter the game's device sits on;
+    // resolved once the device exists, and that one attempt is never retried
+    ID3D11Device* dev = d3d11::state().device;
+    if (!s_adapter_tried && dev) {
+        s_adapter_tried = true;
+        IDXGIDevice*  dd  = nullptr;
+        if (SUCCEEDED(dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dd)) && dd) {
+            IDXGIAdapter* ad = nullptr;
+            if (SUCCEEDED(dd->GetAdapter(&ad)) && ad) {
+                if (FAILED(ad->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&s_adapter3)))
+                    s_adapter3 = nullptr;
+                ad->Release();
+            }
+            dd->Release();
+        }
+    }
+    double vloc = -1.0, vnon = -1.0;
+    if (s_adapter3) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
+        if (SUCCEEDED(s_adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi)))
+            vloc = (double)mi.CurrentUsage / (1024.0 * 1024.0);
+        if (SUCCEEDED(s_adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mi)))
+            vnon = (double)mi.CurrentUsage / (1024.0 * 1024.0);
+    }
+
+    PerfLine L;
+    L.add("perf: dt=%.2fs fps=%.1f ftmax=%.1fms over20=%llu over28=%llu",
+          dt, fps, ft_max, (unsigned long long)over20, (unsigned long long)over28);
+    L.add(" | present n=%llu sum=%.2f max=%.2f",
+          (unsigned long long)pr.n, pr.sum_ms, pr.max_ms);
+    L.add(" | wait sum=%.2f max=%.2f | begin sum=%.2f max=%.2f | end sum=%.2f max=%.2f",
+          wt.sum_ms, wt.max_ms, bg.sum_ms, bg.max_ms, en.sum_ms, en.max_ms);
+    L.add(" | menu sum=%.2f max=%.2f | ours=%.2f",
+          mn.sum_ms, mn.max_ms, ours);
+    L.add(" | rig n=%llu sum=%.2f max=%.3f",
+          (unsigned long long)rg.n, rg.sum_ms, rg.max_ms);
+    L.add(" | cam n=%llu sum=%.2f max=%.3f",
+          (unsigned long long)cam_n, cam_sum, cam_max);
+    for (int i = 0; i < perf::kNumCam; ++i) {
+        if (!cam[i].n) continue;
+        L.add(" c%d=%llu/%.2f", i, (unsigned long long)cam[i].n, cam[i].sum_ms);
+    }
+    L.add(" | ffr n=%llu sum=%.2f max=%.3f",
+          (unsigned long long)ff.n, ff.sum_ms, ff.max_ms);
+    {   // BUILD 216: the GPU's own busy share in the second, NVAPI, this thread only (-1 = unavailable)
+        int fb = -1;
+        const int gu = ffr::gpu_util(&fb);
+        L.add(" | gpu util=%d fb=%d", gu, fb);
+    }
+    L.add(" | log lines=%llu kb=%.1f",
+          (unsigned long long)lines, (double)bytes / 1024.0);
+    L.add(" | mem ws=%.0fMB priv=%.0fMB faults=%llu handles=%lu gdi=%lu user=%lu",
+          ws_mb, priv_mb, (unsigned long long)dfaults, (unsigned long)handles, (unsigned long)gdi, (unsigned long)usr);
+    L.add(" | vram local=%.0fMB nonlocal=%.0fMB",
+          vloc, vnon);
+    LOG_INFO("%s (build 215/216: the mod's own CPU in the second, ms; ffr the render-target bind hook per bind, "
+             "gpu util the GPU's busy share from NVAPI (-1 unavailable); present is the whole Present hook, wait/begin/end "
+             "the OpenXR runtime calls inside it, ours = present minus those; rig is the gun-root and arm write per "
+             "call; cam the camera and skeleton hooks by target, cN=calls/ms; max the worst single call; mem and "
+             "vram are the whole process)", L.s);
+}
+
 void drain_input() {
+    // BUILD 191: the fov root line, 1 Hz, before the input gate, so its off
+    // state and its counters are on record even when OpenXR input is not.
+    camera::fovroot_log();
+    camera::fovsrc_log();   // BUILD 197
+    camera::fovscene_log(); // BUILD 198
+    camera::sprint_log();   // BUILD 200: the sprint probe's drain
+    camera::lead_log();     // BUILD 201
+    camera::gpair_log();    // BUILD 277: the pairing recorder's drain
+    camera::late_log();     // BUILD 278
+    roll_log();             // BUILD 202
+    perf_log();             // BUILD 215: the mod's own time, before any gate
+    ffr::tick_1hz();        // BUILD 216: NVAPI init on the first tick with a device, the mask, the ffr: line
+    {   // BUILD 229: the canvas that was actually built, once, as a WARN so
+        // it survives the quiet log at log_diag = 0.
+        static bool s_said = false;
+        if (!s_said && g_canvas_ready) {
+            s_said = true;
+            const double mp_before = (double)g_clamp_from_w * g_clamp_from_h / 1e6;
+            const double mp_after  = (double)g_sc_w * g_sc_h / 1e6;
+            LOG_WARN("xrcanvas: eye canvas %ux%u (%.1f MP). Unclamped it would "
+                     "have been %ux%u (%.1f MP); the runtime recommends %ux%u, "
+                     "content is %ux%u, canvas_clamp = %d. Restore the old "
+                     "canvas with canvas_clamp = 0 and a relaunch.",
+                     g_sc_w, g_sc_h, mp_after,
+                     g_clamp_from_w, g_clamp_from_h, mp_before,
+                     g_rec_w, g_rec_h, g_content_w, g_content_h,
+                     g_cfg_canvas_clamp.load(std::memory_order_relaxed));
+        }
+    }
+    {   // BUILD 228: the swapchain-image wait bound. WARN so it survives the
+        // quiet log: log_diag = 0 drops INFO instrument lines and every
+        // tester runs the shipped default.
+        static unsigned s_c = 0, s_b = 0;
+        const unsigned c = g_img_to_copy.load(std::memory_order_relaxed);
+        const unsigned b = g_img_to_blit.load(std::memory_order_relaxed);
+        if (c != s_c || b != s_b) {
+            LOG_WARN("xrimg: xrWaitSwapchainImage TIMED OUT, bound %d ms "
+                     "(copy=%u blit=%u total, +%u +%u this second). That eye "
+                     "was skipped and the frame was still submitted with no "
+                     "layer, so Present returns and the game keeps running. "
+                     "xr_img_timeout_ms = 0 restores the unbounded wait.",
+                     g_cfg_img_timeout.load(std::memory_order_relaxed),
+                     c, b, c - s_c, b - s_b);
+            s_c = c; s_b = b;
+        }
+    }
+    LOG_INFO("hpos: on=%d ref=%d frames=%llu clamps=%llu refs=%llu last=(x %+.3f f %+.3f u %+.3f) m "
+             "(build 204: the head's translation since the reference, head-local, as published to the "
+             "camera hook; x right, f forward, u up; a lean forward shows as f growing; Home re-zeroes)",
+             g_head_pos_on.load(std::memory_order_relaxed), g_head_ref_ok ? 1 : 0,
+             (unsigned long long)g_hp_frames.load(std::memory_order_relaxed),
+             (unsigned long long)g_hp_clamps.load(std::memory_order_relaxed),
+             (unsigned long long)g_hp_refs.load(std::memory_order_relaxed),
+             g_hp_last[0].load(std::memory_order_relaxed), g_hp_last[1].load(std::memory_order_relaxed),
+             g_hp_last[2].load(std::memory_order_relaxed));   // BUILD 204
+    LOG_INFO("stance: on=%d stage=%d height=%.2f stand=%.2f src=%d ratio=%.2f drop=%.2f thr=%.2f/%.2f desired=%d actual=%d dz=%.2f dzmax=%.2f | "
+             "taps=%llu holds=%llu fights=%llu changes=%llu manual=%llu seated=%d b=%d (build 205: 0 stand 1 crouch 2 prone; desired from the "
+             "physical height over the standing maximum, actual from the character's head bone; taps and holds "
+             "are the pad's B the loop pressed; fights are back-offs after four acts without effect; build 301: drop = metres below "
+             "the standing height taken at the recentre, thr = crouch_drop / crouch_rise)",
+             g_stance_on.load(std::memory_order_relaxed), g_st_stage_ok ? 1 : 0, g_st_height, g_st_hstand, g_st_src,
+             g_st_hstand > 1.0f ? g_st_height / g_st_hstand : 0.0f, g_st_drop,
+             g_crouch_drop.load(std::memory_order_relaxed), g_crouch_rise.load(std::memory_order_relaxed), g_st_desired, g_st_actual,
+             [](){ float d = 0.0f; headpose::head_dz(&d); return d; }(), g_st_dzmax,
+             (unsigned long long)g_st_taps.load(std::memory_order_relaxed),
+             (unsigned long long)g_st_holds.load(std::memory_order_relaxed),
+             (unsigned long long)g_st_fights.load(std::memory_order_relaxed),
+             (unsigned long long)g_st_changes.load(std::memory_order_relaxed),
+             (unsigned long long)g_st_manual.load(std::memory_order_relaxed), g_st_seated ? 1 : 0,
+             headpose::stance_b() ? 1 : 0);   // BUILD 205, 207
+    LOG_INFO("leanin: soft=%llu menu_hold_recentres=%llu start_taps=%llu (build 300: soft = present frames the horizontal offset was past where "
+             "the easing begins; menu_hold_recentres = left menu button held to recentre; start_taps = short presses sent to the game as Start on release)",
+             (unsigned long long)g_lean_soft_n.load(std::memory_order_relaxed),
+             (unsigned long long)g_lean_rc_menu.load(std::memory_order_relaxed),
+             (unsigned long long)g_lean_start_taps.load(std::memory_order_relaxed));   // BUILD 300
+    LOG_INFO("recenter: refs=%llu | runtime local=%llu absorbed=%llu stage=%llu other=%llu | home_space=%llu fp_f2=%llu session=%llu "
+             "(build 212: every re-zero of the view by source. A re-zero re-takes the YAW reference and turns the world to where the head "
+             "points, and resets the standing height: absorbed ones do neither, the view does not move at all)",
+             (unsigned long long)g_hp_refs.load(std::memory_order_relaxed),
+             (unsigned long long)g_rc_local.load(std::memory_order_relaxed),
+             (unsigned long long)g_rc_absorbed.load(std::memory_order_relaxed),
+             (unsigned long long)g_rc_stage.load(std::memory_order_relaxed),
+             (unsigned long long)g_rc_other.load(std::memory_order_relaxed),
+             (unsigned long long)g_rc_key.load(std::memory_order_relaxed),
+             (unsigned long long)g_rc_fp.load(std::memory_order_relaxed),
+             (unsigned long long)g_rc_begin.load(std::memory_order_relaxed));   // BUILD 212
+    {   // BUILD 209, 210, 211
+        unsigned long long inj = 0, injblk = 0; int injmax = 0;
+        headpose::follow_inj_counts(&inj, &injblk, &injmax);
+        LOG_INFO("follow: on=%d st=%d dist=%.2f stick=%.2f vbody=%.2f vhead=%.2f | frames=%llu advances=%llu adv=%.3f | "
+                 "closes=%llu settles=%llu blocked=%llu bleeds=%llu bled=%.2f | teleports=%llu user=%llu rush=%llu nocam=%llu far=%llu | "
+                 "inj=%llu injblk=%llu injmax=%d "
+                 "(build 211: st 0 idle 1 closing 2 coast 3 settle; dist the horizontal head offset in the head's yaw frame; vbody the "
+                 "character's own speed, which decides the stop; bled the metres the settle took out of the view; inj the polls the game "
+                 "was handed the follow's stick and injmax the largest axis of it, of 32767)",
+                 g_follow_on.load(std::memory_order_relaxed), g_fl_state.load(std::memory_order_relaxed),
+                 g_fl_dist.load(std::memory_order_relaxed), g_fl_stick.load(std::memory_order_relaxed),
+                 g_fl_vbody.load(std::memory_order_relaxed), g_fl_vhead.load(std::memory_order_relaxed),
+                 (unsigned long long)g_fl_frames.load(std::memory_order_relaxed),
+                 (unsigned long long)g_fl_advances.load(std::memory_order_relaxed), g_fl_adv.load(std::memory_order_relaxed),
+                 (unsigned long long)g_fl_closes.load(std::memory_order_relaxed),
+                 (unsigned long long)g_fl_settles.load(std::memory_order_relaxed),
+                 (unsigned long long)g_fl_blocked.load(std::memory_order_relaxed),
+                 (unsigned long long)g_fl_bleeds.load(std::memory_order_relaxed), g_fl_bled.load(std::memory_order_relaxed),
+                 (unsigned long long)g_fl_teleports.load(std::memory_order_relaxed),
+                 (unsigned long long)g_fl_user.load(std::memory_order_relaxed),
+                 (unsigned long long)g_fl_rush.load(std::memory_order_relaxed),
+                 (unsigned long long)g_fl_nocam.load(std::memory_order_relaxed),
+                 (unsigned long long)g_fl_far.load(std::memory_order_relaxed), inj, injblk, injmax);
+    }
     if (!g_input_ok) return;
     // Build 23.1: controller-aim diagnostic, logged whenever VR aim is on
     // with the controller source, even if pose flags look off.
@@ -4032,6 +7690,138 @@ void drain_input() {
                  g_ctl_diag[2].load(std::memory_order_relaxed) * 57.29578f,
                  g_ctl_diag[3].load(std::memory_order_relaxed) * 57.29578f,
                  g_ctl_diag_ok.load(std::memory_order_relaxed) ? 1 : 0);
+    }
+    // 2026-09-01: the look-reversal probe. Three yaws side by side, 1 Hz:
+    // head is what the pump was fed, view is the engine's own view forward
+    // (aim getter, world basis, yaw = atan2(x, y)), eng is the engine's
+    // absolute setter yaw. Protocol: stand still, turn the head slowly left,
+    // then right. head against view answers "is look reversed" end to end;
+    // eng says which side of the pump any flip sits on. Log-only.
+    // BUILD 159, log-only rider on 158 (CX-015): the owner localized the
+    // reversal to VEHICLES ("the first person in vehicles is reveresed");
+    // the 2026-09-01 on-foot runs could not reproduce it (54 of 56 turn
+    // windows agreed). fov is the discriminator this line was missing:
+    // on-foot world sits 0.78..0.87, sprint and vehicle ride near 1.22. The
+    // protocol gains one leg: while DRIVING, sweep the head slowly left,
+    // then right. The fov column marks the vehicle windows; head against
+    // view inside them names the leg that reverses, and only then does any
+    // sign change anywhere.
+    if (camera::aim_available()) {
+        float vf[3];
+        const bool vok = aimtrace::view_fwd(vf);
+        LOG_INFO("aimref: head=%+7.1f view=%+7.1f eng=%+7.1f deg fov=%.3f "
+                 "v_ok=%d",
+                 g_aimref_head.load(std::memory_order_relaxed) * 57.29578f,
+                 (vok ? atan2f(vf[0], vf[1]) : 0.0f) * 57.29578f,
+                 camera::aim_lastval(0) * 57.29578f,
+                 headpose::read_fov(0.0f), vok ? 1 : 0);
+    }
+    {   // BUILD 289: flush the recoil ring to GRWVR\recoil-<pid>.csv (drain thread only; never the Present thread)
+        const uint32_t w = g_rc_w.load(std::memory_order_acquire);
+        if (g_rc_on.load(std::memory_order_relaxed) && w != g_rc_r) {
+            uint32_t from = g_rc_r;
+            if (w - from > kRcN) from = w - kRcN;     // the ring wrapped: keep the newest
+            static FILE* s_f = nullptr;
+            if (!s_f) {
+                const std::wstring p = log::data_dir() + L"\\recoil-" + std::to_wstring(GetCurrentProcessId()) + L".csv";
+                if (_wfopen_s(&s_f, p.c_str(), L"w") != 0) s_f = nullptr;
+                if (s_f) {
+                    fprintf(s_f, "t_ms,shots,trig,eng_deg,base_deg,head_deg,calls,ep_deg,barrel_deg,view_deg,cum_deg,flags,fov,obj\n");
+                    LOG_INFO("recoil: recorder ON, writing recoil-%lu.csv (build 289/292, log only: one row per Present; eng = the pitch the engine "
+                             "passes to SetPitch, base = the camera base pitch, head = what the pump chases, cum = the pump's booked pitch, "
+                             "flags bit0 barrel block ran, bit1 pump live, bit2 firing, bit3 delta in flight; fov in radians, low = ADS)",
+                             (unsigned long)GetCurrentProcessId());
+                }
+            }
+            if (s_f) {
+                for (uint32_t i = from; i != w; ++i) {
+                    const RcRow& r = g_rc[i & (kRcN - 1)];
+                    fprintf(s_f, "%u,%u,%.2f,%.2f,%.2f,%.2f,%u,%.2f,%.2f,%.2f,%.2f,%u,%.3f,%x\n", r.t_ms, r.shots, r.trig, r.eng, r.base, r.head,
+                            r.calls, r.ep, r.barrel, r.view, r.cum, (unsigned)r.flags, r.fov, r.obj);
+                }
+                fflush(s_f);
+            }
+            g_rc_r = w;
+        }
+    }
+    // BUILD 260: THE VEHICLE INSTRUMENT. Log only, no behaviour. The 2026-10-07 drive on the 251 baseline showed the
+    // game's vehicle camera owns the view (the picture follows the car whatever the head does; it swings to the rear
+    // view when reversing). Before any fix is built the project needs a VEHICLE STATE it can detect and a VEHICLE
+    // HEADING that stays steady while the engine camera swings. This line prints both candidates side by side:
+    //   gate   = the 2026-09-08 composite (VEHICLE-2026-09-08 section 6.2): A the camera is more than 3 m from the
+    //            character, B the head bone sits 0.55..0.85 m above the origin (seated), C the first person anchor is live.
+    //            The raw flags are printed so the thresholds can be judged against a real drive; edges = transitions.
+    //   cam    = the engine camera's forward, as yaw (atan2(x, y), degrees, the same convention as aimref view) and the
+    //            z component of that forward (up). This is the one that swings to the rear when reversing.
+    //   root / head = the three model axes X Y Z of the pose root (the body) and of the head bone, each as
+    //            yaw/up: the forward axis is the one whose up is near 0 and whose yaw follows the vehicle. If a
+    //            seated character's body turns with the vehicle and does NOT swing when reversing, it is the base the
+    //            head should be composed onto.
+    //   vel    = the character origin's speed over the last second, its yaw heading, and its dot product with each
+    //            root axis; the sign on the forward axis flips when the vehicle reverses.
+    // Drive one loop that includes reversing. Judge the lines against that drive.
+    if (g_veh_probe.load(std::memory_order_relaxed)) {
+        camera::VehSample vs;
+        camera::veh_sample(&vs);
+        camera::MvpStats ms;
+        camera::mvp_stats(&ms);
+        {   // BUILD 262: dump the per-frame record on the way out of a vehicle and every ten seconds inside one
+            static bool s_on_prev = false;
+            static int s_dump_tick = 0;
+            if ((s_on_prev && !vs.veh_on) || (vs.veh_on && ++s_dump_tick >= 10)) {
+                camera::veh_dump_csv();
+                s_dump_tick = 0;
+            }
+            s_on_prev = vs.veh_on;
+        }
+        float crot[9] = {}, cpos[3] = {};
+        const bool cam_ok = camera::base_frame(crot, cpos);
+        static ULONGLONG s_prev_ms = 0;
+        static float     s_prev_o[3] = {};
+        static bool      s_prev_ok = false;
+        static bool      s_gate_prev = false;
+        static unsigned  s_edges = 0;
+        const ULONGLONG nowms = GetTickCount64();
+        float vel[3] = {}, speed = 0.0f, vyaw = 0.0f;
+        bool vel_ok = false;
+        if (vs.origin_ok && s_prev_ok && nowms > s_prev_ms) {
+            const float dt = (float)(nowms - s_prev_ms) / 1000.0f;
+            if (dt > 0.2f && dt < 3.0f) {
+                for (int i = 0; i < 3; ++i) vel[i] = (vs.origin[i] - s_prev_o[i]) / dt;
+                speed = sqrtf(vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2]);
+                vyaw = atan2f(vel[0], vel[1]) * 57.29578f;
+                vel_ok = true;
+            }
+        }
+        s_prev_ok = vs.origin_ok;
+        s_prev_ms = nowms;
+        if (vs.origin_ok) memcpy(s_prev_o, vs.origin, sizeof(s_prev_o));
+        const bool ga = vs.cam_dist > 3.0f;
+        const bool gb = vs.dz >= 0.55f && vs.dz <= 0.85f;
+        const bool gc = vs.anchored;
+        const bool gate = ga && gb && gc;
+        if (gate != s_gate_prev) { ++s_edges; s_gate_prev = gate; }
+        auto yawd = [](const float* v) { return atan2f(v[0], v[1]) * 57.29578f; };
+        const float* ra = vs.root_ax;
+        const float* ha = vs.head_ax;
+        LOG_INFO("veh: compose=%d edges=%u rootfail=%u smooth=%.2f early(w/kept/lost)=%u/%u/%u begin(used/missed)=%u/%u mvp(%s calls c0/c2/other=%u/%u/%u builds 1cam/2cam=%u/%u cam2first=%u tid same/diff=%u/%u rows eq/ne=%u/%u label hit/miss=%u/%u sites A/B/other=%u/%u/%u) | gate(raw)=%d | A dist=%.2f m (%d) B dz=%+.2f (%d) C anchored (%d) | cam yaw %+.1f up %+.2f ok=%d | "
+                 "root X %+.0f/%+.2f Y %+.0f/%+.2f Z %+.0f/%+.2f ok=%d | head X %+.0f/%+.2f Y %+.0f/%+.2f Z %+.0f/%+.2f ok=%d | "
+                 "vel %.1f m/s yaw %+.0f dotX %+.1f dotY %+.1f dotZ %+.1f ok=%d "
+                 "(build 260, log only: gate = A and B and C; axes are yaw/up of the model X, Y, Z in the world; dot = velocity "
+                 "on each root axis, its sign flips on the forward axis when reversing)",
+                 vs.veh_on ? 1 : 0, vs.veh_edges, vs.veh_rootfail, vs.veh_smooth, vs.pre_writes, vs.pre_kept, vs.pre_lost, vs.vb_used, vs.vb_missed, ms.live ? "LIVE" : "off", ms.calls[0], ms.calls[1], ms.calls[2], ms.builds_one, ms.builds_two, ms.cam2_first, ms.same_tid, ms.diff_tid, ms.rows_eq, ms.rows_ne, ms.label_hit, ms.label_miss, ms.site_a, ms.site_b, ms.site_other, gate ? 1 : 0, vs.cam_dist, ga ? 1 : 0, vs.dz, gb ? 1 : 0, gc ? 1 : 0,
+                 cam_ok ? yawd(crot + 3) : 0.0f, cam_ok ? crot[5] : 0.0f, cam_ok ? 1 : 0,
+                 vs.root_ok ? yawd(ra + 0) : 0.0f, vs.root_ok ? ra[2] : 0.0f,
+                 vs.root_ok ? yawd(ra + 3) : 0.0f, vs.root_ok ? ra[5] : 0.0f,
+                 vs.root_ok ? yawd(ra + 6) : 0.0f, vs.root_ok ? ra[8] : 0.0f, vs.root_ok ? 1 : 0,
+                 vs.head_ok ? yawd(ha + 0) : 0.0f, vs.head_ok ? ha[2] : 0.0f,
+                 vs.head_ok ? yawd(ha + 3) : 0.0f, vs.head_ok ? ha[5] : 0.0f,
+                 vs.head_ok ? yawd(ha + 6) : 0.0f, vs.head_ok ? ha[8] : 0.0f, vs.head_ok ? 1 : 0,
+                 speed, vyaw,
+                 (vel_ok && vs.root_ok) ? vel[0] * ra[0] + vel[1] * ra[1] + vel[2] * ra[2] : 0.0f,
+                 (vel_ok && vs.root_ok) ? vel[0] * ra[3] + vel[1] * ra[4] + vel[2] * ra[5] : 0.0f,
+                 (vel_ok && vs.root_ok) ? vel[0] * ra[6] + vel[1] * ra[7] + vel[2] * ra[8] : 0.0f,
+                 vel_ok ? 1 : 0);
     }
     // Build 84: barrel-aim liveness. Printed whenever the feature is armed,
     // including when it has never fired, because "armed and did nothing" and
@@ -4107,6 +7897,7 @@ void shutdown() {
     g_active.store(false);
     for (int h = 0; h < 2; ++h) {
         if (g_aim_space[h]) { xrDestroySpace(g_aim_space[h]); g_aim_space[h] = XR_NULL_HANDLE; }
+        if (g_grip_space[h]) { xrDestroySpace(g_grip_space[h]); g_grip_space[h] = XR_NULL_HANDLE; }
     }
     if (g_actionset) { xrDestroyActionSet(g_actionset); g_actionset = XR_NULL_HANDLE; }
     g_input_ok = false;
@@ -4116,6 +7907,8 @@ void shutdown() {
     for (int eye = 0; eye < 2; ++eye) {
         if (g_last_srv[eye]) { g_last_srv[eye]->Release(); g_last_srv[eye] = nullptr; }
         if (g_last[eye])     { g_last[eye]->Release();     g_last[eye]     = nullptr; }
+        if (g_half_srv[eye]) { g_half_srv[eye]->Release(); g_half_srv[eye] = nullptr; }   // BUILD 247
+        if (g_half[eye])     { g_half[eye]->Release();     g_half[eye]     = nullptr; }
     }
     g_blit_ok = false;
     // The SRV belongs to Menu.cpp, which frees it in its own shutdown; we only
@@ -4126,6 +7919,8 @@ void shutdown() {
     if (g_blit_rs)   { g_blit_rs->Release();   g_blit_rs   = nullptr; }
     if (g_blit_samp) { g_blit_samp->Release(); g_blit_samp = nullptr; }
     if (g_blit_ps)   { g_blit_ps->Release();   g_blit_ps   = nullptr; }
+    if (g_pip_ps)    { g_pip_ps->Release();    g_pip_ps    = nullptr; }   // BUILD 221
+    if (g_pip_cb)    { g_pip_cb->Release();    g_pip_cb    = nullptr; }
     if (g_blit_vs)   { g_blit_vs->Release();   g_blit_vs   = nullptr; }
     for (int eye = 0; eye < 2; ++eye) {
         for (auto* r : g_rtv[eye]) {
@@ -4165,6 +7960,9 @@ void shutdown() {
 // change IS the live-tuning mechanism: save grwxr.cfg (by hand or from
 // tools/cfg_gui) and the values apply within about a second. Called at 1 Hz
 // from the init thread's drain loop, never from Present (rule 8: file I/O).
+// BUILD 227: read by dllmain before the palette probe's draw detours install.
+bool palette_probe() { return g_palette_probe; }
+
 void poll_config() {
     static FILETIME s_last = {};
     static bool     s_have = false;
@@ -4295,7 +8093,7 @@ void step_ipd_scale(int dir) {
     // 0.05 the world reads 20x oversize and effectively flat. Printing that
     // multiplier is the whole fix: a tester cannot knowingly saturate a dial
     // that tells him what he is giving up. The BAND IS DELIBERATELY UNCHANGED
-    // at 0.00..3.00 (re-clamping is the mistake the project spec already records).
+    // at 0.00..3.00 (re-clamping is the mistake CLAUDE.md already records).
     if (v >= 0.005f) {
         LOG_INFO("hotkey: ipd_scale = %.2f (world reads %.1fx life size. "
                  "1.00 = life size. Depth cues scale as 1/ipd_scale, so far "
@@ -4356,6 +8154,16 @@ void  tune_set_apab_m(float v) {
     aimtrace::set_aimpoint_ab(aimtrace::aimpoint_ab(), g_cfg_aimpoint_m);
 }
 
+// BUILD 137: the direction write, armable and disarmable from inside the
+// headset. This one belongs in the tuner more than most: the question it
+// answers is "does the round go where the barrel points", and that is far
+// easier to answer by turning it off and on between shots than by taking the
+// headset off to edit a cfg and relaunching.
+float tune_get_shot_dir() { return aimtrace::shot_dir() ? 1.0f : 0.0f; }
+void  tune_set_shot_dir(float v) { aimtrace::set_shot_dir(v >= 0.5f); }
+float tune_get_shot_org() { return aimtrace::shot_org() ? 1.0f : 0.0f; }
+void  tune_set_shot_org(float v) { aimtrace::set_shot_org(v >= 0.5f); }
+
 float tune_get_fs_lo() { return headpose::fs_fov_lo(); }
 void  tune_set_fs_lo(float v) { headpose::set_fs_fov_lo(v); }
 
@@ -4396,6 +8204,13 @@ void  tune_set_maxstep(float v) {
 float tune_get_twohand() { return g_cfg_wgun_twohand; }
 float tune_get_two_agree() { return camera::get_wgun_two_agree(); }
 void  tune_set_two_agree(float v) { g_cfg_wgun_two_agree = v; camera::set_wgun_two_agree(v); }
+// 2026-08-31b: the attach band, live, because "how far can I drop my off hand
+// before the gun lets go" is judged by feel in the headset and nowhere else.
+float tune_get_two_attach() { return camera::get_wgun_two_attach(); }
+void  tune_set_two_attach(float v) {
+    g_cfg_wgun_two_attach = v;
+    camera::set_wgun_two_attach(v);
+}
 // BUILD 125: the eye sign, live.
 // BUILD 126: the blob test, live.
 float tune_get_grip_bypass() { return (float)camera::get_wgun_grip_bypass(); }
@@ -4435,6 +8250,84 @@ void  tune_set_twohand(float v) {
     camera::set_wgun_twohand((int)g_cfg_wgun_twohand);
 }
 
+// 2026-08-31: the hands, the anchor, and the hide slots, live, because the
+// hide slots in particular ARE a headset measurement (step until an arm
+// vanishes, then look at the hand) and taking the headset off between steps
+// is how measurements stall for weeks.
+float tune_get_hands() { return g_cfg_wgun_hands; }
+void  tune_set_hands(float v) {
+    g_cfg_wgun_hands = (v >= 0.5f) ? 1.0f : 0.0f;
+    camera::set_wgun_hands((int)g_cfg_wgun_hands);
+}
+float tune_get_hands_grab() { return g_cfg_wgun_hands_grab; }
+void  tune_set_hands_grab(float v) {
+    g_cfg_wgun_hands_grab = (v >= 0.5f) ? 1.0f : 0.0f;
+    camera::set_wgun_hands_grab((int)g_cfg_wgun_hands_grab);
+}
+float tune_get_hide_arms() { return g_cfg_wgun_hide_arms; }
+void  tune_set_hide_arms(float v) {
+    g_cfg_wgun_hide_arms = (v >= 0.5f) ? 1.0f : 0.0f;
+    camera::set_wgun_hide_arms((int)g_cfg_wgun_hide_arms);
+}
+// Build 153: the evidence reticle, on the panel so it can be armed between
+// takes without leaving the headset. These write the drawing state directly;
+// there is no camera:: call because nothing outside this file consumes them.
+float tune_get_reticle() { return (float)g_ret_mode; }
+void  tune_set_reticle(float v) {
+    g_ret_mode = (v >= 1.5f) ? 2 : (v >= 0.5f ? 1 : 0);
+}
+float tune_get_reticle_dist() { return g_ret_dist; }
+void  tune_set_reticle_dist(float v) {
+    if (v >= 1.0f && v <= 500.0f) g_ret_dist = v;
+}
+
+float tune_get_hand_free() { return g_cfg_wgun_hand_free; }
+void  tune_set_hand_free(float v) {
+    g_cfg_wgun_hand_free = (v >= 0.5f) ? 1.0f : 0.0f;
+    camera::set_wgun_hand_free((int)g_cfg_wgun_hand_free);
+}
+float tune_get_arms() { return g_cfg_wgun_arms; }
+void  tune_set_arms(float v) {
+    g_cfg_wgun_arms = (v >= 0.5f) ? 1.0f : 0.0f;
+    camera::set_wgun_arms((int)g_cfg_wgun_arms);
+}
+float tune_get_wrist() { return g_cfg_wgun_wrist; }
+void  tune_set_wrist(float v) {
+    g_cfg_wgun_wrist = (v >= 0.5f) ? 1.0f : 0.0f;
+    camera::set_wgun_wrist((int)g_cfg_wgun_wrist);
+}
+float tune_get_pitch() { return g_cfg_wgun_pitch_deg; }
+void  tune_set_pitch(float v) {
+    g_cfg_wgun_pitch_deg = v;
+    camera::set_wgun_pitch(v);
+}
+float tune_get_two_grip() { return g_cfg_wgun_two_grip; }
+void  tune_set_two_grip(float v) {
+    g_cfg_wgun_two_grip = (v >= 0.5f) ? 1.0f : 0.0f;
+    camera::set_wgun_two_grip((int)g_cfg_wgun_two_grip);
+}
+// The capture is momentary: stepping the row to 1 arms exactly one capture
+// and the row snaps back to 0, so it reads as a button.
+float tune_get_calib() { return 0.0f; }
+void  tune_set_calib(float v) {
+    if (v >= 0.5f) camera::set_hand_calib(1);
+}
+float tune_get_two_anchor() { return g_cfg_wgun_two_anchor; }
+void  tune_set_two_anchor(float v) {
+    g_cfg_wgun_two_anchor = (v >= 0.5f) ? 1.0f : 0.0f;
+    camera::set_wgun_two_anchor((int)g_cfg_wgun_two_anchor);
+}
+float tune_get_hide_child() { return g_cfg_hide_child; }
+void  tune_set_hide_child(float v) {
+    g_cfg_hide_child = (float)(int)v;
+    camera::set_hide_child(0, (int)g_cfg_hide_child);
+}
+float tune_get_hide_child2() { return g_cfg_hide_child2; }
+void  tune_set_hide_child2(float v) {
+    g_cfg_hide_child2 = (float)(int)v;
+    camera::set_hide_child(1, (int)g_cfg_hide_child2);
+}
+
 struct Tunable {
     const char* name;
     float (*get)();
@@ -4467,6 +8360,69 @@ const Tunable kTunables[] = {
     {"wgun_twohand", tune_get_twohand, tune_set_twohand, 1.00f, 0.00f, 1.00f,
      "1 aims the gun along the line between your two hands, 0 aims it along the "
      "right controller alone. Press this if the gun rotates when you shoulder"},
+    {"wgun_hands", tune_get_hands, tune_set_hands, 1.00f, 0.00f, 1.00f,
+     "THE HANDS HOLD THE GUN. 1 carries the character's hands and fingers with "
+     "the weapon so the grip you see is the animation's own, wherever you move "
+     "it. 0 leaves the hands to the animation and only the gun moves"},
+    {"wgun_hands_grab", tune_get_hands_grab, tune_set_hands_grab, 1.00f, 0.00f, 1.00f,
+     "THE GRAB. 1: the character's LEFT hand rides the weapon only while your "
+     "real off hand holds it, and stays with the animation otherwise, so idle "
+     "cannot force both hands on. 0: both hands carried always (build 139)"},
+    {"wgun_hand_free", tune_get_hand_free, tune_set_hand_free, 1.00f, 0.00f, 1.00f,
+     "HAND PRESENCE. 1: off the weapon, your character's left hand follows "
+     "your left controller, so you can reach over your shoulder or down to "
+     "your thigh and see it. The grab then slides it from your hand onto the "
+     "foregrip. 0: a free hand stays with the animation"},
+    {"wgun_arms", tune_get_arms, tune_set_arms, 1.00f, 0.00f, 1.00f,
+     "THE ARMS FOLLOW. 1: the elbows bend so each arm reaches its hand, using "
+     "the animation's own elbow direction, which is the cure for the "
+     "stretching that keeps the arms visible. 0: arms stay with the "
+     "animation. wgun_hide_arms overrides this when on"},
+    {"wgun_pitch_deg", tune_get_pitch, tune_set_pitch, 0.50f, -45.00f, 45.00f,
+     "THE BARREL-TO-BULLET TRIM. Shots print HIGH of where the barrel looks: "
+     "raise this until holes and barrel agree at a wall. Rotates only what "
+     "the gun model shows; the bullet's own line never moves, so this cannot "
+     "break the muzzle rule"},
+    {"wgun_two_grip", tune_get_two_grip, tune_set_two_grip, 1.00f, 0.00f, 1.00f,
+     "GRIP TO HOLD. 1: the two-handed aim engages only while your off hand "
+     "SQUEEZES its grip button, like native VR games, and releases when you "
+     "let go. This is the fix for the aim riding a hand that is not really "
+     "gripping. 0: the hold engages on hand positions alone"},
+    {"hand_calib", tune_get_calib, tune_set_calib, 1.00f, 0.00f, 1.00f,
+     "WINGSPAN CAPTURE, a one-shot button on a 3.5 s timer. F3 does the same "
+     "thing without opening this panel, which is the easier route. Have the "
+     "weapon OUT and move it around first (the avatar's arm lengths are only "
+     "measured while a weapon is drawn), then fire this, let go, and stand "
+     "with both controllers straight out to your sides at shoulder height. A "
+     "good capture APPLIES the arm scale and switches to first person, and "
+     "says so"},
+    {"barrel_reticle", tune_get_reticle, tune_set_reticle, 1.00f, 0.00f, 2.00f,
+     "EVIDENCE RETICLE. 1 draws a GREEN ring where the published barrel "
+     "direction points, from your own muzzle. 2 adds an ORANGE ring along "
+     "camera forward. Both sit at barrel_reticle_dist metres, so the gap between "
+     "them IS how far the gun and your head disagree, on video. The round "
+     "should land on the GREEN one. It does not predict an impact at a "
+     "different range: the camera and the muzzle are not the same point"},
+    {"barrel_reticle_dist", tune_get_reticle_dist, tune_set_reticle_dist, 5.00f,
+     1.00f, 500.00f,
+     "Metres out to place both rings. Set it to roughly your target range or "
+     "the two rings answer a question you are not asking"},
+    {"wgun_hide_arms", tune_get_hide_arms, tune_set_hide_arms, 1.00f, 0.00f, 1.00f,
+     "HIDE THE ARMS AT BONE LEVEL. Collapses both arms onto the shoulders to "
+     "kill the stretch between the animated arm and the carried hand. Try "
+     "hide_child pieces FIRST; this is the fallback if a piece takes the hand "
+     "with the arm. Off restores stock arms instantly"},
+    {"wgun_two_anchor", tune_get_two_anchor, tune_set_two_anchor, 1.00f, 0.00f, 1.00f,
+     "1 rests the weapon on your REAR hand when your right hand measures as the "
+     "front one, which is how you actually hold it. 0 is the old behaviour that "
+     "anchored to the right controller regardless. Turn off if the gun sits in "
+     "the wrong hand"},
+    {"hide_child", tune_get_hide_child, tune_set_hide_child, 1.00f, -1.00f, 63.00f,
+     "HIDE ONE BODY PIECE. Step until the piece you want gone disappears (the "
+     "log names each step). -1 is off. THE QUESTION THAT MATTERS: when an arm "
+     "vanishes, does the hand vanish with it? Say what you see"},
+    {"hide_child2", tune_get_hide_child2, tune_set_hide_child2, 1.00f, -1.00f, 63.00f,
+     "the second hide slot, same as hide_child, because you have two arms"},
     {"wgun_grip_bypass", tune_get_grip_bypass, tune_set_grip_bypass, 1.00f, 0.00f, 1.00f,
      "THE BLOB TEST. Parks the gun ON your tracked hand by ignoring the grip "
      "offset, so you can see whether the gun lands on the orange marker. Your "
@@ -4487,6 +8443,12 @@ const Tunable kTunables[] = {
      "THE TWO-HAND GATE. Refuses the front hand when the line between your hands "
      "disagrees with the right controller. Leave this at 0.35: the refusals were "
      "the backwards barrel, not a tight gate, and wgun_two_auto is the fix"},
+    {"wgun_two_attach", tune_get_two_attach, tune_set_two_attach, 0.05f, 0.25f, 3.00f,
+     "HOW FAR YOUR OFF HAND CAN LEAVE THE WEAPON before it lets go of the hold "
+     "(metres between your hands; release completes 0.15 further out). Real "
+     "holds measure 0.11 to 0.41. Raise it if the hold releases while you are "
+     "still gripping, lower it if a hanging hand still drags the gun. 3.00 "
+     "disables the release"},
     {"wgun_roll_deg", tune_get_roll_deg, tune_set_roll_deg, 5.0f, -180.0f, 180.0f,
      "rotates the gun about its own barrel. Cannot move point of aim"},
     {"wgun_pos_clamp", tune_get_pos_clamp, tune_set_pos_clamp, 0.05f, 0.05f, 8.00f,
@@ -4509,6 +8471,15 @@ const Tunable kTunables[] = {
      "or TWO?"},
     {"aimpoint_ab_m", tune_get_apab_m, tune_set_apab_m, 1.00f, 0.50f, 25.00f,
      "how far the shot test throws the aiming point each way, in metres"},
+    {"shot_dir", tune_get_shot_dir, tune_set_shot_dir, 1.00f, 0.00f, 1.00f,
+     "THE ROUND FOLLOWS THE BARREL. 1 on, 0 the game's own aim. Only touches "
+     "shots that start at your own muzzle, so it cannot reach the enemy AI. "
+     "Turn it off and on between shots to compare"},
+    {"shot_org", tune_get_shot_org, tune_set_shot_org, 1.00f, 0.00f, 1.00f,
+     "THE ROUND LEAVES THE MUZZLE. When the game builds your shot at the "
+     "CAMERA (aiming, obstruction, its hybrid shoot system) the origin is "
+     "moved back to your muzzle instead of the shot being refused. 0 restores "
+     "the build 137 refusal"},
     {"fullscreen_fov_lo", tune_get_fs_lo, tune_set_fs_lo, 0.02f, 0.05f, 1.30f,
      "AIMING DOWN SIGHTS. Step DOWN past 0.33 to stop ADS drawing as a small "
      "flat window and make it fill the view like the rest of the game"},

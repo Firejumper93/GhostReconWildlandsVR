@@ -5,7 +5,7 @@
 // y forward, z up, row-vector rows, docs/RE-notes.md "COORDINATE
 // CONVENTIONS"), and publishes it here from the Present hook. The camera hook
 // reads it at on_calc_mvp entry on an engine thread. Neither side may lock or
-// allocate (project rule 8), so the slot is a seqlock: an atomic sequence
+// allocate (CLAUDE.md rule 8), so the slot is a seqlock: an atomic sequence
 // counter around nine relaxed-atomic floats. A reader that catches the writer
 // mid-update retries, and on the (rare) torn read simply skips that call,
 // which costs at most one engine camera pass.
@@ -104,6 +104,38 @@ void set_fp_enabled(bool on);
 bool fp_enabled();
 void set_fp_forward(float meters);
 float fp_forward();
+// BUILD 204: the head's translation since the reference, head-local metres
+// (x right, f forward, u up), clamped, published by the present thread every
+// frame; the camera hook adds it to the viewpoint along the composed basis.
+// ok = false publishes nothing (the hook adds 0).
+// BUILD 207: u is the head-local vertical (rides the camera basis with x and
+// f); uh is the height model's vertical (rides world up) and use_h says
+// whether the hook should take it instead of the mapped vertical.
+void set_head_offset(float x, float f, float u, float uh, bool use_h, bool ok);
+bool head_offset(float out[4], bool* use_h);
+// BUILD 205: the character's head bone height above its origin, from the
+// camera hook while anchored (1.6 standing, 1.1 crouched, 0.3 prone); and
+// the stance loop's injected B, read by the XInput merge.
+void set_head_dz(float dz, bool anchored);
+
+// BUILD 261: the yaw reference epoch. VRMirror bumps it each time the head's yaw reference is (re)captured: the
+// first capture, the Home / Space / F2 recenters. A runtime (Meta) recenter is ABSORBED by build 212 and does not
+// bump it, because it leaves the view exactly where it was. The vehicle camera reads it to know when the head's
+// forward has been moved on purpose.
+void note_recenter();
+unsigned ref_epoch();
+bool head_dz(float* dz);
+void set_stance_b(bool held);
+bool stance_b();
+// BUILD 209: the body follow's left stick (x right, y forward, -1..1), added by
+// the XInput merge when the user's own stick is idle.
+void set_follow_stick(float x, float y, bool active);
+bool follow_stick(float* x, float* y);
+// BUILD 211: what the GAME was actually handed, counted on its own input
+// thread. The 210 run could not tell a stick the game discarded from a stick
+// it never received; this counts the polls and the largest axis written.
+void follow_injected(bool applied, int lx, int ly);
+void follow_inj_counts(unsigned long long* applied, unsigned long long* blocked, int* maxabs);
 
 // BUILD 11f: the third-person camera hangs off the RIGHT shoulder, so a
 // pure forward push lands right of the head (user report). Side (positive =
@@ -177,9 +209,9 @@ bool cam_selector_pose();
 void set_cam_pose_rot(bool on);
 bool cam_pose_rot();
 
-// Build 91: THE VIEWPOINT PLACEMENT TRIO, ported from this author's own flat
-// first-person mod for the same game, where each has a measured reason behind
-// it. The VR camera write had none of them and took the animated
+// Build 91: THE VIEWPOINT PLACEMENT TRIO, ported from this author's flat
+// first-person mod (E:\GRW-FP\flat\src\FpCamera.cpp), where each has a measured
+// reason behind it. The VR camera write had none of them and took the animated
 // head bone raw, three times a frame.
 //
 // fp_fwd    metres the eyes sit FORWARD of the head joint, which is at the base

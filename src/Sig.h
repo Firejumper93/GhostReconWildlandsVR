@@ -1,6 +1,6 @@
 // Sig.h - AOB signature scanning over the live GRW.exe image.
 //
-// project rule 7: locate engine code with unique AOB signatures, never ship a
+// CLAUDE.md rule 7: locate engine code with unique AOB signatures, never ship a
 // guessed hardcoded address, and fail loudly on a miss while leaving the game
 // running normally. CURRENT-STATE.md standing rules 1 to 3 add three more:
 //
@@ -48,6 +48,33 @@ std::optional<Image> main_image();
 // the game updated, >1 means our pattern is too short.
 std::optional<uint8_t*> find_unique(const Image& img, const char* pattern,
                                     size_t* matches_out = nullptr);
+
+// Find the single `E9 <rel32>` thunk whose jump resolves to `target`.
+//
+// WHY THIS EXISTS. Every other hook here takes its thunk RVA from the GameBuild
+// pin table, and HANDOFF-2026-08-28 method rule 6.3 measured that vtable RVAs
+// agree in 0 of 97 cases across any pair of the four pinned builds, including
+// two builds of the SAME game version from different stores. A pinned thunk RVA
+// is therefore wrong per store, not merely per patch. Deriving the thunk from
+// the body at runtime removes the pin from this hook entirely.
+//
+// Method rule 6.2 is what makes it tractable: every function reaches its callers
+// through exactly ONE jmp thunk (271,346 thunks against 316,202 .pdata records).
+// So body -> thunk is a well-posed question with one answer, and uniqueness is
+// the correctness check rather than a hopeful assumption. More than one match
+// means that rule does not hold for this function on this binary, so we return
+// nothing rather than pick one, exactly as find_unique does.
+//
+// The slot must also be safe for ThunkHook: 5 bytes of E9 rel32 followed by at
+// least 9 bytes of CC padding, which is what lets a 14-byte absolute indirect
+// jump fit without touching anything outside the slot. An unpadded thunk is not
+// returned, because overwriting it would run past the slot into whatever
+// follows.
+//
+// `matches_out` receives the true count, so a caller can tell "the game was
+// updated" (0) from "rule 6.2 does not hold here" (>1).
+std::optional<uint8_t*> find_thunk_to(const Image& img, const uint8_t* target,
+                                      size_t* matches_out = nullptr);
 
 }  // namespace sig
 }  // namespace grwxr

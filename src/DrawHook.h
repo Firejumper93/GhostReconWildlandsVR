@@ -48,6 +48,7 @@
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
+struct ID3D11RenderTargetView;
 
 namespace grwxr {
 namespace drawhook {
@@ -73,6 +74,50 @@ using Recorder = void (*)(ID3D11DeviceContext* ctx, Kind kind, uint32_t vertex_o
 // then detour each unique function. Returns the number of functions detoured,
 // 0 on failure with the reason logged. Nothing is written on failure.
 int install(ID3D11Device* dev, ID3D11DeviceContext* ctx, Recorder rec);
+
+// BUILD 216: the render-target binds, for the foveation mask (Foveate.cpp).
+// Called AFTER the real OMSetRenderTargets or
+// OMSetRenderTargetsAndUnorderedAccessViews has run, on the calling thread,
+// for every context object. n is the NumViews argument
+// (D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL means the targets did not
+// change). Rule 8 applies: no logging, no allocation, and no locks except
+// Foveate's documented NVAPI spinlock (build 218: the driver's rate calls are
+// not thread-safe across contexts).
+using RtRecorder = void (*)(ID3D11DeviceContext* ctx, uint32_t n,
+                            ID3D11RenderTargetView* const* rtvs);
+
+// Detour the two bind functions in both context classes through the same
+// machinery as install(); independent of it (either may run first, or
+// neither). All four or nothing: returns the number detoured (4, or fewer
+// when the classes share an implementation), 0 when nothing could be resolved,
+// and -1 when any one of the four was refused (what was patched passes
+// through; the owner must stay inactive). The reason is logged either way.
+int install_rt(ID3D11Device* dev, ID3D11DeviceContext* ctx, RtRecorder rec);
+
+// BUILD 241: the frame-anatomy capture (Anatomy.h). Detours, in BOTH context
+// classes, the four draw kinds, the two render-target binds, Map, Unmap,
+// UpdateSubresource, UpdateSubresource1, ExecuteCommandList and
+// FinishCommandList, each feeding the anatomy taps. ALL OR NOTHING: every
+// target is decoded against the whitelist FIRST and not one byte is written
+// unless every one decodes (rule 7). Returns the number of functions newly
+// detoured (functions another module already detoured are shared and not
+// counted), or -1 when anything was refused or could not be resolved, in which
+// case nothing was written. Independent of install() and install_rt(): either
+// order works, and they share the detours that overlap.
+//
+// IMPORTANT, measured 2026-10-05: the immediate context's vtable flips between
+// two sets of entry points (ID3D11DeviceContext::Flush -> second set,
+// ExecuteCommandList -> first set) for the draws and UpdateSubresource(1). This
+// installer samples the live vtable for about 1.5 s (it BLOCKS the calling
+// thread that long; call it from the init thread only) and detours every
+// distinct entry point it sees. install() above does not: it detours whichever
+// set the vtable shows at the moment it runs.
+int install_anatomy(ID3D11Device* dev, ID3D11DeviceContext* ctx);
+
+// BUILD 241: -1 when every anatomy slot of ctx's vtable points at a detoured
+// entry, else the first slot that does not (and that entry in *bad). Plain
+// reads; safe on the render thread.
+int anatomy_vtable_unhooked(ID3D11DeviceContext* ctx, void** bad);
 
 // Undo every detour. Safe to call if install() failed.
 void restore();

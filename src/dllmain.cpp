@@ -42,6 +42,13 @@
 #include "Voice.h"
 #include "Menu.h"
 #include "Presets.h"
+#include "StallWatch.h"   // BUILD 239: the stall watchdog's reading
+#include "Anatomy.h"      // BUILD 241: the one-window frame anatomy capture
+#include "Census.h"       // BUILD 242: the one-window camera/view census
+#include "CbDump.h"       // BUILD 246: the one-window constant-buffer content capture
+#include "Cam2.h"         // BUILD 243: the second-camera experiment
+#include "PassGuard.h"    // BUILD 259: fail-closed guard on the ProjShadow pass body
+#include "GtRec.h"        // BUILD 270: the ground-truth stereo recorder (log only, cfg gtrec, off by default)
 
 // Forward every export of the real dxgi.dll to dxgi_real.dll.
 // deploy.bat places a copy of C:\Windows\System32\dxgi.dll as dxgi_real.dll
@@ -461,10 +468,36 @@ DWORD WINAPI init_thread(LPVOID) {
 
         // Bring OpenXR up once the device exists, on OUR thread, not the render
         // thread. Session creation is slow and allocates; it must not happen
-        // inside Present (project rule 8).
+        // inside Present (CLAUDE.md rule 8).
+        //
+        // BUILD 239: and not until the game is actually presenting. st.ready is
+        // set by the FIRST Present ENTRY, so before this gate the session was
+        // built in the same instant that thread first went into DXGI, which is
+        // the instant it dies on every wedged machine we have logs for. The
+        // gate counts RETURNS, because a return is the only proof the render
+        // thread is cycling rather than parked. See VRMirror.cpp
+        // g_cfg_init_frames for the evidence and the cost.
         static bool vr_tried = false, vr_armed = false;
         const auto& st = grwxr::d3d11::state();
-        if (!vr_tried && st.ready && st.device) {
+        const int   need = grwxr::vr::init_frames();
+        const unsigned long long got = grwxr::d3d11::present_returns();
+        const bool  gate_open = (need <= 0) || (got >= (unsigned long long)need);
+        if (!vr_tried && st.ready && st.device && !gate_open) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                LOG_INFO("xrgate: the device is ready but the game has only "
+                         "completed %llu Present call(s); waiting for %d before "
+                         "starting OpenXR (cfg xr_init_frames, 0 disables). "
+                         "Build 239: a render thread that never comes back from "
+                         "its first Present must not get a VR session built "
+                         "underneath it.", got, need);
+            }
+        }
+        if (!vr_tried && st.ready && st.device && gate_open) {
+            if (need > 0)
+                LOG_INFO("xrgate: %llu Present call(s) returned, gate open. "
+                         "Starting OpenXR.", got);
             vr_tried = true;
             vr_armed = grwxr::vr::init(st);
         } else if (vr_tried && !vr_armed) {
@@ -481,8 +514,12 @@ DWORD WINAPI init_thread(LPVOID) {
         // Build 33: the skinning-palette probe (PaletteProbe.h). Installed
         // once the game's immediate context exists; inert until NUMPAD MINUS
         // arms a capture window. All its logging happens in poll(), here.
+        // BUILD 227: only when cfg palette_probe = 1. Its seven draw-call
+        // detours were the one thing still touching a frozen tester's frames
+        // in safe mode (issue 2, 2026-08-22); a research probe does not ship
+        // armed.
         static bool pal_tried = false;
-        if (!pal_tried && st.ready && st.context) {
+        if (!pal_tried && st.ready && st.context && grwxr::vr::palette_probe()) {
             pal_tried = true;
             grwxr::pal::install(st.device, st.context);
         }
@@ -508,9 +545,116 @@ DWORD WINAPI init_thread(LPVOID) {
         // do not have to put a key read in Present for it.
         grwxr::menu::poll();
 
+        // BUILD 241: the frame-anatomy state machine. Installs its hooks 20 s
+        // after the first stereo layer, opens the 240-present window at 30 s,
+        // and hands the closed window to its own dump thread. Observation only.
+        grwxr::anatomy::tick();
+        // BUILD 246: the constant-buffer content capture. Does nothing at all unless cfg
+        // cbdump_capture = 1; then it rides the anatomy hooks (installed at 20 s) and opens its own
+        // 120-present window at 30 s.
+        grwxr::cbdump::tick();
+        // BUILD 242: the camera/view census state machine. Installs its four
+        // thunk redirects 50 s after the first stereo layer, captures 240
+        // presents, then restores the thunks and dumps. Observation only.
+        grwxr::census::tick();
+        // BUILD 243: the second-camera experiment. Does nothing at all unless cfg
+        // cam2_experiment = 1; then verifies, installs and prints the 1 Hz "cam2:" lines.
+        grwxr::cam2::tick();
+        // BUILD 270: the ground-truth stereo recorder. Does nothing at all unless cfg gtrec = 1; then it arms once true
+        // stereo is live, drains its rings to GRWVR\gtrec-<pid>.bin and prints the 1 Hz "gtrec:" line.
+        grwxr::gtrec::tick();
+        // BUILD 259: the ProjShadow pass-body guard. Installs once, after frame 600 and a pin check; then logs its counters.
+        grwxr::passguard::tick();
+
         const unsigned long long now = grwxr::d3d11::frame_count();
         LOG_INFO("hb %4d  frames=%llu  (+%llu in the last second)",
                  tick, now, now - last);
+        if (now == last && grwxr::vr::active())
+            LOG_WARN("xrphase: no frame this second. The render thread last "
+                     "entered %s. (build 228: frames counts Present ENTRIES, "
+                     "so frames=1 with this line means the FIRST frame never "
+                     "returned and this is the call it is in.)",
+                     grwxr::vr::frame_phase());
+
+        // ------------------------------------------------------------------
+        // BUILD 239: THE RENDER-THREAD STALL WATCHDOG.
+        //
+        // Build 235 put a deadline on the first VR frame and wired the reading
+        // to on_present. Five reported logs later, that guard has never once
+        // fired, and the logs say why: on every wedged machine the phase
+        // counter still reads "idle", and ph(kPhBody) is the first statement of
+        // on_present, so the callback is never entered at all. The render
+        // thread enters Present once, before the mirror is even armed, and
+        // stops. A watchdog living inside that callback can never see it.
+        //
+        // So it moves here, to the thread that is demonstrably still ticking:
+        // every wedged log keeps printing heartbeats for nine more seconds
+        // after the game has stopped. StallWatch.h was written for exactly this
+        // caller ("the heartbeat thread is the intended caller"). It was built
+        // in 235 and then never given a trigger that fires.
+        //
+        // Two thresholds, both well inside the eight-to-nine second window
+        // between the last frame and the process being killed:
+        //   3 s  take the reading. Entries against returns, the first Present's
+        //        times, and a stack for every thread in the process.
+        //   6 s  stand VR down as well, so that if the thread does come back it
+        //        presents flat instead of into a session nobody is driving.
+        //
+        // The window handle gates both: the last twenty seconds of a clean
+        // 53 minute run are a tester quitting, and a normal exit must not print
+        // a crash report. Across that whole run there was never one other
+        // second without a frame, so 3 s costs nothing in false positives.
+        // ------------------------------------------------------------------
+        {
+            constexpr int kStallReport = 3;
+            constexpr int kStallStandDown = 6;
+            static int  stalled = 0;
+            static bool reported = false;
+            const auto& sst = grwxr::d3d11::state();
+            const bool  alive = sst.hwnd && IsWindow(sst.hwnd);
+
+            if (now >= 1 && now == last && alive) ++stalled; else stalled = 0;
+
+            if (stalled == kStallReport && !reported) {
+                reported = true;
+                const unsigned long long ret = grwxr::d3d11::present_returns();
+                const unsigned long long e = grwxr::d3d11::first_present_enter_ms();
+                const unsigned long long r = grwxr::d3d11::first_present_return_ms();
+                LOG_ERROR("");
+                LOG_ERROR("######## THE GAME HAS STOPPED PRESENTING ########");
+                LOG_ERROR("stall: %d s with no new frame. Present ENTRIES %llu, "
+                          "RETURNS %llu.", stalled, now, ret);
+                if (ret < now)
+                    LOG_ERROR("stall: THE RENDER THREAD (tid %lu) IS STILL INSIDE "
+                              "A PRESENT CALL THAT HAS NOT RETURNED. It is %llu "
+                              "call(s) deep. Look for that thread id in the "
+                              "snapshot below: whatever it is parked in is the "
+                              "thing to fix.",
+                              grwxr::d3d11::render_thread_id(), now - ret);
+                else
+                    LOG_ERROR("stall: every Present RETURNED (%llu of %llu). The "
+                              "render thread is not inside Present at all; it "
+                              "stopped calling it. The cause is upstream of this "
+                              "hook.", ret, now);
+                if (e)
+                    LOG_ERROR("stall: the first Present entered %llu ms ago and %s",
+                              (unsigned long long)(GetTickCount64() - e),
+                              r ? "did return" : "HAS NEVER RETURNED");
+                LOG_ERROR("stall: VR is %s at this moment; the last VR step the "
+                          "render thread entered was %s.",
+                          grwxr::vr::active() ? "ARMED" : "not armed",
+                          grwxr::vr::frame_phase());
+                grwxr::stallwatch::report("the game stopped presenting");
+                // BUILD 245: the second-camera experiment's diagnostics, from this (the heartbeat) thread, never
+                // from a game worker. A no-op unless the experiment is recording.
+                grwxr::cam2::on_stall("the heartbeat saw 3 s with no frame");
+                grwxr::gtrec::on_stall();   // BUILD 270: one best-effort drain of the recorder, from this thread
+            }
+
+            if (stalled >= kStallStandDown && grwxr::vr::active())
+                grwxr::vr::stand_down("the game stopped presenting");
+        }
+
         last = now;
     }
 }
@@ -530,6 +674,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             break;   // the reference implementation is missing this break
         }
         case DLL_PROCESS_DETACH:
+            // BUILD 245: the second-camera diagnostics, best effort at exit. A no-op unless the experiment is recording.
+            grwxr::cam2::on_exit();
+            grwxr::gtrec::on_exit();   // BUILD 270: the recorder's final drain and close, best effort
             // Distinguishes an orderly shutdown from a hard kill: if this line
             // appears, the process unloaded us properly rather than dying.
             LOG_INFO("DLL_PROCESS_DETACH after %llu frames (orderly unload)",

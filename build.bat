@@ -1,7 +1,7 @@
 @echo off
 REM Build the GRW-XR proxy DLL (Release).
 REM
-REM project rule 3: build Release and stop on any compiler error.
+REM CLAUDE.md rule 3: build Release and stop on any compiler error.
 REM
 REM Usage: build.bat
 REM Output: build\dxgi.dll
@@ -51,13 +51,14 @@ cl /nologo /std:c++20 /EHsc /O2 /W4 /MT /DNDEBUG /LD /I tools\xr_probe\extern\in
    src\dllmain.cpp src\Log.cpp src\D3D11Hook.cpp src\Crash.cpp src\VRMirror.cpp src\AnselProbe.cpp ^
    src\Sig.cpp src\ThunkHook.cpp src\CameraProbe.cpp src\HeadPose.cpp src\FactoryHook.cpp src\XInputMerge.cpp ^
    src\RenderDocCapture.cpp src\PaletteProbe.cpp src\DrawHook.cpp src\WeaponProbe.cpp src\GameBuild.cpp ^
-   src\AimTrace.cpp src\WeaponDraw.cpp src\Menu.cpp src\Voice.cpp src\Presets.cpp ^
+   src\AimTrace.cpp src\WeaponDraw.cpp src\Menu.cpp src\Voice.cpp src\Presets.cpp src\Foveate.cpp ^
+   src\StallWatch.cpp src\Anatomy.cpp src\Census.cpp src\Cam2.cpp src\CbDump.cpp src\EyeRec.cpp src\PassGuard.cpp src\MvpHook.cpp src\GtRec.cpp ^
    build\ProbeStub.obj build\imgui\*.obj ^
-   /link /DLL /LIBPATH:tools\xr_probe\extern\lib openxr_loader.lib ole32.lib sapi.lib /OUT:build\dxgi.dll
+   /link /DLL /LIBPATH:tools\xr_probe\extern\lib /LIBPATH:src\nvapi openxr_loader.lib nvapi64.lib ole32.lib uuid.lib windowscodecs.lib sapi.lib advapi32.lib /OUT:build\dxgi.dll
 
 if errorlevel 1 (
     echo.
-    echo *** BUILD FAILED. Stopping, per project rule 3. ***
+    echo *** BUILD FAILED. Stopping, per CLAUDE.md rule 3. ***
     popd
     exit /b 1
 )

@@ -63,7 +63,7 @@ public:
     // `thunk` must point at a 5-byte E9 rel32 followed by at least 9 bytes of
     // CC padding, and its jump must resolve to `expected_target`. Both are
     // verified before anything is written; a mismatch installs nothing and
-    // returns false, leaving the game running normally (project rule 7).
+    // returns false, leaving the game running normally (CLAUDE.md rule 7).
     bool install(uint8_t* thunk, void* expected_target, void* replacement,
                  const char* name);
 
@@ -72,7 +72,7 @@ public:
     // (`mov rax,[rcx]; jmp qword ptr [rax+disp]`, 10 bytes + CC padding).
     // There is no jump target to verify, so the caller supplies the EXACT
     // expected byte sequence instead; one mismatched byte installs nothing
-    // (project rule 7). The replacement must re-implement the dispatch
+    // (CLAUDE.md rule 7). The replacement must re-implement the dispatch
     // itself, because there is no single "original function" to return to.
     bool install_raw(uint8_t* slot, const uint8_t* expected, size_t expected_len,
                      void* replacement, const char* name);

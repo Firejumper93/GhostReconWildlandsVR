@@ -75,6 +75,12 @@ void drain();
 // history rather than starting from zero.
 void set_logging(bool on);
 
+// 2026-09-01: cfg voice_guide, default 0. Whether the guided anchor test
+// ANNOUNCES itself once per session. The test still exists and End still
+// starts it; this only stops it inviting the tester into a different
+// procedure than the one they are actually running.
+void set_voice_guide(int on);
+
 // Build 62: THE CONTROLLER RAY. VRMirror publishes the right controller's
 // aim direction in ENGINE WORLD coordinates once per frame (the same
 // head-local-to-game-basis mapping the hand markers and the build 47 write
@@ -109,11 +115,31 @@ bool ctrl_pos_l(float out[3]);
 void set_ctrl_up(const float u[3], bool ok);
 bool ctrl_up(float out[3]);
 
+// BUILD 158, CX-017: the LEFT controller's forward and up, engine world
+// space, from the same pass and basis as ctrl_pos_l. Two VECTORS rather than
+// the quaternion, deliberately: the XR-to-engine basis change is a signed
+// permutation verified for vectors only (see the ctrl_up publish note in
+// VRMirror.cpp), and a frame built from forward and up carries everything a
+// wrist needs. Consumed by hands_apply so the free hand's wrist can follow
+// the real wrist instead of freezing in the animation's brace pose.
+void set_ctrl_vecs_l(const float fwd[3], const float up[3], bool ok);
+bool ctrl_vecs_l(float fwd[3], float up[3]);
+
+// BUILD 162: the LEFT controller's GRIP-pose +Y and +Z axes, engine world
+// space, same pass and basis as ctrl_vecs_l. The grip pose is anatomical by
+// OpenXR specification (+X the palm normal, -Z little finger to thumb through
+// the curled fingers, +Y by the right-hand rule), which is what lets the hand
+// bone be placed absolutely instead of by delta from an arbitrary latch.
+void set_ctrl_gripf_l(const float y[3], const float z[3], bool ok);
+bool ctrl_gripf_l(float y[3], float z[3]);
+
 // Build 72: the direction the GAME is aiming, engine world space, published in
 // the same per-frame pass as the controller ray. The weapon rotation is the
 // delta between the two, so it needs no knowledge of the engine's axis order.
 void set_view_fwd(const float dir[3], bool ok);
 bool view_fwd(float out[3]);
+// BUILD 289: shots seen by the shot-direction hook (rewritten plus left alone), all time; log only.
+uint32_t shots_total();
 
 // Build 84: WHERE THE BARREL ACTUALLY POINTS, engine world space.
 //
@@ -133,6 +159,134 @@ bool view_fwd(float out[3]);
 // would aim the gun at where it pointed minutes ago.
 void set_barrel_dir(const float dir[3], bool ok);
 bool barrel_dir(float out[3]);
+
+// BUILD 137: the same vector, read WITHOUT consuming the freshness token.
+//
+// barrel_dir() above keeps its "have I seen this generation" memory in a single
+// function-static, which makes it a SINGLE-CONSUMER accessor: a second caller
+// would have its reads answered "stale" whenever the first one got there first,
+// and on this hardware the first one runs at frame rate. A shot rewrite built
+// on it would therefore do nothing on almost every shot, for a reason no log
+// line would ever explain. That is the failure mode this project keeps paying
+// for, so the second consumer gets its own memory instead.
+//
+// Hands back the vector and the generation it belongs to. gen == 0 means the
+// weapon writer has never published, which is not the same as "not fresh" and
+// is why the count is returned rather than a bare bool.
+bool barrel_dir_peek(float out[3], uint32_t* gen);
+
+// BUILD 153b: the same barrel direction expressed in the CAMERA'S OWN AXES
+// (x right, y forward, z up), published by the weapon writer using the basis
+// it already holds, in the same instant.
+//
+// DRAWING ONLY, and it exists because of a measured bug: a world vector
+// re-projected through a basis captured at a different instant swings by the
+// rotation between those instants, which the owner saw as the reticle moving
+// OPPOSITE a character turn while the gaze ring stayed correct. Consuming
+// this needs no conversion, so that class of error cannot recur.
+//
+// Nothing may AIM from this. The shot chain takes the world vector, and the
+// hard baseline guards that path.
+void set_barrel_local(const float dir[3], bool ok);
+bool barrel_local_peek(float out[3], uint32_t* gen);
+
+// BUILD 153: the PLAYER'S OWN muzzle in engine world space. This is build
+// 137's interlock anchor (player-flagged), not the "most recent, any owner"
+// muzzle the A/B uses. False until it resolves once.
+//
+// **IT IS NOT A PER-FRAME VALUE, AND THAT COST A BUILD.** It is published from
+// grwxr_muzpt_post, the MUZZLE GETTER hook, and the engine calls that when it
+// wants a muzzle point, which in practice means while shooting. Between shots
+// it holds a STALE WORLD POSITION. Build 153's reticle drew a ring from it and
+// the owner reported the ring "gets turned around if the character moves, it
+// will end up behind the player": the ring was pinned to where he last fired
+// while he walked away from it. The direction was live; the origin was not.
+//
+// So: fine for anything that happens AT a shot, wrong for anything drawn or
+// evaluated every frame. A per-frame consumer wants a live origin (the camera
+// from camera::base_frame) or its own freshness counter.
+//
+// DRAWING ONLY besides that. It is unsynchronised, so a torn read costs a
+// marker a few centimetres for one frame. Anything deciding where a BULLET
+// goes must use the interlock itself, never this.
+bool player_muzzle(float out[3]);
+
+// BUILD 137: THE SHOT DIRECTION FOLLOWS THE BARREL. cfg shot_dir, default ON.
+//
+// Build 136 measured eleven shots and settled the question the project had been
+// circling since build 59: the round already STARTS at the muzzle in hip fire
+// (0.019 m out), and it is only the DIRECTION that is wrong, because the engine
+// builds it as normalize(cameraSpacePoint - origin). One vector, written once
+// per shot, is the whole defect.
+//
+// So this replaces that vector, in the caller's own buffer, at the moment
+// SetShotLine receives it, with the direction the barrel is actually pointing.
+// It is not a steering loop: nothing is nudged and nothing is re-measured, which
+// is the difference between this and the eleven runs that never converged.
+//
+// Three interlocks, and all three must hold or the engine's own vector is left
+// exactly as it was:
+//   1. the shot must start within a few centimetres of the PLAYER'S OWN muzzle,
+//      which is the owner test (an NPC's shot starts at the NPC's barrel) and
+//      simultaneously excludes ADS shots, whose origin is the camera and whose
+//      direction cannot be fixed without also moving the origin;
+//   2. the weapon writer must have published this second, so a holstered or
+//      unarmed gun cannot aim the shot at where it pointed a minute ago;
+//   3. the resulting vector must be finite and non-degenerate.
+// The engine's own magnitude is preserved, so the ONLY thing that changes is
+// which way the ray points.
+void set_shot_dir(bool on);
+bool shot_dir();
+
+// BUILD 154: THE VERTICAL. cfg shot_pitch, default ON.
+//
+// SHOT-2026-09-02 settled why build 137's direction write only ever fixed the
+// horizontal: SetShotLine reads [r8] and [r8+4] and NEVER [r8+8]. The engine is
+// z-up, so the elevation we wrote was never read at all. It is taken instead
+// from the shot direction one step earlier, decomposed to a scalar in degrees,
+// and handed to a trajectory generator that builds the ballistic arc BEFORE
+// SetShotLine runs; SetShotLine then spins that finished arc through a yaw-only
+// frame. Pitch is consumed before our write and yaw after it, which is the
+// entire 34.6-deg-yes / 12.8-deg-no asymmetry measured over 30 shots.
+//
+// The two generators are hooked as OBSERVERS ONLY. At generator time there is
+// no shot origin and no weapon pointer, so none of the interlocks that keep AI
+// fire untouched can run there, and an ungated write would re-aim every NPC in
+// the firefight. Instead the arguments are stashed, and the arc is rebuilt from
+// the SetShotLine hook after sd_apply has already ruled the shot ours by the
+// same build 137 gate. The rebuild calls the ENGINE'S OWN generator with its
+// own saved arguments and only the elevation replaced, so nothing here
+// reimplements ballistics.
+//
+// This moves the round, so the hard baseline governs it: ships with the ray
+// probe on, re-proven in the headset, never assumed. 0 restores exact build
+// 153 behaviour.
+void set_shot_pitch(bool on);
+
+// BUILD 152: THE ORIGIN WRITE. cfg shot_org, default ON.
+//
+// The 03:05 session on 2026-09-01 (grwxr-25048) proved live what the build-133
+// comment predicted: the engine RELOCATES the player's shot origin to the
+// camera in ordinary play (hybrid shoot / focus system). Eleven shots WROTE,
+// then every shot's origin jumped from the muzzle to 0.31..0.55 m from the
+// camera and stayed there, with the barrel as little as 5.6 deg off the gaze.
+// The direction write stands down on those by design, so the rounds follow the
+// engine's camera-converged aim: the owner's "acts right for the first couple
+// of shots but it misses". This build repairs the shot instead of refusing it:
+// origin back to the player's own muzzle, direction onto the barrel, both in
+// the engine's own buffer at SetShotLine. A shot is repaired ONLY when all of
+// these hold, and each test an AI shot could pass is paired with one it
+// cannot:
+//   1. the origin is NOT at our muzzle but IS within 0.60 m of the camera
+//      (measured clusters: relocated 0.31..0.55, muzzle-origin 0.68..1.05);
+//   2. the engine's direction is camera-convergent (dot > 0.5 with the view);
+//      an AI firing point-blank AT the player points against the view;
+//   3. the same barrel-freshness and finiteness interlocks as shot_dir.
+// ADS shots become repaired shots too; that is the point. The hard baseline
+// says the round must ALWAYS leave the muzzle, and until this build the mod
+// only enforced the direction half of that sentence.
+void set_shot_org(bool on);
+bool shot_org();
 
 // cfg bullet_ctrl: 1 = every player round is relocated, frame by frame,
 // onto the controller ray captured at its spawn. The engine keeps drop and

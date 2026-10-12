@@ -1,3 +1,6 @@
+#include "Anatomy.h"
+#include "CbDump.h"
+#include "Census.h"
 #include "D3D11Hook.h"
 #include "Log.h"
 
@@ -87,9 +90,19 @@ struct ReentryGuard {
 };
 
 // Set by Present, drained and logged by the init thread. Present itself must not
-// touch the log: project rule 8 forbids file I/O on a per-frame hook, and a
+// touch the log: CLAUDE.md rule 8 forbids file I/O on a per-frame hook, and a
 // flush under a critical section on the render thread is a real deadlock risk.
 std::atomic<bool> g_capture_pending{false};
+
+// BUILD 239: see the header. g_state.frames counts Present ENTRIES, so a log
+// frozen at frames=1 has never been able to say whether the render thread is
+// parked inside the real Present or returned from it and stopped elsewhere.
+// These four answer that, and the re-entrant pass-through above is deliberately
+// excluded from all of them: it is DXGI calling itself, not a game frame.
+std::atomic<unsigned long long> g_returns{0};
+std::atomic<unsigned long long> g_first_enter_ms{0};
+std::atomic<unsigned long long> g_first_return_ms{0};
+std::atomic<unsigned long>      g_render_tid{0};
 
 HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain* sc, UINT sync, UINT flags) {
     ReentryGuard guard;
@@ -104,12 +117,32 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain* sc, UINT sync, UINT fla
         g_capture_pending.store(true, std::memory_order_release);
     }
     g_state.frames++;
+    // BUILD 241: the frame-anatomy Present boundary. One relaxed load unless a
+    // capture window is open. No logging, no allocation (rule 8).
+    anatomy::on_present(g_state.frames);
+    census::on_present(g_state.frames);   // BUILD 242: same, for the camera census window
+    cbdump::on_present(g_state.frames);   // BUILD 246: same, for the constant-buffer content window (and its ground-truth sample)
+
+    // Build 239: stamped BEFORE the callback and before the real Present, so a
+    // thread that never comes back still leaves the time it went in and the
+    // thread id to look for in the stall report.
+    if (!g_first_enter_ms.load(std::memory_order_relaxed)) {
+        g_render_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        g_first_enter_ms.store(GetTickCount64(), std::memory_order_relaxed);
+    }
 
     if (auto cb = g_callback.load(std::memory_order_relaxed)) {
         cb(g_state);
     }
 
-    return g_orig_present(sc, sync, flags);
+    const HRESULT hr = g_orig_present(sc, sync, flags);
+
+    // Build 239: reached only if the real Present came back. Entries minus
+    // returns is therefore exactly the depth the render thread is stuck at.
+    g_returns.fetch_add(1, std::memory_order_relaxed);
+    if (!g_first_return_ms.load(std::memory_order_relaxed))
+        g_first_return_ms.store(GetTickCount64(), std::memory_order_relaxed);
+    return hr;
 }
 
 // ResizeBuffers is not hooked HERE. This module still relies on Present
@@ -372,7 +405,7 @@ void remove() {
 }
 
 // Called by the init thread once Present has captured the device, so that the
-// heavy logging happens off the render thread (project rule 8).
+// heavy logging happens off the render thread (CLAUDE.md rule 8).
 void drain_capture_log() {
     if (!g_capture_pending.exchange(false, std::memory_order_acq_rel)) return;
 
@@ -398,6 +431,20 @@ void drain_capture_log() {
 }
 
 unsigned long long frame_count() { return g_state.frames; }
+
+// BUILD 239: the render thread's own facts (header). Read from the init thread.
+unsigned long long present_returns() {
+    return g_returns.load(std::memory_order_relaxed);
+}
+unsigned long long first_present_enter_ms() {
+    return g_first_enter_ms.load(std::memory_order_relaxed);
+}
+unsigned long long first_present_return_ms() {
+    return g_first_return_ms.load(std::memory_order_relaxed);
+}
+unsigned long render_thread_id() {
+    return g_render_tid.load(std::memory_order_relaxed);
+}
 
 void request_max_frame_latency(int frames) {
     if (frames < 0)  frames = 0;

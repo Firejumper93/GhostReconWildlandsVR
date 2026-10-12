@@ -11,7 +11,7 @@
 ;   * docs/RE-notes.md documents six projection variants with different shapes.
 ;     Guessing which arguments are floats in xmm and which are pointers in
 ;     integer registers is exactly the kind of plausible-but-wrong step that
-;     the project rules forbid. Get it backwards and we forward garbage to the engine.
+;     CLAUDE.md forbids. Get it backwards and we forward garbage to the engine.
 ;   * on_calc_mvp takes 21 arguments. Writing that prototype by hand, from a
 ;     static reading of one call site, and then having the engine execute it, is
 ;     not a risk worth taking to answer a question about call counts.
@@ -68,6 +68,11 @@ EXTERN grwxr_headhide_obj   : QWORD    ; last matching object seen
 EXTERN grwxr_headhide_ring     : QWORD ; BUILD 121: 16 distinct objects
 EXTERN grwxr_headhide_ring_cls : QWORD ; their class method tables
 
+; BUILD 224: the pre-latch (see CameraProbe.cpp, grwxr_headlatch_entry below).
+EXTERN grwxr_headlatch_impl  : QWORD
+EXTERN grwxr_headlatch_cand  : QWORD
+EXTERN grwxr_headlatch_hits  : QWORD
+
 ; Build 67: the gun-root bone write. See CameraProbe.cpp for the evidence.
 EXTERN grwxr_wgun_skel  : QWORD        ; player skeleton to match, 0 = disarmed
 EXTERN grwxr_wgun_impl  : QWORD        ; the real PublishAttachments
@@ -118,6 +123,19 @@ EXTERN grwxr_muzpt_orig   : QWORD
 EXTERN grwxr_spawn_pre  : PROC
 EXTERN grwxr_spawn_post : PROC
 EXTERN grwxr_spawn_orig : QWORD
+
+; BUILD 136, SetShotLine. An observer on the INPUTS, so unlike aimpt and muzpt
+; it records BEFORE calling the original: the vectors it wants are the
+; arguments, not the result, and recording first also means a fault inside the
+; original still leaves the measurement in the table.
+EXTERN grwxr_shotline_pre  : PROC
+EXTERN grwxr_shotline_orig : QWORD
+
+; BUILD 242, the camera/view census (Census.h). Pure observers.
+EXTERN grwxr_census_record : PROC
+EXTERN grwxr_census_orig   : QWORD   ; 4 entries: the real bodies, set before the thunks are patched
+EXTERN grwxr_census_on     : DWORD   ; 1 only while the census window is open
+EXTERN grwxr_cam2_on       : DWORD   ; BUILD 243: 1 while the second-camera experiment wants the graph-builder entry (id 0 only)
 
 .code
 
@@ -198,7 +216,7 @@ ENDM
 ; The engine's own integrate loop is get-modify-write on the same object, so
 ; a one-time bump persists without us touching anything again.
 ;
-; project rule 8: no logging, no allocation, no locks, no calls. Plain and
+; CLAUDE.md rule 8: no logging, no allocation, no locks, no calls. Plain and
 ; interlocked stores only. No stack use at all, so no alignment concerns.
 ; rax, r11 and the flags are volatile at function entry; xmm0 maps to argument
 ; slot 1, which is rcx (the object), so xmm0 carries nothing and is free.
@@ -268,7 +286,7 @@ grwxr_setpitch_entry ENDP
 ; else passes through untouched, and a zeroed table pointer disables the
 ; whole test.
 ;
-; project rule 8: stores and interlocked increments only, no calls, no
+; CLAUDE.md rule 8: stores and interlocked increments only, no calls, no
 ; stack. rax and r11 are volatile at entry. [rcx+8] is the same field the
 ; real function's callers dereference, so reading it here adds no new risk.
 ; ---------------------------------------------------------------------------
@@ -318,6 +336,45 @@ hh_pass:
     mov     rax, [grwxr_headhide_impl]
     jmp     rax
 grwxr_headhide_entry ENDP
+
+; ---------------------------------------------------------------------------
+; BUILD 224: THE PRE-LATCH. Detours the visibility predicate the engine calls
+; with the render object in rcx on EVERY pass of the per-frame
+; visibility-apply function, which runs at spawn, long before the first
+; SetHidden transition. Ported from the flat mod (FpStub.asm, 2026-08-12),
+; where it ran in the headset-free game on the byte-identical Last Rites
+; image (grwfp-27492.log).
+;
+; This entry only OFFERS a candidate. It never forces anything and never
+; writes grwxr_headhide_obj directly: the class check alone cannot tell the
+; player's head assembly from another character's of the same class, so
+; promotion happens on the drain thread after the ENTITY TIE (CameraProbe.cpp,
+; head_obj_entity). First candidate wins; the drain clears the slot after
+; judging it, which re-opens the offer.
+;
+; Rule 8 holds: no call, no stack frame, no allocation, no logging. The one
+; lock inc runs at most once per open candidate slot, not per predicate call.
+; Registers touched: rax only, volatile at function entry. The impl behind
+; the thunk is byte-verified at install as `movzx eax, byte [rcx+10h]; ret`,
+; so every live caller's rcx is readable at +8 wherever the engine itself
+; would not crash; a zero rcx is passed through untouched.
+; ---------------------------------------------------------------------------
+grwxr_headlatch_entry PROC
+    mov     rax, [grwxr_headhide_table]
+    test    rax, rax
+    jz      hl_pass                        ; class table not verified: disarmed
+    test    rcx, rcx
+    jz      hl_pass
+    cmp     rax, [rcx+8]
+    jne     hl_pass                        ; not the head class
+    cmp     qword ptr [grwxr_headlatch_cand], 0
+    jne     hl_pass                        ; an offer is already pending
+    mov     [grwxr_headlatch_cand], rcx
+    lock inc qword ptr [grwxr_headlatch_hits]
+hl_pass:
+    mov     rax, [grwxr_headlatch_impl]
+    jmp     rax
+grwxr_headlatch_entry ENDP
 
 ; ---------------------------------------------------------------------------
 ; Build 67: THE GUN-ROOT BONE WRITE, at Skeleton::PublishAttachments.
@@ -807,5 +864,235 @@ grwxr_spawn_entry PROC
     add     rsp, 0B8h
     ret
 grwxr_spawn_entry ENDP
+
+; ---------------------------------------------------------------------------
+; BUILD 136: SetShotLine(rcx = shot context, rdx = float4* ray ORIGIN,
+;                        r8 = float4* ray DIRECTION).
+;
+; One call per shot, not per frame, so this is the cheapest place in the whole
+; ballistic chain to ask where a bullet starts.
+;
+; The recorder runs BEFORE the original because the values wanted are the
+; arguments. That also means a fault inside the original still leaves the
+; measurement in the table.
+;
+; r9 and xmm0-3 are saved even though the disassembled prologue reads only
+; rcx, rdx and r8. Our call to the recorder is an ordinary C call, and the x64
+; ABI makes r9 and xmm0-5 caller-saved, so if this function turns out to take a
+; fourth argument we have not seen, clobbering it here would corrupt a live
+; shot rather than merely mismeasure one. Saving four registers costs nothing
+; at one call per shot.
+;
+; Stack: after `sub rsp,0B8h` the callee shadow space overlaps [rsp+0..0x20),
+; so every slot used is 0x40 or above, matching aimpt and spawn.
+; ---------------------------------------------------------------------------
+grwxr_shotline_entry PROC
+    sub     rsp, 0B8h
+    mov     [rsp+40h], rcx
+    mov     [rsp+48h], rdx
+    mov     [rsp+50h], r8
+    mov     [rsp+58h], r9
+    movups  [rsp+60h], xmm0
+    movups  [rsp+70h], xmm1
+    movups  [rsp+80h], xmm2
+    movups  [rsp+90h], xmm3
+
+    ; rcx, rdx and r8 are already the recorder's three arguments.
+    call    grwxr_shotline_pre      ; void pre(u64 ctx, const float* org,
+                                    ;          const float* dir)
+
+    movups  xmm3, [rsp+90h]
+    movups  xmm2, [rsp+80h]
+    movups  xmm1, [rsp+70h]
+    movups  xmm0, [rsp+60h]
+    mov     r9,  [rsp+58h]
+    mov     r8,  [rsp+50h]
+    mov     rdx, [rsp+48h]
+    mov     rcx, [rsp+40h]
+
+    mov     r11, [grwxr_shotline_orig]
+    call    r11                     ; the real SetShotLine, arguments untouched
+    mov     [rsp+0A0h], rax
+
+    mov     rax, [rsp+0A0h]
+    add     rsp, 0B8h
+    ret
+grwxr_shotline_entry ENDP
+
+; ---------------------------------------------------------------------------
+; BUILD 154: THE TRAJECTORY GENERATORS, observers only.
+;
+; SHOT-2026-09-02 established that SetShotLine never reads the vertical: it
+; reads [r8] and [r8+4] only, and builds a YAW-ONLY frame. The elevation is
+; taken from the shot direction one step EARLIER, as a scalar in DEGREES, and
+; handed to one of these two generators, which builds the ballistic arc before
+; SetShotLine runs. Our direction write therefore lands after the vertical has
+; already been consumed, which is the whole 34.6-deg-yes / 12.8-deg-no
+; asymmetry measured over 30 shots.
+;
+; Contract, from disassembly:
+;     rcx = ballistic data      xmm1 = launch elevation, DEGREES, +-89.99
+;     r8  = shotctx + 0x170     r9d  = drop-table flag
+;
+; THESE STUBS MODIFY NOTHING. They record the arguments and call through
+; unchanged. The correction is applied later, from grwxr_shotline_pre, and only
+; after the existing interlocks have proved the shot is the player's. That
+; ordering is deliberate: at generator time there is no origin and no weapon
+; pointer, so no AI-safe gate exists here, and an ungated write would re-aim
+; every NPC in the firefight.
+;
+; The incoming registers ALREADY sit in the recorder's first four argument
+; slots (rcx, xmm1, r8, r9), so only the fifth needs placing.
+; ---------------------------------------------------------------------------
+EXTERN grwxr_gen_record : PROC
+EXTERN grwxr_gen_a_orig : QWORD
+EXTERN grwxr_gen_b_orig : QWORD
+
+grwxr_gen_a_entry PROC
+    sub     rsp, 0B8h
+    mov     [rsp+40h], rcx
+    mov     [rsp+48h], rdx
+    mov     [rsp+50h], r8
+    mov     [rsp+58h], r9
+    movups  [rsp+60h], xmm0
+    movups  [rsp+70h], xmm1
+    movups  [rsp+80h], xmm2
+    movups  [rsp+90h], xmm3
+
+    mov     qword ptr [rsp+20h], 0  ; which = 0, generator A
+    call    grwxr_gen_record        ; (rcx=bal, xmm1=elev, r8=arc, r9=flag, which)
+
+    movups  xmm3, [rsp+90h]
+    movups  xmm2, [rsp+80h]
+    movups  xmm1, [rsp+70h]
+    movups  xmm0, [rsp+60h]
+    mov     r9,  [rsp+58h]
+    mov     r8,  [rsp+50h]
+    mov     rdx, [rsp+48h]
+    mov     rcx, [rsp+40h]
+
+    mov     r11, [grwxr_gen_a_orig]
+    call    r11                     ; the real generator, arguments untouched
+    mov     [rsp+0A0h], rax
+
+    mov     rax, [rsp+0A0h]
+    add     rsp, 0B8h
+    ret
+grwxr_gen_a_entry ENDP
+
+grwxr_gen_b_entry PROC
+    sub     rsp, 0B8h
+    mov     [rsp+40h], rcx
+    mov     [rsp+48h], rdx
+    mov     [rsp+50h], r8
+    mov     [rsp+58h], r9
+    movups  [rsp+60h], xmm0
+    movups  [rsp+70h], xmm1
+    movups  [rsp+80h], xmm2
+    movups  [rsp+90h], xmm3
+
+    mov     qword ptr [rsp+20h], 1  ; which = 1, generator B
+    call    grwxr_gen_record
+
+    movups  xmm3, [rsp+90h]
+    movups  xmm2, [rsp+80h]
+    movups  xmm1, [rsp+70h]
+    movups  xmm0, [rsp+60h]
+    mov     r9,  [rsp+58h]
+    mov     r8,  [rsp+50h]
+    mov     rdx, [rsp+48h]
+    mov     rcx, [rsp+40h]
+
+    mov     r11, [grwxr_gen_b_orig]
+    call    r11
+    mov     [rsp+0A0h], rax
+
+    mov     rax, [rsp+0A0h]
+    add     rsp, 0B8h
+    ret
+grwxr_gen_b_entry ENDP
+
+; ---------------------------------------------------------------------------
+; BUILD 242: the camera/view census stubs. OBSERVATION ONLY. Same shape as
+; grwxr_probe_common above, with a fast path in front.
+;
+; The thunk slots of four engine bodies are redirected here (Census.cpp, an
+; atomic 8-byte swap of the slot head). Entered with the census id in r10d:
+;   0 = top-level graphics-frame graph builder, 1 = per-camera renderer entry,
+;   2 = BuildCmdList body, 3 = ExecuteCmdList body.
+;
+; FAST PATH. While the window is closed (grwxr_census_on == 0) the stub loads
+; the real body from grwxr_census_orig[id] and tail-jumps: no stack use, no
+; call, r10 and r11 are the only registers touched and both are volatile at
+; function entry.
+;
+; SLOW PATH. Saves every argument register that can carry an argument under the
+; Microsoft x64 ABI (rcx rdx r8 r9 and xmm0-3), calls
+;   void grwxr_census_record(uint32 id, const SavedArgs* saved, uint64 retaddr)
+; then restores and TAIL JUMPS to the real body, so the body sees the original
+; rsp, return address and stack-passed arguments and cannot tell we were here.
+; Stack alignment: entry rsp is 8 mod 16, 0B8h keeps the call 16-aligned (see
+; the note on grwxr_probe_common).
+; ---------------------------------------------------------------------------
+grwxr_census_common PROC PRIVATE
+    cmp     dword ptr [grwxr_census_on], 0
+    jne     cen_record
+    ; BUILD 243: the second-camera experiment rides entry 0 (the graph-frame
+    ; builder) with the census window closed. Ids 1..3 never take this branch,
+    ; and with grwxr_cam2_on == 0 (the default) entry 0 still passes straight
+    ; through, so the fast path is unchanged except for two compares.
+    test    r10d, r10d
+    jnz     cen_pass
+    cmp     dword ptr [grwxr_cam2_on], 0
+    jne     cen_record
+cen_pass:
+    lea     r11, grwxr_census_orig
+    mov     r11, [r11 + r10*8]
+    jmp     r11
+
+cen_record:
+    sub     rsp, 0B8h
+    mov     [rsp+40h], rcx
+    mov     [rsp+48h], rdx
+    mov     [rsp+50h], r8
+    mov     [rsp+58h], r9
+    movups  [rsp+60h], xmm0
+    movups  [rsp+70h], xmm1
+    movups  [rsp+80h], xmm2
+    movups  [rsp+90h], xmm3
+    mov     [rsp+0A0h], r10
+
+    mov     ecx, r10d
+    lea     rdx, [rsp+40h]
+    mov     r8,  [rsp+0B8h]         ; the caller's return address
+    call    grwxr_census_record
+
+    mov     r10, [rsp+0A0h]
+    movups  xmm3, [rsp+90h]
+    movups  xmm2, [rsp+80h]
+    movups  xmm1, [rsp+70h]
+    movups  xmm0, [rsp+60h]
+    mov     r9,  [rsp+58h]
+    mov     r8,  [rsp+50h]
+    mov     rdx, [rsp+48h]
+    mov     rcx, [rsp+40h]
+
+    lea     r11, grwxr_census_orig
+    mov     r11, [r11 + r10*8]
+    add     rsp, 0B8h
+    jmp     r11
+grwxr_census_common ENDP
+
+CENSUS_ENTRY MACRO n
+grwxr_census_entry_&n& PROC
+    mov     r10d, n
+    jmp     grwxr_census_common
+grwxr_census_entry_&n& ENDP
+ENDM
+
+    CENSUS_ENTRY 0
+    CENSUS_ENTRY 1
+    CENSUS_ENTRY 2
+    CENSUS_ENTRY 3
 
 END

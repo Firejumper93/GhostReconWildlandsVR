@@ -132,7 +132,7 @@ constexpr Build kUpdate2026 = {
 // and image-range immediates), then re-finds it in the target. Every row below
 // reproduced its source RVA as a positive control before its target hit was
 // accepted, so a bad seed shows up as a control failure and never as a silent
-// wrong address (project RE rule 2).
+// wrong address (CLAUDE.md RE rule 2).
 //
 // Two passes were needed. Pass 1 seeded from the 2023 Steam pin and carried 16
 // bodies. The nine misses were all bodies RECOMPILED since 2023, which no
@@ -274,8 +274,55 @@ constexpr Build make_update20260819() {
 }
 constexpr Build kUpdate20260819 = make_update20260819();
 
+// The 2026-09-15 Title Update 25 (Steam buildid 25120584). Rebuilt and
+// re-wrapped: 48 of 51 pinned sites moved (F-222, F-248). Rows are F-248's
+// fingerprint derivations (positive control in the seed, one hit in TU25),
+// the same table the flat FP mod runs, confirmed in game 2026-09-25.
+//   on_calc_mvp: body 0x0138E5F0 recovered by call-graph shape, but it has NO
+//     int3-slot thunk, so the thunk-based installer skips it and the mod uses
+//     the selector stand-in exactly as on Last Rites. A body-entry hook is the
+//     follow-up (the FP mod synthesizes one at runtime).
+//   head_table 0x04AF46B0: F-248 reported it underived because it looked for
+//     the SETTER thunk at +0x1F0. The slot holds the slot-fn thunk; done that
+//     way it reproduces 0x04AF4550 on Last Rites and gives this on TU25.
+//   xinput_slot 0x0389D130: the resolver code stores GetProcAddress(XINPUT1_3,
+//     ordinal 2) into DAT_14389d130, the same RVA as Last Rites. XInputMerge
+//     still checks the slot points into XINPUT1_3.dll before patching.
+constexpr Build kTU25 = {
+    "2026-09-15 Title Update 25", 0x6A99768A, 0x185BA000,
+    {{0x01376B40, 0x0D67ABF0},    // proj[0] anchor
+     {0x01376D20, 0x0D67AE80},    // proj[1]
+     {0x01376DF0, 0x0D67B110},    // proj[2] gameplay
+     {0x01377100, 0x0D67B8B0},    // proj[3] skew path
+     {0x01374FE0, 0x0D678B60},    // proj[4]
+     {0x013750C0, 0x0D678C80},    // proj[5]
+     {0,          0x0138E5F0},    // on_calc_mvp: NO THUNK, not installed
+     {0x013796D0, 0x0D67FFA0},    // selector
+     {0x01899110, 0x0F6D9800},    // SkeletonPostUpdate
+     {0x018F2260, 0x0FA50BE0},    // HIK datablock reader
+     {0x02752340, 0x139AE870}},   // cPlayerComponent::OnInit callee
+    0x003EB820, 0x00448530,       // setyaw, setpitch stubs
+    0x003EB830, 0x003EBBC0,       // getyaw, getpitch stubs
+    0x1483E07B, 0x1483E0BC,       // per-shot aim read sites
+    0x029FB1C0, 0x1483DE80,       // weapon per-frame update thunk + impl
+    0x030F96C0, 0x163F18D0,       // hknpWorld::castRay thunk + impl
+    0x029EF3B0, 0x1480EC50,       // GetAimOrientation thunk + impl
+    0x029CFB80, 0x14756D40,       // ballistic projectile spawn thunk + impl
+    0x04AF46B0, 0x02A257C0, 0x148B32C0,  // head_table, setter thunk + impl
+    0x1485806C,                   // no-blur match
+    0x030F5480, 0x163E8A00,       // weapon setterA thunk + impl
+    0x182B2098, 0x182B20A0,       // ansel IAT slots
+    0x03112770, 0x16429A10,       // TtCastRay thunk + impl
+    0x0389D130,                   // XInputGetState shadow-IAT slot
+    "48 83 EC 08 44 0F B6 DA 49 89 CA 38 51 68 74 ? 0F B7 41 4A 85 C0 74 ?",
+    0x0189E2B0, 0x0F6E5DD0,       // Skeleton::PublishAttachments thunk + impl
+    0x017DF200, 0x0EAC05B0,       // TransformNode::SetWorldTransform thunk + impl
+    0x02993D30, 0x14668660,       // aiming-point anchor world getter
+    0x029958A0, 0x1466F330,       // muzzle-shoot anchor world getter
+};
+
 const Build* kKnown[] = {&kSteam, &kStore, &kUpdate2026, &kLastRites2026,
-                         &kUpdate20260819};
+                         &kUpdate20260819, &kTU25};
 
 // Read once from the loaded module's own headers. No file I/O: the values
 // come from the same mapped image every RVA is applied to.

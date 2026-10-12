@@ -12,6 +12,12 @@ injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
 > the Steam overlay is suspected too. `install.bat` (v0.13.0) reads both settings and warns you. Ubisoft
 > Connect: Settings, General, untick the in-game overlay. Steam: Settings, In Game, untick the overlay, and
 > untick it in the game's Properties as well.
+>
+> **Download: [v0.13.0, the body](https://github.com/Firejumper93/GhostReconWildlandsVR/releases/tag/v0.13.0)**
+> ([GRW-XR-0.13.0.zip](https://github.com/Firejumper93/GhostReconWildlandsVR/releases/download/v0.13.0/GRW-XR-0.13.0.zip)): unzip anywhere, run `install.bat`, read `INSTALL.txt`.
+>
+> **Reset in the headset: hold the LEFT MENU button for about a second, standing straight.** That recentres the view,
+> zeroes the lean and takes your standing height for the crouch. A short press is still the game menu.
 
 > [!WARNING]
 > **SINGLEPLAYER OR PRIVATE CO-OP ONLY, never PvP, never matchmaking.**

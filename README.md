@@ -7,29 +7,7 @@ DirectX 11). Head-tracked stereoscopic 3D rendered by the game's own engine and
 injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
 
 > [!IMPORTANT]
-> ### v0.11.1 is out
->
-> **[Download the latest release](https://github.com/Firejumper93/GhostReconWildlandsVR/releases/latest)**
->
-> - **A possible fix for the startup crash.** If the mod has never started for
->   you - black screen, then the game closes eight or nine seconds later - this
->   is the release to try. It also stands down to flat instead of taking the
->   game with it when something blocks it, so a machine that used to die should
->   now either work or tell you why.
-> - **The magnified overlay is big enough to shoot through.** Click the left
->   thumbstick (L3) to raise it, click again to put it away. Shooting at range
->   works properly for the first time. Built for iron sights and red dots. The
->   left trigger stays the game's own aim-down-sights.
-> - **The head hide is repaired.** In v0.10.0-test1 and every build back to
->   v0.9.0, your character's head would not hide while you held a weapon. It
->   hides again now: at all times, in every state, through movement, firing and
->   cover.
-> - **The two-handed hold is on.** Squeeze the left grip with your hand near the
->   handguard and both hands take the weapon.
->
-> **Coming from v0.10.0-test1 or older? This is a large update** - eleven builds
-> of work, and it repairs something that had been broken in every release since
-> v0.9.0.
+>YOU MUST DISABLE UBISOFT CONNECT OVERLAY AND STEAM OVERLAY OR THIS WILL CRASH!!!!!
 
 > [!WARNING]
 > **SINGLEPLAYER OR PRIVATE CO-OP ONLY, never PvP, never matchmaking.**

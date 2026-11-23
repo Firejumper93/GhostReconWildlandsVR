@@ -9,12 +9,13 @@ injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
 > [!IMPORTANT]
 >YOU MUST DISABLE UBISOFT CONNECT OVERLAY AND STEAM OVERLAY OR THIS WILL CRASH!!!!!
 > The Ubisoft Connect in-game overlay freezes the mod's first frame (black screen, then the game closes);
-> the Steam overlay is suspected too. `install.bat` (v0.13.0) reads both settings and warns you. Ubisoft
+> the Steam overlay is suspected too. `install.bat` (v0.21.0) reads both settings and warns you. Ubisoft
 > Connect: Settings, General, untick the in-game overlay. Steam: Settings, In Game, untick the overlay, and
 > untick it in the game's Properties as well.
 >
-> **Download: [v0.13.0, the body](https://github.com/Firejumper93/GhostReconWildlandsVR/releases/tag/v0.13.0)**
-> ([GRW-XR-0.13.0.zip](https://github.com/Firejumper93/GhostReconWildlandsVR/releases/download/v0.13.0/GRW-XR-0.13.0.zip)): unzip anywhere, run `install.bat`, read `INSTALL.txt`.
+> **Download: [v0.21.0, the full body](https://github.com/Firejumper93/GhostReconWildlandsVR/releases/tag/v0.21.0)**
+> ([GRW-XR-0.21.0.zip](https://github.com/Firejumper93/GhostReconWildlandsVR/releases/download/v0.21.0/GRW-XR-0.21.0.zip)): unzip anywhere, run `install.bat`, read `INSTALL.txt`.
+> The installer finds an earlier install and asks before replacing it.
 >
 > **Reset in the headset: hold the LEFT MENU button for about a second, standing straight.** That recentres the view,
 > zeroes the lean and takes your standing height for the crouch. A short press is still the game menu.
@@ -27,7 +28,7 @@ injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
 > and competitive play stays out of scope.
 
 > [!NOTE]
-> ### This is not a complete VR experience yet, and v0.13.0 is the body
+> ### This is not a complete VR experience yet, and v0.21.0 is the full body
 >
 > It is a real, playable VR mod rather than a proof of concept: stereo depth, a
 > fullscreen head-tracked view, first person that turns itself on, your head and
@@ -46,9 +47,15 @@ injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
 > not your head. Cars, bikes and boats work in first person; helicopters and planes
 > still show the outside camera.
 >
+> **v0.20.5 added magnified scopes** you aim by raising the optic to your eye, and
+> **v0.21.0 adds the full body:** the knees bend to your real height, the crouch stays
+> in step with the game, a step in your room steps the character, one standing height
+> is kept from your recentre, scopes are drawn at full frame rate, vehicles bank with
+> you. Every body layer is one line in the cfg that can be turned off; the release
+> notes list them with the symptom that says which.
+>
 > **There are still rough edges and they are listed honestly below.** Holsters and
-> gesture reload are next. A magnified scope fitted to a
-> weapon does not work yet. The mod is right-handed only for now.
+> gesture reload are next. The mod is right-handed only for now.
 >
 > Each release has closed more of that list than it has opened, and the
 > [Roadmap](#roadmap) says exactly where every piece stands: what works, what is

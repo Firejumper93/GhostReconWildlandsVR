@@ -9,12 +9,12 @@ injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
 > [!IMPORTANT]
 >YOU MUST DISABLE UBISOFT CONNECT OVERLAY AND STEAM OVERLAY OR THIS WILL CRASH!!!!!
 > The Ubisoft Connect in-game overlay freezes the mod's first frame (black screen, then the game closes);
-> the Steam overlay is suspected too. `install.bat` (v0.21.0) reads both settings and warns you. Ubisoft
+> the Steam overlay is suspected too. `install.bat` (v0.30.0) reads both settings and warns you. Ubisoft
 > Connect: Settings, General, untick the in-game overlay. Steam: Settings, In Game, untick the overlay, and
 > untick it in the game's Properties as well.
 >
-> **Download: [v0.21.0, the full body](https://github.com/Firejumper93/GhostReconWildlandsVR/releases/tag/v0.21.0)**
-> ([GRW-XR-0.21.0.zip](https://github.com/Firejumper93/GhostReconWildlandsVR/releases/download/v0.21.0/GRW-XR-0.21.0.zip)): unzip anywhere, run `install.bat`, read `INSTALL.txt`.
+> **Download: [v0.30.0, manual reload](https://github.com/Firejumper93/GhostReconWildlandsVR/releases/tag/v0.30.0)**
+> ([GRW-XR-0.30.0.zip](https://github.com/Firejumper93/GhostReconWildlandsVR/releases/download/v0.30.0/GRW-XR-0.30.0.zip)): unzip anywhere, run `install.bat`, read `INSTALL.txt`.
 > The installer finds an earlier install and asks before replacing it.
 >
 > **Reset in the headset: hold the LEFT MENU button for about a second, standing straight.** That recentres the view,
@@ -22,13 +22,16 @@ injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
 
 > [!WARNING]
 > **SINGLEPLAYER OR PRIVATE CO-OP ONLY, never PvP, never matchmaking.**
+> **v0.30.0: CO-OP IS BROKEN, singleplayer only until the next update** (in a co-op session the mod can put
+> your view in the other player's character).
+>
 > This is a hard rule of the project and it has not changed. The 2026-08-13
 > title update removed Easy Anti-Cheat, and that does not loosen it: the mod is
 > built and tested for the campaign, solo or with friends in a private session,
 > and competitive play stays out of scope.
 
 > [!NOTE]
-> ### This is not a complete VR experience yet, and v0.21.0 is the full body
+> ### This is not a complete VR experience yet, and v0.30.0 is manual reload
 >
 > It is a real, playable VR mod rather than a proof of concept: stereo depth, a
 > fullscreen head-tracked view, first person that turns itself on, your head and
@@ -54,8 +57,14 @@ injected through a `dxgi.dll` proxy. **No game files are modified, ever.**
 > you. Every body layer is one line in the cfg that can be turned off; the release
 > notes list them with the symptom that says which.
 >
-> **There are still rough edges and they are listed honestly below.** Holsters and
-> gesture reload are next. The mod is right-handed only for now.
+> **v0.30.0 adds manual reload and weapons on the body:** B drops the magazine, a fresh
+> one comes from your chest and seats in the magazine well; your main weapons ride on your
+> shoulders and the pistol on your hip; the left hand holds the handguard until you let go;
+> sights show the game's own reticles; the vehicle view switches on from the seat. **The HUD
+> is still being worked on, and co-op is broken until the next update.**
+>
+> **There are still rough edges and they are listed honestly below.** Co-op, the
+> charging handle and the HUD in VR are next. The mod is right-handed only for now.
 >
 > Each release has closed more of that list than it has opened, and the
 > [Roadmap](#roadmap) says exactly where every piece stands: what works, what is
